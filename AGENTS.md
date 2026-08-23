@@ -12,15 +12,25 @@ between the two should be quick and easy.
 
 ## Mirroring
 
-Repos with multiple remotes are kept in sync automatically: commits the user
-has pushed to at least one remote are mirrored to the others (all shared
-branches plus tags). Commits that exist only locally are never pushed. Sync
-runs in the background on TUI startup, after the interactive shell exits, when
-a push from another terminal updates `.git/refs/remotes`, and periodically
-while the TUI is open. Diverged refs are reported as errors, never
-force-pushed. The core logic lives in `src/sync.rs`; the TUI scheduling in
-`SyncManager` (`src/tui/mod.rs`). `workset sync` runs the same logic from the
-CLI.
+Mirroring is opt-in per repo: remotes listed in the multi-valued local git
+config key `workset.mirror` receive commits the user has pushed to at least one
+remote (all shared branches plus tags). Repos without any `workset.mirror`
+entries are skipped entirely — no fetch, no network activity. When mirrors are
+configured, all remotes are still fetched (the planner needs to see where a ref
+is published, and the status display needs fresh tracking refs), but only mirror
+remotes are pushed to; divergence on a non-mirror remote is not an error.
+Commits that exist only locally are never pushed. Sync runs in the background on
+TUI startup, after the interactive shell exits, when a push from another
+terminal updates `.git/refs/remotes`, and periodically while the TUI is open.
+Diverged mirror refs are reported as errors, never force-pushed.
+
+Mirror remotes are toggled in the TUI with `Ctrl+R` on a workspace repo, or
+manually with `git config --add workset.mirror <remote>`. The config survives
+drop/restore because drop moves `.git` wholesale and restore copies the original
+config back over the fresh clone.
+
+The core logic lives in `src/sync.rs`; the TUI scheduling in `SyncManager`
+(`src/tui/mod.rs`). `workset sync` runs the same logic from the CLI.
 
 ## Testing
 
@@ -39,7 +49,5 @@ attest --bin-dir target/debug tests/
   - If a repo is selected, show stats
     - Total size
     - Clean or number of outstanding changes
-    - Show mirror status
-  - If a remote is selected, show available repos
-- Per-remote mirroring opt-out (e.g. git config `workset.noMirror`) for
-  remotes the user can't push to, like a fork's upstream
+    - Show mirror(s) status
+- Unify the `sync` and `mirror` subcommands

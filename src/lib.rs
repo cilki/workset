@@ -180,6 +180,30 @@ pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
     Ok(submodules)
 }
 
+/// Return the config text with core.bare set to the given value, adding the
+/// [core] section or the bare entry if missing
+fn set_core_bare(config: &str, bare: bool) -> String {
+    if config.contains("[core]") {
+        if config.contains("bare =") || config.contains("bare=") {
+            config
+                .lines()
+                .map(|line| {
+                    if line.trim().starts_with("bare") {
+                        format!("\tbare = {}", bare)
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            config.replacen("[core]", &format!("[core]\n\tbare = {}", bare), 1)
+        }
+    } else {
+        format!("{}\n[core]\n\tbare = {}\n", config, bare)
+    }
+}
+
 /// Clone a repository (from a remote URL or a local path) into the given
 /// destination directory, creating parent directories as needed
 pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
@@ -248,13 +272,13 @@ pub fn check_repo_status_and_modification_time(
         }
     };
 
-    let (has_changes, dirty_files_time) = scan_worktree_changes(&repo, repo_path);
+    let (change_count, dirty_files_time) = scan_worktree_changes(&repo, repo_path);
 
     let Some(head_ref) = head_referent(&repo) else {
         return Ok((RepoStatus::NoCommits, Some(dirty_files_time)));
     };
 
-    if has_changes {
+    if change_count > 0 {
         // For dirty repos, use the max of last commit time and dirty file times
         let commit_time = get_last_commit_time(&repo).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         return Ok((RepoStatus::Dirty, Some(commit_time.max(dirty_files_time))));
@@ -418,13 +442,21 @@ fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime>
     Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
 }
 
-/// Scan the worktree once, returning whether any changes or untracked files
-/// exist and the most recent modification time among them
+/// Count uncommitted changes and untracked files in the worktree. Walks the
+/// full status iterator; use the check_repo_status* functions when only a
+/// boolean is needed, since they stop at the first change.
+pub fn count_worktree_changes(repo_path: &Path) -> Result<usize> {
+    let repo = gix::open(repo_path)?;
+    Ok(scan_worktree_changes(&repo, repo_path).0)
+}
+
+/// Scan the worktree once, returning the number of changed or untracked files
+/// and the most recent modification time among them
 fn scan_worktree_changes(
     repo: &gix::Repository,
     repo_path: &Path,
-) -> (bool, std::time::SystemTime) {
-    let mut has_changes = false;
+) -> (usize, std::time::SystemTime) {
+    let mut change_count = 0;
     let mut latest_time = std::time::SystemTime::UNIX_EPOCH;
 
     let platform = match repo.status(gix::progress::Discard) {
@@ -435,7 +467,7 @@ fn scan_worktree_changes(
                 error = %e,
                 "Failed to create status platform"
             );
-            return (has_changes, latest_time);
+            return (change_count, latest_time);
         }
     };
 
@@ -446,7 +478,7 @@ fn scan_worktree_changes(
     {
         Ok(iter) => {
             for item in iter.flatten() {
-                has_changes = true;
+                change_count += 1;
                 let file_path = repo_path.join(gix::path::from_bstr(item.rela_path()));
                 if let Ok(metadata) = std::fs::metadata(&file_path)
                     && let Ok(modified) = metadata.modified()
@@ -465,7 +497,7 @@ fn scan_worktree_changes(
         }
     }
 
-    (has_changes, latest_time)
+    (change_count, latest_time)
 }
 
 /// A `Workspace` is filesystem directory containing git repositories checked out
@@ -693,32 +725,7 @@ impl Workspace {
         // Set core.bare=true by modifying the config file directly
         let config_path = std::path::Path::new(&source).join("config");
         let config_content = std::fs::read_to_string(&config_path)?;
-
-        // Simple approach: check if core.bare already exists and update it, or add it
-        let new_config = if config_content.contains("[core]") {
-            // Replace or add bare = true under [core]
-            if config_content.contains("bare =") || config_content.contains("bare=") {
-                config_content
-                    .lines()
-                    .map(|line| {
-                        if line.trim().starts_with("bare") {
-                            "\tbare = true".to_string()
-                        } else {
-                            line.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                // Add bare = true after [core]
-                config_content.replacen("[core]", "[core]\n\tbare = true", 1)
-            }
-        } else {
-            // Add [core] section with bare = true
-            format!("{}\n[core]\n\tbare = true\n", config_content)
-        };
-
-        std::fs::write(&config_path, new_config)?;
+        std::fs::write(&config_path, set_core_bare(&config_content, true))?;
 
         debug!(source = %source, dest = %dest, "Storing repository in library");
 
@@ -757,52 +764,19 @@ impl Workspace {
             );
         }
 
-        // Get all remotes from the bare repository using gix
-        let source_repo = gix::open(&source)?;
-        let names = source_repo.remote_names();
-        let mut remote_names = Vec::new();
-        for name in names.iter() {
-            if let Ok(s) = std::str::from_utf8(name.as_ref()) {
-                remote_names.push(s.to_string());
-            }
-        }
+        // The library config is the original workspace config, moved wholesale
+        // by store_in_library. Read it before cloning so it can be restored
+        // verbatim afterwards.
+        let source_config = std::fs::read_to_string(Path::new(&source).join("config"))?;
 
         // Clone from the library using gix
         gix_clone(&source, Path::new(&dest))?;
 
-        // Restore all original remote URLs by updating the config file
+        // Replace the fresh clone's config (which points its origin at the
+        // library) with the original config, preserving remotes, workset.*
+        // keys, and any other settings the repo had when it was dropped
         let dest_config_path = std::path::Path::new(&dest).join(".git/config");
-        let mut dest_config_content = std::fs::read_to_string(&dest_config_path)?;
-
-        for remote_name in &remote_names {
-            // Get the URL for this remote from the library
-            if let Ok(remote) = source_repo.find_remote(remote_name.as_str())
-                && let Some(url) = remote.url(gix::remote::Direction::Fetch)
-            {
-                let remote_url = url.to_bstring().to_string();
-                debug!(remote = %remote_name, url = %remote_url, "Restoring remote");
-
-                // Find and update the URL line for this remote
-                let remote_section = format!("[remote \"{}\"]", remote_name);
-                if let Some(section_start) = dest_config_content.find(&remote_section) {
-                    // Find the URL line after the section start
-                    if let Some(url_line_start) =
-                        dest_config_content[section_start..].find("url = ")
-                    {
-                        let abs_url_start = section_start + url_line_start;
-                        if let Some(line_end) = dest_config_content[abs_url_start..].find('\n') {
-                            let abs_line_end = abs_url_start + line_end;
-                            dest_config_content.replace_range(
-                                abs_url_start..abs_line_end,
-                                &format!("\turl = {}", remote_url),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        std::fs::write(&dest_config_path, dest_config_content)?;
+        std::fs::write(&dest_config_path, set_core_bare(&source_config, false))?;
 
         Ok(())
     }
@@ -856,6 +830,35 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn set_core_bare_replaces_existing_entry() {
+        let config = "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = x\n";
+        let updated = set_core_bare(config, true);
+        assert!(updated.contains("\tbare = true"));
+        assert!(!updated.contains("bare = false"));
+        assert!(updated.contains("[remote \"origin\"]"));
+
+        let reverted = set_core_bare(&updated, false);
+        assert!(reverted.contains("\tbare = false"));
+        assert!(!reverted.contains("bare = true"));
+    }
+
+    #[test]
+    fn set_core_bare_inserts_under_existing_core_section() {
+        let config = "[core]\n\tfilemode = true\n";
+        let updated = set_core_bare(config, true);
+        assert!(updated.contains("[core]\n\tbare = true"));
+        assert!(updated.contains("filemode = true"));
+    }
+
+    #[test]
+    fn set_core_bare_appends_missing_core_section() {
+        let config = "[workset]\n\tmirror = b\n";
+        let updated = set_core_bare(config, false);
+        assert!(updated.contains("[core]\n\tbare = false"));
+        assert!(updated.contains("mirror = b"));
+    }
 
     #[test]
     fn test_library_contains() {

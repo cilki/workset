@@ -1,9 +1,11 @@
 mod app;
+mod details;
 mod metadata;
 mod tree;
 mod watcher;
 
 use app::{App, AppMode, Section};
+use details::{DetailsLoader, MirrorState, mirror_rows};
 use metadata::{format_size, format_time_ago_verbose, get_repo_modification_time, get_repo_size};
 use tree::{RepoInfo, RepoOperationStatus, TreeNode};
 use watcher::FileWatcher;
@@ -187,6 +189,8 @@ fn merge_discovered(pending: &mut Vec<RepoInfo>, discovered: Vec<RepoInfo>) {
 /// Result of a background sync job for one repo
 enum SyncEvent {
     Started,
+    /// The repo has no mirror remotes configured; nothing was done
+    Skipped,
     Finished(crate::sync::SyncOutcome),
     Failed(String),
 }
@@ -275,6 +279,19 @@ impl SyncManager {
             let tx = self.tx.clone();
             let interrupt = self.interrupt.clone();
             std::thread::spawn(move || {
+                // Check for mirror remotes before reporting Started so
+                // opted-out repos never flash a "syncing" status
+                match crate::sync::mirror_remotes(&repo, &interrupt) {
+                    Ok(mirrors) if mirrors.is_empty() => {
+                        let _ = tx.send((repo, SyncEvent::Skipped));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send((repo, SyncEvent::Failed(e.to_string())));
+                        return;
+                    }
+                    Ok(_) => {}
+                }
                 let _ = tx.send((repo.clone(), SyncEvent::Started));
                 let event = match crate::sync::sync_repo(&repo, &interrupt) {
                     Ok(outcome) => SyncEvent::Finished(outcome),
@@ -291,7 +308,17 @@ impl SyncManager {
             let display_name = workspace_display_name(&self.workspace_path, &repo);
             match event {
                 SyncEvent::Started => {
+                    app.syncing_repos.insert(repo);
                     app.set_sync_status(&display_name, RepoOperationStatus::Syncing);
+                }
+                SyncEvent::Skipped => {
+                    self.finish(&repo);
+                    // Clears a stale SyncFailed overlay if the user just
+                    // untoggled the repo's mirrors
+                    app.clear_sync_status(&display_name);
+                    app.syncing_repos.remove(&repo);
+                    app.sync_outcomes.remove(&repo);
+                    app.details.remove(&repo);
                 }
                 SyncEvent::Finished(outcome) => {
                     self.finish(&repo);
@@ -304,10 +331,16 @@ impl SyncManager {
                         }
                         None => app.clear_sync_status(&display_name),
                     }
+                    app.syncing_repos.remove(&repo);
+                    // The fetch may have changed what the info panel shows
+                    app.details.remove(&repo);
+                    // Keep the full outcome for the panel's per-mirror rows
+                    app.sync_outcomes.insert(repo, outcome);
                 }
                 SyncEvent::Failed(err) => {
                     self.finish(&repo);
                     app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err));
+                    app.syncing_repos.remove(&repo);
                 }
             }
         }
@@ -334,6 +367,8 @@ struct BackgroundTasks {
     watcher: Option<mpsc::Receiver<Result<FileWatcher, notify::Error>>>,
     /// Mirrors commits across each repo's remotes
     sync: SyncManager,
+    /// Computes info-panel details for the selected repo
+    details: DetailsLoader,
 }
 
 /// Detect the parent shell by reading /proc/self/status
@@ -400,6 +435,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
             clone_result: None,
             watcher: Some(watcher_rx),
             sync: SyncManager::new(workspace.path.clone()),
+            details: DetailsLoader::new(),
         };
 
         // Inner loop to handle actions without tearing down terminal
@@ -411,6 +447,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 Action::None => {
                     // Stop in-flight sync jobs between git invocations
                     background.sync.interrupt.store(true, Ordering::Relaxed);
+                    background.details.interrupt.store(true, Ordering::Relaxed);
 
                     // Drain any pending events before cleanup to avoid issues
                     while event::poll(Duration::from_millis(0))? {
@@ -594,6 +631,9 @@ fn run_app<B: ratatui::backend::Backend>(
         background.sync.poll(app);
         background.sync.maybe_periodic(app, loader_active);
         background.sync.pump();
+        background.details.poll(app);
+        background.details.note_selection(app);
+        background.details.pump(app);
         poll_suggestions(app, background);
         if let Some((pattern, rx)) = &background.clone_result {
             match rx.try_recv() {
@@ -649,6 +689,19 @@ fn run_app<B: ratatui::backend::Backend>(
                             if !repo_paths.is_empty() {
                                 return Ok(Action::DropToLibrary(repo_paths));
                             }
+                        }
+                    }
+                    KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Ctrl+R = mirror remotes dialog for the selected repo
+                        if app.active_section == Section::Workspace
+                            && let Some(dialog) = app
+                                .selected_node()
+                                .and_then(|node| node.repo_info.as_ref())
+                                .filter(|repo| !repo.is_submodule)
+                                .and_then(build_mirror_dialog)
+                        {
+                            app.mirror_dialog = Some(dialog);
+                            app.mode = AppMode::MirrorRemotes;
                         }
                     }
                     KeyCode::Right | KeyCode::Left => {
@@ -770,9 +823,71 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 },
+                AppMode::MirrorRemotes => match key.code {
+                    KeyCode::Esc => {
+                        app.mode = AppMode::Normal;
+                        if let Some(dialog) = app.mirror_dialog.take() {
+                            // Re-read the info panel's mirror list
+                            app.details.remove(&dialog.repo_path);
+                            // Apply the new config right away; a Skipped event
+                            // also clears any stale sync-failed overlay
+                            background.sync.request_sync(dialog.repo_path, false);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(dialog) = app.mirror_dialog.as_mut() {
+                            dialog.move_selection(1);
+                        }
+                    }
+                    KeyCode::Up => {
+                        if let Some(dialog) = app.mirror_dialog.as_mut() {
+                            dialog.move_selection(-1);
+                        }
+                    }
+                    KeyCode::Char(' ') | KeyCode::Enter => {
+                        if let Some(dialog) = app.mirror_dialog.as_mut() {
+                            let mirrors = dialog.toggle_selected();
+                            match crate::sync::set_mirror_remotes(&dialog.repo_path, &mirrors) {
+                                Ok(()) => dialog.error = None,
+                                Err(e) => {
+                                    dialog.toggle_selected();
+                                    dialog.error = Some(e.to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
             }
         }
     }
+}
+
+/// Build the mirror-remotes dialog state for a repo by reading its remotes
+/// and current workset.mirror config (both local and fast)
+fn build_mirror_dialog(repo: &RepoInfo) -> Option<app::MirrorDialog> {
+    let interrupt = AtomicBool::new(false);
+    let remotes = crate::sync::list_remotes(&repo.path, &interrupt).ok()?;
+    let mirrors = crate::sync::mirror_remotes(&repo.path, &interrupt).ok()?;
+
+    let mut entries: Vec<(String, bool, bool)> = remotes
+        .iter()
+        .map(|name| (name.clone(), mirrors.contains(name), true))
+        .collect();
+    // Configured mirrors that no longer match a remote, so they can be untoggled
+    for mirror in &mirrors {
+        if !remotes.contains(mirror) {
+            entries.push((mirror.clone(), true, false));
+        }
+    }
+
+    Some(app::MirrorDialog {
+        repo_path: repo.path.clone(),
+        display_name: repo.display_name.clone(),
+        entries,
+        selected: 0,
+        error: None,
+    })
 }
 
 /// Apply clone-dialog suggestions once the background fetch completes
@@ -813,6 +928,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         render_clone_repo_dialog(f, app);
         return;
     }
+    if app.mode == AppMode::MirrorRemotes {
+        render_mirror_dialog(f, app);
+        return;
+    }
 
     // Split vertically into rows; the search box only appears while a query
     // is being typed
@@ -840,7 +959,19 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     render_help_line(f, app, vertical_chunks[0]);
     render_tree_panel(f, app, horizontal_chunks[0], Section::Workspace);
-    render_tree_panel(f, app, horizontal_chunks[1], Section::Library);
+
+    // Info panel above the library, sized to its content but never squeezing
+    // the library list below half the column
+    let info_lines = info_panel_lines(app);
+    let info_height = (info_lines.len() as u16 + 2).min(horizontal_chunks[1].height / 2);
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(info_height), Constraint::Min(0)])
+        .split(horizontal_chunks[1]);
+    let info =
+        Paragraph::new(info_lines).block(Block::default().borders(Borders::ALL).title("Info"));
+    f.render_widget(info, right_chunks[0]);
+    render_tree_panel(f, app, right_chunks[1], Section::Library);
 
     if show_search {
         let search_text = format!("{}_", app.search_query);
@@ -873,6 +1004,7 @@ fn render_help_line(f: &mut Frame, app: &App, area: Rect) {
     ];
     if app.active_section == Section::Workspace {
         bindings.push(("Ctrl+D", Color::Yellow, " drop  "));
+        bindings.push(("Ctrl+R", Color::Cyan, " mirrors  "));
     }
     bindings.push(("Ctrl+A", Color::Magenta, " clone  "));
     bindings.push(("Esc", Color::Red, " quit"));
@@ -888,6 +1020,97 @@ fn render_help_line(f: &mut Frame, app: &App, area: Rect) {
 
     let help = Paragraph::new(Line::from(help_spans)).alignment(Alignment::Center);
     f.render_widget(help, area);
+}
+
+/// Content of the info panel for the current selection: size, worktree
+/// changes, and one status row per configured mirror. Fields still being
+/// computed by the details loader show an ellipsis.
+fn info_panel_lines(app: &App) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let Some(repo) = app.selected_node().and_then(|node| node.repo_info.as_ref()) else {
+        return vec![Line::from(Span::styled("no repo selected", dim))];
+    };
+    let details = app.details.get(&repo.path).cloned().unwrap_or_default();
+
+    let mut lines = vec![Line::from(Span::styled(
+        repo.display_name.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+
+    let size = match details.size_bytes.or(repo.size_bytes) {
+        Some(bytes) => Span::raw(format_size(bytes)),
+        None => Span::styled("…", dim),
+    };
+    lines.push(Line::from(vec![Span::styled("Size: ", dim), size]));
+
+    let changes = match details.change_count {
+        Some(0) => Span::styled("clean", Style::default().fg(Color::Green)),
+        Some(count) => Span::styled(
+            format!("{} outstanding", count),
+            Style::default().fg(Color::Yellow),
+        ),
+        None => Span::styled("…", dim),
+    };
+    lines.push(Line::from(vec![Span::styled("Changes: ", dim), changes]));
+
+    match &details.mirrors {
+        None => lines.push(Line::from(vec![
+            Span::styled("Mirrors: ", dim),
+            Span::styled("…", dim),
+        ])),
+        Some(mirrors) if mirrors.is_empty() => {
+            // The mirror dialog only opens on workspace repos
+            let hint = if app.active_section == Section::Workspace && !repo.is_submodule {
+                "none (Ctrl+R to configure)"
+            } else {
+                "none"
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Mirrors: ", dim),
+                Span::styled(hint, dim),
+            ]));
+        }
+        Some(mirrors) => {
+            lines.push(Line::from(Span::styled("Mirrors:", dim)));
+            let outcome = app.sync_outcomes.get(&repo.path);
+            let syncing = app.syncing_repos.contains(&repo.path);
+            for (name, state) in mirror_rows(mirrors, outcome, syncing) {
+                lines.push(mirror_status_line(name, state));
+            }
+        }
+    }
+    lines
+}
+
+/// One info-panel row showing a mirror remote and its sync state
+fn mirror_status_line(name: String, state: MirrorState) -> Line<'static> {
+    let status = match state {
+        MirrorState::Syncing => Span::styled("syncing…", Style::default().fg(Color::Cyan)),
+        MirrorState::InSync => Span::styled("✓ in sync", Style::default().fg(Color::Green)),
+        MirrorState::Pushed(count) => Span::styled(
+            format!(
+                "↑ pushed {} ref{}",
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(Color::Green),
+        ),
+        MirrorState::Conflict(msg) | MirrorState::PushError(msg) | MirrorState::FetchError(msg) => {
+            Span::styled(format!("⚠ {}", msg), Style::default().fg(Color::Red))
+        }
+        MirrorState::UnknownRemote => {
+            Span::styled("remote not found", Style::default().fg(Color::Red))
+        }
+        MirrorState::Pending => {
+            Span::styled("not synced yet", Style::default().fg(Color::DarkGray))
+        }
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::raw(name),
+        Span::raw("  "),
+        status,
+    ])
 }
 
 /// Render the workspace or library tree panel
@@ -1194,6 +1417,80 @@ fn render_clone_repo_dialog(f: &mut Frame, app: &App) {
     let mut state = ratatui::widgets::ListState::default();
     state.select(app.clone_repo_state.selected());
     f.render_stateful_widget(suggestions, chunks[1], &mut state);
+}
+
+/// Render the mirror-remotes dialog: one row per remote, toggled entries are
+/// replication targets (git config workset.mirror)
+fn render_mirror_dialog(f: &mut Frame, app: &App) {
+    let Some(dialog) = app.mirror_dialog.as_ref() else {
+        return;
+    };
+    let area = f.area();
+
+    let error_lines = if dialog.error.is_some() { 1 } else { 0 };
+    let content_height = dialog.entries.len().max(1) as u16 + error_lines;
+    let dialog_width = area.width.min(60);
+    let dialog_height = area.height.min(content_height + 4);
+    let dialog_area = Rect {
+        x: (area.width.saturating_sub(dialog_width)) / 2,
+        y: (area.height.saturating_sub(dialog_height)) / 2,
+        width: dialog_width,
+        height: dialog_height,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!("Mirror Remotes - {}", dialog.display_name))
+        .title_bottom(" Space toggle · Esc close ")
+        .style(Style::default().bg(Color::Black));
+    f.render_widget(block, dialog_area);
+
+    let inner = dialog_area.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(error_lines)])
+        .split(inner);
+
+    if dialog.entries.is_empty() {
+        let empty =
+            Paragraph::new("no remotes configured").style(Style::default().fg(Color::DarkGray));
+        f.render_widget(empty, chunks[0]);
+    } else {
+        let items: Vec<ListItem> = dialog
+            .entries
+            .iter()
+            .map(|(name, is_mirror, exists)| {
+                let checkbox = if *is_mirror { "[x] " } else { "[ ] " };
+                let mut spans = vec![Span::raw(checkbox), Span::raw(name.clone())];
+                if !exists {
+                    spans.push(Span::styled(
+                        " (missing)",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(">> ");
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(dialog.selected));
+        f.render_stateful_widget(list, chunks[0], &mut state);
+    }
+
+    if let Some(error) = &dialog.error {
+        let error_line = Paragraph::new(error.as_str()).style(Style::default().fg(Color::Red));
+        f.render_widget(error_line, chunks[1]);
+    }
 }
 
 /// Render right-aligned metadata (status or size) with padding

@@ -78,12 +78,20 @@ Don't let Github be the only place you store your repos!
 **Workset** makes it easy to keep local copies of all of your repos without
 having to sift through them to find the ones you're currently working on.
 
-If a repo has multiple remotes, **workset** mirrors your pushed commits to all
-of them automatically. Push to one remote (from anywhere — inside or outside
-workset) and the others catch up in the background: all shared branches and
-tags are propagated, commits you haven't pushed anywhere are never touched,
-and diverged refs show an error instead of being force-pushed. `workset sync`
-does the same from the command line.
+**Workset** can mirror your pushed commits to other remotes of a repo. Opt in
+per repo by marking remotes as mirrors — press `Ctrl+R` on a repo in the TUI,
+or from the command line:
+
+```sh
+git config --add workset.mirror <remote>
+```
+
+Push to any remote (from anywhere — inside or outside workset) and the mirror
+remotes catch up in the background: all shared branches and tags are
+propagated, commits you haven't pushed anywhere are never touched, and
+diverged refs show an error instead of being force-pushed. Repos without any
+mirror remotes are left alone entirely. `workset sync` does the same from the
+command line.
 
 Background pushes never prompt for credentials (SSH runs in batch mode), so
 use an SSH agent or credential helper for remotes that need authentication.

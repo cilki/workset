@@ -11,6 +11,47 @@ use std::time::{Duration, Instant};
 pub enum AppMode {
     Normal,
     CloneRepo,
+    MirrorRemotes,
+}
+
+/// State of the mirror-remotes dialog (Ctrl+R on a workspace repo)
+pub struct MirrorDialog {
+    pub repo_path: PathBuf,
+    pub display_name: String,
+    /// (remote name, is a mirror, exists as an actual git remote)
+    pub entries: Vec<(String, bool, bool)>,
+    pub selected: usize,
+    pub error: Option<String>,
+}
+
+impl MirrorDialog {
+    pub fn move_selection(&mut self, delta: isize) {
+        let len = self.entries.len();
+        if len == 0 {
+            return;
+        }
+        let len = len as isize;
+        let current = self.selected as isize;
+        self.selected = ((current + delta).rem_euclid(len)) as usize;
+    }
+
+    /// Flip the selected entry and return the resulting set of mirror names
+    /// for the caller to persist
+    pub fn toggle_selected(&mut self) -> Vec<String> {
+        if let Some(entry) = self.entries.get_mut(self.selected) {
+            entry.1 = !entry.1;
+        }
+        self.mirrors()
+    }
+
+    /// Currently checked mirror names
+    pub fn mirrors(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(_, is_mirror, _)| *is_mirror)
+            .map(|(name, _, _)| name.clone())
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -56,10 +97,18 @@ pub struct App {
     pub clone_repo_suggestions: Vec<String>,
     pub clone_repo_state: TreeState,
     pub suggestions_loading: bool,
+    pub mirror_dialog: Option<MirrorDialog>,
     pending_clones: Vec<PendingClone>,
     /// Sync status per repo display name (Syncing or SyncFailed), overlaid on
     /// the repo rows so it survives background data refreshes
     sync_statuses: std::collections::HashMap<String, RepoOperationStatus>,
+    /// Full result of each repo's last sync, keyed by path, for the info
+    /// panel's per-mirror status rows
+    pub sync_outcomes: std::collections::HashMap<PathBuf, crate::sync::SyncOutcome>,
+    /// Repos with a sync currently running, keyed by path
+    pub syncing_repos: std::collections::HashSet<PathBuf>,
+    /// Info-panel details computed in the background, keyed by repo path
+    pub details: std::collections::HashMap<PathBuf, super::details::RepoDetails>,
     /// Whether the current selection was made automatically (not by the user).
     /// Automatic selections may be replaced when repo data is reloaded; user
     /// selections are preserved.
@@ -92,8 +141,12 @@ impl App {
             clone_repo_suggestions: Vec::new(),
             clone_repo_state: TreeState::new(),
             suggestions_loading: false,
+            mirror_dialog: None,
             pending_clones: Vec::new(),
             sync_statuses: std::collections::HashMap::new(),
+            sync_outcomes: std::collections::HashMap::new(),
+            syncing_repos: std::collections::HashSet::new(),
+            details: std::collections::HashMap::new(),
             selection_is_auto: true,
         };
         app.update_repos(workspace_repos, library_repos);
@@ -400,6 +453,9 @@ impl App {
         } else {
             self.selected_position()
         };
+
+        // A rescan may have changed anything the info panel shows
+        self.details.clear();
 
         self.library_tree = build_library_tree(library_repos.clone(), &workspace_repos);
         self.workspace_repos_list = workspace_repos;

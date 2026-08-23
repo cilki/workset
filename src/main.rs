@@ -270,7 +270,8 @@ fn main() -> Result<()> {
                                        With --force: drop even with uncommitted changes{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
   {subcmd}status{reset}                               Show workspace summary and statistics
-  {subcmd}sync{reset} {arg}[pattern]{reset}                       Mirror pushed commits to all of each repo's remotes
+  {subcmd}sync{reset} {arg}[pattern]{reset}                       Mirror pushed commits to each repo's mirror remotes
+{dim}                                       Opt in per repo: git config --add workset.mirror <remote>{reset}
 
 {examples_header}
   {cmd}workset init{reset}                              Initialize workspace here
@@ -466,7 +467,8 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     Ok(())
 }
 
-/// Mirror pushed commits across each repo's remotes, printing per-ref results
+/// Mirror pushed commits to each repo's configured mirror remotes, printing
+/// per-ref results
 fn sync_repos(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
     let repos = workset::find_git_repositories(Path::new(&workspace.path))?;
     let interrupt = std::sync::atomic::AtomicBool::new(false);
@@ -492,6 +494,13 @@ fn sync_repos(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
 
         match workset::sync::sync_repo(&repo, &interrupt) {
             Ok(outcome) => {
+                if outcome.skipped {
+                    println!("  {} - skipped (no mirror remotes)", repo_name);
+                    continue;
+                }
+                for error in &outcome.config_errors {
+                    println!("  {} - ⚠ {}", repo_name, error);
+                }
                 for (remote, refname) in &outcome.pushed {
                     println!(
                         "  {} - ✓ pushed {} to {}",
@@ -525,6 +534,7 @@ fn sync_repos(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
                     && outcome.conflicts.is_empty()
                     && outcome.push_errors.is_empty()
                     && outcome.fetch_errors.is_empty()
+                    && outcome.config_errors.is_empty()
                 {
                     println!("  {} - ✓ in sync", repo_name);
                 }
