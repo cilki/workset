@@ -270,8 +270,9 @@ fn main() -> Result<()> {
                                        With --force: drop even with uncommitted changes{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
   {subcmd}status{reset}                               Show workspace summary and statistics
-  {subcmd}sync{reset} {arg}[pattern]{reset}                       Mirror pushed commits to each repo's mirror remotes
-{dim}                                       Opt in per repo: git config --add workset.mirror <remote>{reset}
+  {subcmd}mirror{reset} {arg}[pattern]{reset} {arg}[--dryrun]{reset}          Mirror pushed commits to each repo's mirror remotes
+{dim}                                       Opt in per repo: git config --add workset.mirror <remote>
+                                       With --dryrun: show what would be pushed without pushing{reset}
 
 {examples_header}
   {cmd}workset init{reset}                              Initialize workspace here
@@ -402,10 +403,11 @@ fn main() -> Result<()> {
                     error!("Not in a workspace");
                 }
             }
-            "sync" => {
+            "mirror" => {
                 if let Some(workspace) = maybe_workspace {
+                    let dry_run = args.contains("--dryrun");
                     let pattern = args.opt_free_from_str::<String>()?;
-                    sync_repos(&workspace, pattern.as_deref())?;
+                    mirror_repos(&workspace, pattern.as_deref(), dry_run)?;
                 } else {
                     error!("Not in a workspace");
                 }
@@ -469,7 +471,7 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
 
 /// Mirror pushed commits to each repo's configured mirror remotes, printing
 /// per-ref results
-fn sync_repos(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
+fn mirror_repos(workspace: &Workspace, pattern: Option<&str>, dry_run: bool) -> Result<()> {
     let repos = workset::find_git_repositories(Path::new(&workspace.path))?;
     let interrupt = std::sync::atomic::AtomicBool::new(false);
     let short = |refname: &str| {
@@ -492,7 +494,7 @@ fn sync_repos(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
         }
         matched = true;
 
-        match workset::sync::sync_repo(&repo, &interrupt) {
+        match workset::sync::sync_repo(&repo, &interrupt, dry_run) {
             Ok(outcome) => {
                 if outcome.skipped {
                     println!("  {} - skipped (no mirror remotes)", repo_name);
@@ -504,6 +506,14 @@ fn sync_repos(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
                 for (remote, refname) in &outcome.pushed {
                     println!(
                         "  {} - ✓ pushed {} to {}",
+                        repo_name,
+                        short(refname),
+                        remote
+                    );
+                }
+                for (remote, refname) in &outcome.would_push {
+                    println!(
+                        "  {} - would push {} to {}",
                         repo_name,
                         short(refname),
                         remote
@@ -531,6 +541,7 @@ fn sync_repos(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
                     println!("  {} - ✗ fetch {} failed: {}", repo_name, remote, error);
                 }
                 if outcome.pushed.is_empty()
+                    && outcome.would_push.is_empty()
                     && outcome.conflicts.is_empty()
                     && outcome.push_errors.is_empty()
                     && outcome.fetch_errors.is_empty()
@@ -539,7 +550,7 @@ fn sync_repos(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
                     println!("  {} - ✓ in sync", repo_name);
                 }
             }
-            Err(e) => println!("  {} - ✗ sync failed: {}", repo_name, e),
+            Err(e) => println!("  {} - ✗ mirror failed: {}", repo_name, e),
         }
     }
 
@@ -698,7 +709,7 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
     if word_index <= 1 {
         // Complete subcommands
         let subcommands: &[&str] = if maybe_workspace.is_some() {
-            &["clone", "restore", "drop", "list", "ls", "status"]
+            &["clone", "restore", "drop", "list", "ls", "status", "mirror"]
         } else {
             &["init"]
         };
@@ -747,6 +758,7 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
             println!("list\tList all repositories with their status");
             println!("ls\tList all repositories with their status");
             println!("status\tShow workspace summary and statistics");
+            println!("mirror\tMirror pushed commits to each repo's mirror remotes");
         } else {
             println!("init\tInitialize a workspace in current directory");
         }

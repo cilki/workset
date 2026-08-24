@@ -293,7 +293,7 @@ impl SyncManager {
                     Ok(_) => {}
                 }
                 let _ = tx.send((repo.clone(), SyncEvent::Started));
-                let event = match crate::sync::sync_repo(&repo, &interrupt) {
+                let event = match crate::sync::sync_repo(&repo, &interrupt, false) {
                     Ok(outcome) => SyncEvent::Finished(outcome),
                     Err(e) => SyncEvent::Failed(e.to_string()),
                 };

@@ -80,6 +80,8 @@ pub struct SyncOutcome {
     pub fetch_errors: Vec<(String, String)>,
     /// (remote, refname) successfully mirrored
     pub pushed: Vec<(String, String)>,
+    /// (remote, refname) that a dry run would have pushed
+    pub would_push: Vec<(String, String)>,
     /// (remote, refname, reason) for diverged refs and rejected pushes
     pub conflicts: Vec<(String, String, String)>,
     /// (remote, refname, error) for pushes that failed for other reasons
@@ -202,7 +204,7 @@ pub fn plan_ref_sync(
 ///
 /// Blocking; intended to run on a background thread. `interrupt` is checked
 /// between git invocations and aborts the ones in flight.
-pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool) -> Result<SyncOutcome> {
+pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Result<SyncOutcome> {
     let mut outcome = SyncOutcome::default();
 
     let mirrors = mirror_remotes(repo_path, interrupt)?;
@@ -248,7 +250,7 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool) -> Result<SyncOutcome
         if fetched.is_empty() {
             outcome.fetch_errors.clear();
         } else if fetched.iter().any(|r| mirrors.contains(r)) {
-            mirror_refs(repo_path, &fetched, &mirrors, interrupt, &mut outcome)?;
+            mirror_refs(repo_path, &fetched, &mirrors, interrupt, dry_run, &mut outcome)?;
         }
     }
 
@@ -283,6 +285,7 @@ fn mirror_refs(
     remotes: &[String],
     mirrors: &[String],
     interrupt: &AtomicBool,
+    dry_run: bool,
     outcome: &mut SyncOutcome,
 ) -> Result<()> {
     let ref_states = collect_ref_states(repo_path, remotes, interrupt)?;
@@ -306,6 +309,12 @@ fn mirror_refs(
     }
 
     for (remote, refnames) in pushes {
+        if dry_run {
+            for refname in refnames {
+                outcome.would_push.push((remote.clone(), refname));
+            }
+            continue;
+        }
         if interrupt.load(Ordering::Relaxed) {
             bail!("interrupted");
         }

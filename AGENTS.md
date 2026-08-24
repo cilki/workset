@@ -30,7 +30,8 @@ drop/restore because drop moves `.git` wholesale and restore copies the original
 config back over the fresh clone.
 
 The core logic lives in `src/sync.rs`; the TUI scheduling in `SyncManager`
-(`src/tui/mod.rs`). `workset sync` runs the same logic from the CLI.
+(`src/tui/mod.rs`). `workset mirror` runs the same logic from the CLI;
+`workset mirror --dryrun` reports what would be pushed without pushing.
 
 ## Testing
 
@@ -50,4 +51,3 @@ attest --bin-dir target/debug tests/
     - Total size
     - Clean or number of outstanding changes
     - Show mirror(s) status
-- Unify the `sync` and `mirror` subcommands

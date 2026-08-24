@@ -90,8 +90,9 @@ Push to any remote (from anywhere — inside or outside workset) and the mirror
 remotes catch up in the background: all shared branches and tags are
 propagated, commits you haven't pushed anywhere are never touched, and
 diverged refs show an error instead of being force-pushed. Repos without any
-mirror remotes are left alone entirely. `workset sync` does the same from the
-command line.
+mirror remotes are left alone entirely. `workset mirror` does the same from
+the command line, and `workset mirror --dryrun` shows what would be pushed
+without pushing anything.
 
 Background pushes never prompt for credentials (SSH runs in batch mode), so
 use an SSH agent or credential helper for remotes that need authentication.
