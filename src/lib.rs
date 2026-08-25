@@ -23,18 +23,68 @@ pub struct RepoPattern {
 impl FromStr for RepoPattern {
     type Err = std::convert::Infallible;
 
-    fn from_str(path: &str) -> std::result::Result<Self, Self::Err> {
-        // If the first component looks like a domain (contains '.'), it's a provider
-        Ok(match path.split_once('/') {
+    fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
+        // Accept full clone URLs in addition to bare patterns, since that's
+        // what a user is most likely to paste. `normalize_clone_url` reduces
+        // "https://host/path", "ssh://git@host/path" and "git@host:owner/repo"
+        // down to the bare "<host>/<path>" form the rest of the logic expects.
+        let normalized = normalize_clone_url(input);
+
+        // If the first component looks like a domain (contains '.'), it's a
+        // provider.
+        Ok(match normalized.split_once('/') {
             Some((first, rest)) if first.contains('.') => Self {
                 provider: Some(first.to_string()),
                 path: rest.to_string(),
             },
             _ => Self {
                 provider: None,
-                path: path.to_string(),
+                path: normalized,
             },
         })
+    }
+}
+
+/// Reduce a git clone URL to the bare `<host>/<path>` form used by patterns,
+/// stripping the scheme, any `user@` prefix, and a trailing `.git`. Inputs that
+/// aren't clone URLs are returned unchanged apart from surrounding whitespace.
+fn normalize_clone_url(input: &str) -> String {
+    let s = input.trim();
+
+    let host_and_path = match s.split_once("://") {
+        // scheme://[user@]host[:port]/path
+        Some((_scheme, rest)) => strip_userinfo(rest),
+        None => match s.split_once('@') {
+            // scp-like git@host:owner/repo; the ':' separating host from path
+            // becomes the '/' the pattern logic splits on.
+            Some((_user, host_and_path)) if is_scp_like(host_and_path) => {
+                host_and_path.replacen(':', "/", 1)
+            }
+            _ => s.to_string(),
+        },
+    };
+
+    host_and_path
+        .strip_suffix(".git")
+        .unwrap_or(&host_and_path)
+        .to_string()
+}
+
+/// Drop a leading `user@` from the host portion of a URL, if present.
+fn strip_userinfo(host_and_rest: &str) -> String {
+    match host_and_rest.split_once('@') {
+        Some((_user, rest)) => rest.to_string(),
+        None => host_and_rest.to_string(),
+    }
+}
+
+/// Whether `host:path` uses scp-like syntax: the host/path colon appears before
+/// any '/', distinguishing `host:owner/repo` from a plain filesystem path.
+fn is_scp_like(host_and_path: &str) -> bool {
+    match (host_and_path.find(':'), host_and_path.find('/')) {
+        (Some(colon), Some(slash)) => colon < slash,
+        (Some(_), None) => true,
+        _ => false,
     }
 }
 
@@ -1545,6 +1595,38 @@ mod tests {
         let pattern = str::parse::<RepoPattern>("gitlab.com/company/project/repo")?;
         assert_eq!(pattern.provider, Some("gitlab.com".to_string()));
         assert_eq!(pattern.path, "company/project/repo".to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_https_url() -> Result<(), Box<dyn Error>> {
+        let pattern = str::parse::<RepoPattern>("https://github.com/user/repo")?;
+        assert_eq!(pattern.provider, Some("github.com".to_string()));
+        assert_eq!(pattern.path, "user/repo".to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_https_url_with_port_and_git_suffix() -> Result<(), Box<dyn Error>> {
+        let pattern = str::parse::<RepoPattern>("https://annex.cilki.net:3000/fossable/repo.git")?;
+        assert_eq!(pattern.provider, Some("annex.cilki.net:3000".to_string()));
+        assert_eq!(pattern.path, "fossable/repo".to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_ssh_url() -> Result<(), Box<dyn Error>> {
+        let pattern = str::parse::<RepoPattern>("ssh://git@gitlab.com/company/project/repo.git")?;
+        assert_eq!(pattern.provider, Some("gitlab.com".to_string()));
+        assert_eq!(pattern.path, "company/project/repo".to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_scp_like_url() -> Result<(), Box<dyn Error>> {
+        let pattern = str::parse::<RepoPattern>("git@github.com:user/repo.git")?;
+        assert_eq!(pattern.provider, Some("github.com".to_string()));
+        assert_eq!(pattern.path, "user/repo".to_string());
         Ok(())
     }
 
