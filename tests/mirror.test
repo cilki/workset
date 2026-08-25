@@ -132,6 +132,43 @@ testMirrorNeverPushesUnpushedCommits() {
 	workset list | grep "repo - ⚠ unpushed"
 }
 
+## A commit pushed to one remote from another machine propagates to the other
+## remotes, without a manual fetch and without touching the local checkout
+testMirrorPropagatesPushFromAnotherMachine() {
+	setupMirror
+	local_head=$(git -C repo rev-parse HEAD)
+
+	git clone -q -b main "$remotes/a.git" ../elsewhere
+	git -C ../elsewhere config user.email test@example.com
+	git -C ../elsewhere config user.name "Test User"
+	addCommit ../elsewhere elsewhere.txt
+	git -C ../elsewhere push -q origin main
+
+	output=$(workset mirror sync)
+
+	echo "$output" | grep "repo - ✓ pushed main to b"
+	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C ../elsewhere rev-parse HEAD)" ]
+	[ "$(git -C repo rev-parse HEAD)" = "$local_head" ]
+}
+
+## A tag pushed from another machine is mirrored, even when its commit isn't
+## in any local branch, without creating a local tag
+testMirrorPropagatesRemoteOnlyTag() {
+	setupMirror
+	git clone -q "$remotes/a.git" ../elsewhere
+	git -C ../elsewhere config user.email test@example.com
+	git -C ../elsewhere config user.name "Test User"
+	addCommit ../elsewhere tagged.txt
+	git -C ../elsewhere tag v9
+	git -C ../elsewhere push -q origin refs/tags/v9
+
+	output=$(workset mirror sync)
+
+	echo "$output" | grep "repo - ✓ pushed v9 to b"
+	[ "$(git -C "$remotes/b.git" rev-parse refs/tags/v9)" = "$(git -C ../elsewhere rev-parse refs/tags/v9)" ]
+	! git -C repo rev-parse -q --verify refs/tags/v9
+}
+
 ## A diverged remote is reported rather than force-pushed
 testMirrorReportsDivergenceWithoutForcing() {
 	setupMirror
@@ -217,6 +254,17 @@ testMirrorContinuesPastUnreachableRemote() {
 
 	echo "$output" | grep "repo - ✗ fetch c failed"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
+}
+
+## When no remote is reachable the repo is not reported as in sync
+testMirrorReportsUnreachableInsteadOfInSync() {
+	setupMirror
+	rm -rf "$remotes/a.git" "$remotes/b.git"
+
+	output=$(workset mirror sync)
+
+	echo "$output" | grep "repo - ⚠ remotes unreachable"
+	! echo "$output" | grep "in sync"
 }
 
 ## A repo with mirroring disabled is skipped entirely

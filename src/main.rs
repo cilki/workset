@@ -612,7 +612,9 @@ fn mirror_repos(workspace: &Workspace, pattern: Option<&str>, dry_run: bool) -> 
                 for (remote, error) in &outcome.fetch_errors {
                     println!("  {} - ✗ fetch {} failed: {}", repo_name, remote, error);
                 }
-                if outcome.pushed.is_empty()
+                if outcome.offline {
+                    println!("  {} - ⚠ remotes unreachable", repo_name);
+                } else if outcome.pushed.is_empty()
                     && outcome.would_push.is_empty()
                     && outcome.conflicts.is_empty()
                     && outcome.push_errors.is_empty()

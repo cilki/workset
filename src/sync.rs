@@ -2,9 +2,11 @@
 //!
 //! Mirroring is opt-in per repo, toggled with `workset mirror init` or
 //! `Ctrl+R` in the TUI. When enabled, all of the repo's remotes are mirror
-//! targets and receive refs that the user has already published to at least
-//! one remote. Repos with mirroring disabled are skipped entirely. Commits
-//! that exist only locally are never pushed automatically.
+//! targets: for every branch and tag, the newest id published to at least one
+//! remote is propagated to the remotes that are behind or missing it — even
+//! when the local checkout is behind or doesn't have the ref at all. Local
+//! refs are never modified, and commits that exist only locally are never
+//! pushed automatically. Repos with mirroring disabled are skipped entirely.
 //!
 //! gix has no push support yet, so all network operations shell out to the
 //! `git` CLI (consistent with the existing `gh`/`glab` shell-outs).
@@ -33,8 +35,8 @@ pub struct RefState {
     /// Short name, e.g. "main" or "v1.0"
     pub name: String,
     pub kind: RefKind,
-    /// Local commit (or tag object) id
-    pub local: String,
+    /// Local commit (or tag object) id, if the ref exists locally
+    pub local: Option<String>,
     /// (remote name, id of this ref on that remote, if it exists there)
     pub remotes: Vec<(String, Option<String>)>,
 }
@@ -65,6 +67,8 @@ pub enum RefDecision {
     Push {
         remote: String,
         refname: String,
+        /// Object id to push; not necessarily the local ref's id
+        from: String,
     },
     Conflict {
         remote: String,
@@ -91,6 +95,8 @@ pub struct SyncOutcome {
     pub modification_time: Option<std::time::SystemTime>,
     /// True when the repo has mirroring disabled and was not touched
     pub skipped: bool,
+    /// True when no remote could be fetched, so the mirror state is unknown
+    pub offline: bool,
 }
 
 impl SyncOutcome {
@@ -123,43 +129,54 @@ pub(crate) fn short_ref(refname: &str) -> &str {
 
 /// Decide what to do for one ref across all remotes.
 ///
-/// The mirror-only rule: a ref is only propagated if its exact local id is
-/// already present on at least one remote. Refs the user never pushed
-/// anywhere are left alone.
+/// The mirror-only rule: only ids already present on at least one remote are
+/// propagated. Refs the user never pushed anywhere are left alone, and the
+/// local ref is never modified — the newest published id flows between
+/// remotes even when the local checkout is behind or lacks the ref.
 pub fn plan_ref_sync(
     state: &RefState,
     ancestry: &mut dyn FnMut(&str, &str) -> Ancestry,
 ) -> Vec<RefDecision> {
     let refname = state.refname();
-    let exists_somewhere = state.remotes.iter().any(|(_, id)| id.is_some());
-    if !exists_somewhere {
-        // Local-only ref: never touched
+    let mut published = state.remotes.iter().filter_map(|(_, id)| id.as_deref());
+    let Some(first_published) = published.next() else {
+        // Never-published ref: never touched
         return Vec::new();
-    }
-    let published = state
-        .remotes
-        .iter()
-        .any(|(_, id)| id.as_deref() == Some(state.local.as_str()));
+    };
 
     let mut decisions = Vec::new();
     match state.kind {
         RefKind::Branch => {
-            if !published {
-                // Local id isn't on any remote: unpushed, behind, or diverged.
-                // Nothing is pushed and no error is raised.
-                return Vec::new();
+            // The candidate is the newest published id, preferring the local
+            // id when it is itself published
+            let local_published = state.local.as_deref().filter(|local| {
+                state
+                    .remotes
+                    .iter()
+                    .any(|(_, id)| id.as_deref() == Some(local))
+            });
+            let mut candidate = local_published.unwrap_or(first_published);
+            for (_, id) in &state.remotes {
+                if let Some(id) = id.as_deref()
+                    && id != candidate
+                    && ancestry(candidate, id) == Ancestry::LocalBehind
+                {
+                    candidate = id;
+                }
             }
             for (remote, id) in &state.remotes {
                 match id.as_deref() {
                     None => decisions.push(RefDecision::Push {
                         remote: remote.clone(),
                         refname: refname.clone(),
+                        from: candidate.to_string(),
                     }),
-                    Some(id) if id == state.local => {}
-                    Some(id) => match ancestry(&state.local, id) {
+                    Some(id) if id == candidate => {}
+                    Some(id) => match ancestry(candidate, id) {
                         Ancestry::LocalAhead => decisions.push(RefDecision::Push {
                             remote: remote.clone(),
                             refname: refname.clone(),
+                            from: candidate.to_string(),
                         }),
                         Ancestry::Equal | Ancestry::LocalBehind => {}
                         Ancestry::Diverged => decisions.push(RefDecision::Conflict {
@@ -172,15 +189,23 @@ pub fn plan_ref_sync(
             }
         }
         RefKind::Tag => {
-            // Tags are compared by identity only and never rewritten
+            // Tags are compared by identity only and never rewritten. A local
+            // tag takes precedence; otherwise the first remote's id is the
+            // one the others must match.
+            let candidate = state.local.as_deref().unwrap_or(first_published);
+            let published = state
+                .remotes
+                .iter()
+                .any(|(_, id)| id.as_deref() == Some(candidate));
             for (remote, id) in &state.remotes {
                 match id.as_deref() {
                     None if published => decisions.push(RefDecision::Push {
                         remote: remote.clone(),
                         refname: refname.clone(),
+                        from: candidate.to_string(),
                     }),
                     None => {}
-                    Some(id) if id == state.local => {}
+                    Some(id) if id == candidate => {}
                     Some(_) => decisions.push(RefDecision::Conflict {
                         remote: remote.clone(),
                         refname: refname.clone(),
@@ -232,9 +257,10 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Res
         }
 
         // Every fetch failing usually means we're offline; don't flag each
-        // repo as failed in that case
+        // repo as failed in that case, but don't claim it's in sync either
         if fetched.is_empty() {
             outcome.fetch_errors.clear();
+            outcome.offline = true;
         } else {
             mirror_refs(repo_path, &fetched, interrupt, dry_run, &mut outcome)?;
         }
@@ -258,15 +284,30 @@ fn mirror_refs(
 ) -> Result<()> {
     let ref_states = collect_ref_states(repo_path, remotes, interrupt)?;
 
+    // Where each published id can be fetched from, for ids (remote-only tags)
+    // that the regular fetch didn't bring into the local object database
+    let mut sources: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for state in &ref_states {
+        for (remote, id) in &state.remotes {
+            if let Some(id) = id {
+                sources
+                    .entry(id.clone())
+                    .or_insert_with(|| (remote.clone(), state.refname()));
+            }
+        }
+    }
+
     let mut ancestry =
         |local: &str, other: &str| compare_ancestry(repo_path, local, other, interrupt);
-    let mut pushes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut pushes: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for state in &ref_states {
         for decision in plan_ref_sync(state, &mut ancestry) {
             match decision {
-                RefDecision::Push { remote, refname } => {
-                    pushes.entry(remote).or_default().push(refname)
-                }
+                RefDecision::Push {
+                    remote,
+                    refname,
+                    from,
+                } => pushes.entry(remote).or_default().push((from, refname)),
                 RefDecision::Conflict {
                     remote,
                     refname,
@@ -276,9 +317,9 @@ fn mirror_refs(
         }
     }
 
-    for (remote, refnames) in pushes {
+    for (remote, refspecs) in pushes {
         if dry_run {
-            for refname in refnames {
+            for (_, refname) in refspecs {
                 outcome.would_push.push((remote.clone(), refname));
             }
             continue;
@@ -286,7 +327,51 @@ fn mirror_refs(
         if interrupt.load(Ordering::Relaxed) {
             bail!("interrupted");
         }
-        push_refs(repo_path, &remote, &refnames, interrupt, outcome);
+        let mut ready = Vec::new();
+        for (from, refname) in refspecs {
+            match ensure_object_local(repo_path, &from, &sources, interrupt) {
+                Ok(()) => ready.push((from, refname)),
+                Err(e) => outcome
+                    .push_errors
+                    .push((remote.clone(), refname, e.to_string())),
+            }
+        }
+        if !ready.is_empty() {
+            push_refs(repo_path, &remote, &ready, interrupt, outcome);
+        }
+    }
+    Ok(())
+}
+
+/// Make sure `id` exists in the local object database, fetching it from a
+/// remote that has it if necessary. The fetch uses a refspec without a
+/// destination so no local ref is created.
+fn ensure_object_local(
+    repo_path: &Path,
+    id: &str,
+    sources: &BTreeMap<String, (String, String)>,
+    interrupt: &AtomicBool,
+) -> Result<()> {
+    let out = run_git(
+        repo_path,
+        &["cat-file", "-e", id],
+        interrupt,
+        LOCAL_TIMEOUT,
+    )?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let Some((remote, refname)) = sources.get(id) else {
+        bail!("object {} not found locally or on any remote", id);
+    };
+    let out = run_git(
+        repo_path,
+        &["fetch", "--quiet", remote, refname],
+        interrupt,
+        NETWORK_TIMEOUT,
+    )?;
+    if !out.status.success() {
+        bail!("fetch {} from {}: {}", refname, remote, stderr_summary(&out));
     }
     Ok(())
 }
@@ -334,66 +419,71 @@ fn collect_ref_states(
         }
     }
 
+    // Branch names come from local branches and tracking refs alike, so a
+    // branch that only exists on remotes still gets mirrored
+    let mut branch_names: std::collections::BTreeSet<String> = branches.keys().cloned().collect();
+    branch_names.extend(tracking.keys().map(|(_, name)| name.clone()));
+
     let mut states = Vec::new();
-    for (name, local) in branches {
+    for name in branch_names {
         let remote_ids = remotes
             .iter()
             .map(|r| (r.clone(), tracking.get(&(r.clone(), name.clone())).cloned()))
             .collect();
         states.push(RefState {
+            local: branches.get(&name).cloned(),
             name,
             kind: RefKind::Branch,
-            local,
             remotes: remote_ids,
         });
     }
 
-    if !tags.is_empty() {
-        // Tracking refs don't cover tags, so ask each remote directly
-        let mut remote_tags: BTreeMap<(String, String), String> = BTreeMap::new();
-        for remote in remotes {
-            let out = run_git(
-                repo_path,
-                &["ls-remote", "--tags", remote],
-                interrupt,
-                NETWORK_TIMEOUT,
-            )?;
-            if !out.status.success() {
-                bail!(
-                    "git ls-remote --tags {} failed: {}",
-                    remote,
-                    stderr_summary(&out)
-                );
-            }
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let Some((id, refname)) = line.split_once('\t') else {
-                    continue;
-                };
-                // Skip peeled entries; tag object ids match for-each-ref output
-                if let Some(name) = refname.strip_prefix("refs/tags/")
-                    && !name.ends_with("^{}")
-                {
-                    remote_tags.insert((remote.clone(), name.to_string()), id.to_string());
-                }
+    // Tracking refs don't cover tags, so ask each remote directly
+    let mut remote_tags: BTreeMap<(String, String), String> = BTreeMap::new();
+    for remote in remotes {
+        let out = run_git(
+            repo_path,
+            &["ls-remote", "--tags", remote],
+            interrupt,
+            NETWORK_TIMEOUT,
+        )?;
+        if !out.status.success() {
+            bail!(
+                "git ls-remote --tags {} failed: {}",
+                remote,
+                stderr_summary(&out)
+            );
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some((id, refname)) = line.split_once('\t') else {
+                continue;
+            };
+            // Skip peeled entries; tag object ids match for-each-ref output
+            if let Some(name) = refname.strip_prefix("refs/tags/")
+                && !name.ends_with("^{}")
+            {
+                remote_tags.insert((remote.clone(), name.to_string()), id.to_string());
             }
         }
-        for (name, local) in tags {
-            let remote_ids = remotes
-                .iter()
-                .map(|r| {
-                    (
-                        r.clone(),
-                        remote_tags.get(&(r.clone(), name.clone())).cloned(),
-                    )
-                })
-                .collect();
-            states.push(RefState {
-                name,
-                kind: RefKind::Tag,
-                local,
-                remotes: remote_ids,
-            });
-        }
+    }
+    let mut tag_names: std::collections::BTreeSet<String> = tags.keys().cloned().collect();
+    tag_names.extend(remote_tags.keys().map(|(_, name)| name.clone()));
+    for name in tag_names {
+        let remote_ids = remotes
+            .iter()
+            .map(|r| {
+                (
+                    r.clone(),
+                    remote_tags.get(&(r.clone(), name.clone())).cloned(),
+                )
+            })
+            .collect();
+        states.push(RefState {
+            local: tags.get(&name).cloned(),
+            name,
+            kind: RefKind::Tag,
+            remotes: remote_ids,
+        });
     }
 
     Ok(states)
@@ -427,22 +517,26 @@ fn compare_ancestry(
     }
 }
 
-/// Push a batch of refs to one remote, classifying per-ref results
+/// Push a batch of (object id, destination refname) pairs to one remote,
+/// classifying per-ref results
 fn push_refs(
     repo_path: &Path,
     remote: &str,
-    refnames: &[String],
+    refs: &[(String, String)],
     interrupt: &AtomicBool,
     outcome: &mut SyncOutcome,
 ) {
-    let refspecs: Vec<String> = refnames.iter().map(|r| format!("{}:{}", r, r)).collect();
+    let refspecs: Vec<String> = refs
+        .iter()
+        .map(|(from, refname)| format!("{}:{}", from, refname))
+        .collect();
     let mut args = vec!["push", "--porcelain", remote];
     args.extend(refspecs.iter().map(|s| s.as_str()));
 
     let out = match run_git(repo_path, &args, interrupt, NETWORK_TIMEOUT) {
         Ok(out) => out,
         Err(e) => {
-            for refname in refnames {
+            for (_, refname) in refs {
                 outcome
                     .push_errors
                     .push((remote.to_string(), refname.clone(), e.to_string()));
@@ -463,7 +557,7 @@ fn push_refs(
     }
     if !out.status.success() {
         let error = stderr_summary(&out);
-        for refname in refnames {
+        for (_, refname) in refs {
             if !accounted.contains(refname) {
                 outcome
                     .push_errors
@@ -623,11 +717,11 @@ fn run_git(
 mod tests {
     use super::*;
 
-    fn branch(local: &str, remotes: &[(&str, Option<&str>)]) -> RefState {
+    fn branch(local: Option<&str>, remotes: &[(&str, Option<&str>)]) -> RefState {
         RefState {
             name: "main".to_string(),
             kind: RefKind::Branch,
-            local: local.to_string(),
+            local: local.map(|s| s.to_string()),
             remotes: remotes
                 .iter()
                 .map(|(r, id)| (r.to_string(), id.map(|s| s.to_string())))
@@ -635,11 +729,19 @@ mod tests {
         }
     }
 
-    fn tag(local: &str, remotes: &[(&str, Option<&str>)]) -> RefState {
+    fn tag(local: Option<&str>, remotes: &[(&str, Option<&str>)]) -> RefState {
         RefState {
             name: "v1".to_string(),
             kind: RefKind::Tag,
             ..branch(local, remotes)
+        }
+    }
+
+    fn push(remote: &str, refname: &str, from: &str) -> RefDecision {
+        RefDecision::Push {
+            remote: remote.to_string(),
+            refname: refname.to_string(),
+            from: from.to_string(),
         }
     }
 
@@ -663,46 +765,51 @@ mod tests {
 
     #[test]
     fn published_branch_pushed_to_remote_behind() {
-        let state = branch("b", &[("a", Some("b")), ("mirror", Some("a"))]);
+        let state = branch(Some("b"), &[("a", Some("b")), ("mirror", Some("a"))]);
         let decisions = plan_ref_sync(&state, &mut stub_ancestry(&["ab"]));
-        assert_eq!(
-            decisions,
-            vec![RefDecision::Push {
-                remote: "mirror".to_string(),
-                refname: "refs/heads/main".to_string(),
-            }]
-        );
+        assert_eq!(decisions, vec![push("mirror", "refs/heads/main", "b")]);
     }
 
     #[test]
     fn in_sync_branch_does_nothing() {
-        let state = branch("b", &[("a", Some("b")), ("mirror", Some("b"))]);
+        let state = branch(Some("b"), &[("a", Some("b")), ("mirror", Some("b"))]);
         assert!(plan_ref_sync(&state, &mut stub_ancestry(&[])).is_empty());
     }
 
     #[test]
     fn local_only_branch_untouched() {
-        let state = branch("b", &[("a", None), ("mirror", None)]);
+        let state = branch(Some("b"), &[("a", None), ("mirror", None)]);
         assert!(plan_ref_sync(&state, &mut stub_ancestry(&[])).is_empty());
     }
 
     #[test]
     fn unpushed_commits_never_auto_pushed() {
-        // Local is ahead of every remote: the user hasn't pushed anywhere
-        let state = branch("c", &[("a", Some("b")), ("mirror", Some("a"))]);
-        assert!(plan_ref_sync(&state, &mut stub_ancestry(&["ab", "bc", "ac"])).is_empty());
+        // Local is ahead of every remote: the newest published id still
+        // propagates, but the local-only commit "c" is never pushed
+        let state = branch(Some("c"), &[("a", Some("b")), ("mirror", Some("a"))]);
+        let decisions = plan_ref_sync(&state, &mut stub_ancestry(&["ab", "bc", "ac"]));
+        assert_eq!(decisions, vec![push("mirror", "refs/heads/main", "b")]);
     }
 
     #[test]
-    fn remote_ahead_of_local_skipped() {
-        // Published on mirror, but "a" has newer commits: don't touch it
-        let state = branch("b", &[("a", Some("c")), ("mirror", Some("b"))]);
-        assert!(plan_ref_sync(&state, &mut stub_ancestry(&["bc"])).is_empty());
+    fn newer_id_on_one_remote_mirrored_to_others() {
+        // A push from another machine left "a" ahead of both the local
+        // branch and mirror: mirror receives it, local is left alone
+        let state = branch(Some("b"), &[("a", Some("c")), ("mirror", Some("b"))]);
+        let decisions = plan_ref_sync(&state, &mut stub_ancestry(&["bc"]));
+        assert_eq!(decisions, vec![push("mirror", "refs/heads/main", "c")]);
+    }
+
+    #[test]
+    fn remote_only_branch_propagated() {
+        let state = branch(None, &[("a", Some("b")), ("mirror", None)]);
+        let decisions = plan_ref_sync(&state, &mut stub_ancestry(&[]));
+        assert_eq!(decisions, vec![push("mirror", "refs/heads/main", "b")]);
     }
 
     #[test]
     fn diverged_remote_reports_conflict() {
-        let state = branch("b", &[("a", Some("b")), ("mirror", Some("x"))]);
+        let state = branch(Some("b"), &[("a", Some("b")), ("mirror", Some("x"))]);
         let decisions = plan_ref_sync(&state, &mut stub_ancestry(&[]));
         assert_eq!(
             decisions,
@@ -715,34 +822,58 @@ mod tests {
     }
 
     #[test]
-    fn published_branch_created_on_remote_missing_it() {
-        let state = branch("b", &[("a", Some("b")), ("mirror", None)]);
-        let decisions = plan_ref_sync(&state, &mut stub_ancestry(&[]));
+    fn diverged_published_ids_conflict() {
+        // Two remotes diverged from each other; the local id isn't published
+        let state = branch(Some("a"), &[("a", Some("b")), ("mirror", Some("x"))]);
+        let decisions = plan_ref_sync(&state, &mut stub_ancestry(&["ab"]));
         assert_eq!(
             decisions,
-            vec![RefDecision::Push {
+            vec![RefDecision::Conflict {
                 remote: "mirror".to_string(),
                 refname: "refs/heads/main".to_string(),
+                reason: "diverged (non-fast-forward)".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn published_branch_created_on_remote_missing_it() {
+        let state = branch(Some("b"), &[("a", Some("b")), ("mirror", None)]);
+        let decisions = plan_ref_sync(&state, &mut stub_ancestry(&[]));
+        assert_eq!(decisions, vec![push("mirror", "refs/heads/main", "b")]);
     }
 
     #[test]
     fn published_tag_mirrored_to_missing_remote() {
-        let state = tag("t", &[("a", Some("t")), ("mirror", None)]);
+        let state = tag(Some("t"), &[("a", Some("t")), ("mirror", None)]);
+        let decisions = plan_ref_sync(&state, &mut stub_ancestry(&[]));
+        assert_eq!(decisions, vec![push("mirror", "refs/tags/v1", "t")]);
+    }
+
+    #[test]
+    fn remote_only_tag_propagated() {
+        let state = tag(None, &[("a", Some("t")), ("mirror", None)]);
+        let decisions = plan_ref_sync(&state, &mut stub_ancestry(&[]));
+        assert_eq!(decisions, vec![push("mirror", "refs/tags/v1", "t")]);
+    }
+
+    #[test]
+    fn tag_mismatch_reports_conflict() {
+        let state = tag(Some("t"), &[("a", Some("t")), ("mirror", Some("x"))]);
         let decisions = plan_ref_sync(&state, &mut stub_ancestry(&[]));
         assert_eq!(
             decisions,
-            vec![RefDecision::Push {
+            vec![RefDecision::Conflict {
                 remote: "mirror".to_string(),
                 refname: "refs/tags/v1".to_string(),
+                reason: "tag exists with different id".to_string(),
             }]
         );
     }
 
     #[test]
-    fn tag_mismatch_reports_conflict() {
-        let state = tag("t", &[("a", Some("t")), ("mirror", Some("x"))]);
+    fn tag_disagreement_between_remotes_conflicts() {
+        let state = tag(None, &[("a", Some("t")), ("mirror", Some("x"))]);
         let decisions = plan_ref_sync(&state, &mut stub_ancestry(&[]));
         assert_eq!(
             decisions,
@@ -756,7 +887,7 @@ mod tests {
 
     #[test]
     fn local_only_tag_untouched() {
-        let state = tag("t", &[("a", None), ("mirror", None)]);
+        let state = tag(Some("t"), &[("a", None), ("mirror", None)]);
         assert!(plan_ref_sync(&state, &mut stub_ancestry(&[])).is_empty());
     }
 

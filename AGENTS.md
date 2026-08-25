@@ -14,9 +14,12 @@ between the two should be quick and easy.
 
 Mirroring is opt-in per repo: when enabled, all of the repo's remotes become
 mirrors and receive commits the user has pushed to at least one remote (all
-shared branches plus tags). Repos with mirroring disabled are skipped entirely
-— no fetch, no network activity. Commits that exist only locally are never
-pushed. Sync runs in the background on TUI startup, after the interactive
+shared branches plus tags). Propagation is remote→remote: for each ref the
+newest published id is mirrored to the remotes that are behind or missing it,
+even when the local checkout is behind or doesn't have the ref at all (e.g. a
+push made from another machine). Local refs are never modified. Repos with
+mirroring disabled are skipped entirely — no fetch, no network activity.
+Commits that exist only locally are never pushed. Sync runs in the background on TUI startup, after the interactive
 shell exits, when a push from another terminal updates `.git/refs/remotes`,
 and periodically while the TUI is open. Diverged mirror refs are reported as
 errors, never force-pushed.

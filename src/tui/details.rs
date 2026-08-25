@@ -86,6 +86,9 @@ fn mirror_state_from_outcome(remote: &str, outcome: &SyncOutcome) -> MirrorState
     if let Some((_, error)) = outcome.fetch_errors.iter().find(|(r, _)| r == remote) {
         return MirrorState::FetchError(error.clone());
     }
+    if outcome.offline {
+        return MirrorState::FetchError("unreachable".to_string());
+    }
     let pushed = outcome.pushed.iter().filter(|(r, _)| r == remote).count();
     if pushed > 0 {
         MirrorState::Pushed(pushed)
@@ -312,6 +315,28 @@ mod tests {
                 "a".to_string(),
                 MirrorState::Conflict("main: non-fast-forward".to_string())
             )]
+        );
+    }
+
+    #[test]
+    fn offline_outcome_not_reported_as_in_sync() {
+        let outcome = SyncOutcome {
+            offline: true,
+            ..Default::default()
+        };
+        let rows = mirror_rows(&mirrors(&["a", "b"]), Some(&outcome), false);
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "a".to_string(),
+                    MirrorState::FetchError("unreachable".to_string())
+                ),
+                (
+                    "b".to_string(),
+                    MirrorState::FetchError("unreachable".to_string())
+                ),
+            ]
         );
     }
 
