@@ -854,10 +854,10 @@ mod tests {
 
     #[test]
     fn set_core_bare_appends_missing_core_section() {
-        let config = "[workset]\n\tmirror = b\n";
+        let config = "[workset]\n\tmirror = true\n";
         let updated = set_core_bare(config, false);
         assert!(updated.contains("[core]\n\tbare = false"));
-        assert!(updated.contains("mirror = b"));
+        assert!(updated.contains("mirror = true"));
     }
 
     #[test]

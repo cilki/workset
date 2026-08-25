@@ -1,10 +1,10 @@
-//! Mirror commits to a repository's opted-in mirror remotes.
+//! Mirror commits to the remotes of mirror-enabled repositories.
 //!
-//! Mirroring is opt-in per repo: remotes listed in the multi-valued local git
-//! config key `workset.mirror` receive refs that the user has already
-//! published to at least one remote. Repos without any `workset.mirror`
-//! entries are skipped entirely. Commits that exist only locally are never
-//! pushed automatically.
+//! Mirroring is opt-in per repo, toggled with `workset mirror init` or
+//! `Ctrl+R` in the TUI. When enabled, all of the repo's remotes are mirror
+//! targets and receive refs that the user has already published to at least
+//! one remote. Repos with mirroring disabled are skipped entirely. Commits
+//! that exist only locally are never pushed automatically.
 //!
 //! gix has no push support yet, so all network operations shell out to the
 //! `git` CLI (consistent with the existing `gh`/`glab` shell-outs).
@@ -89,10 +89,8 @@ pub struct SyncOutcome {
     /// Fresh status computed after fetching (tracking refs are up to date)
     pub status: Option<crate::RepoStatus>,
     pub modification_time: Option<std::time::SystemTime>,
-    /// True when the repo has no workset.mirror entries and was not touched
+    /// True when the repo has mirroring disabled and was not touched
     pub skipped: bool,
-    /// Configured mirror names that don't match any git remote
-    pub config_errors: Vec<String>,
 }
 
 impl SyncOutcome {
@@ -111,9 +109,6 @@ impl SyncOutcome {
         }
         if let Some((remote, error)) = self.fetch_errors.first() {
             return Some(format!("fetch {}: {}", remote, error));
-        }
-        if let Some(error) = self.config_errors.first() {
-            return Some(error.clone());
         }
         None
     }
@@ -198,30 +193,21 @@ pub fn plan_ref_sync(
     decisions
 }
 
-/// Fetch all remotes, then mirror published refs to the repo's configured
-/// mirror remotes (`workset.mirror`). Repos without any mirror remotes are
-/// skipped without touching the network.
+/// Fetch all remotes, then mirror published refs to every remote of a
+/// mirror-enabled repo. Repos with mirroring disabled are skipped without
+/// touching the network.
 ///
 /// Blocking; intended to run on a background thread. `interrupt` is checked
 /// between git invocations and aborts the ones in flight.
 pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Result<SyncOutcome> {
     let mut outcome = SyncOutcome::default();
 
-    let mirrors = mirror_remotes(repo_path, interrupt)?;
-    if mirrors.is_empty() {
+    if !mirror_enabled(repo_path, interrupt)? {
         outcome.skipped = true;
         return Ok(outcome);
     }
 
     let remotes = list_remotes(repo_path, interrupt)?;
-    for mirror in &mirrors {
-        if !remotes.contains(mirror) {
-            outcome
-                .config_errors
-                .push(format!("mirror remote '{}' not found", mirror));
-        }
-    }
-
     if !remotes.is_empty() {
         // All remotes are fetched, not just mirrors: the planner needs to see
         // where a ref is published, and the status recompute below needs
@@ -249,8 +235,8 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Res
         // repo as failed in that case
         if fetched.is_empty() {
             outcome.fetch_errors.clear();
-        } else if fetched.iter().any(|r| mirrors.contains(r)) {
-            mirror_refs(repo_path, &fetched, &mirrors, interrupt, dry_run, &mut outcome)?;
+        } else {
+            mirror_refs(repo_path, &fetched, interrupt, dry_run, &mut outcome)?;
         }
     }
 
@@ -261,29 +247,11 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Res
     Ok(outcome)
 }
 
-/// Keep only decisions that target a declared mirror remote
-pub fn filter_mirror_decisions(
-    decisions: Vec<RefDecision>,
-    mirrors: &[String],
-) -> Vec<RefDecision> {
-    decisions
-        .into_iter()
-        .filter(|decision| {
-            let remote = match decision {
-                RefDecision::Push { remote, .. } => remote,
-                RefDecision::Conflict { remote, .. } => remote,
-            };
-            mirrors.contains(remote)
-        })
-        .collect()
-}
-
 /// Plan mirror pushes using the state of all fetched remotes, then execute
-/// only the decisions targeting mirror remotes
+/// the resulting decisions
 fn mirror_refs(
     repo_path: &Path,
     remotes: &[String],
-    mirrors: &[String],
     interrupt: &AtomicBool,
     dry_run: bool,
     outcome: &mut SyncOutcome,
@@ -294,7 +262,7 @@ fn mirror_refs(
         |local: &str, other: &str| compare_ancestry(repo_path, local, other, interrupt);
     let mut pushes: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for state in &ref_states {
-        for decision in filter_mirror_decisions(plan_ref_sync(state, &mut ancestry), mirrors) {
+        for decision in plan_ref_sync(state, &mut ancestry) {
             match decision {
                 RefDecision::Push { remote, refname } => {
                     pushes.entry(remote).or_default().push(refname)
@@ -528,54 +496,42 @@ fn parse_push_porcelain(stdout: &str) -> Vec<(char, String, String)> {
     results
 }
 
-/// Remote names declared as replication targets via the multi-valued local
-/// git config key `workset.mirror`. Empty when the key is unset.
-pub fn mirror_remotes(repo_path: &Path, interrupt: &AtomicBool) -> Result<Vec<String>> {
+/// Whether mirroring is enabled for this repo, via the boolean local git
+/// config key `workset.mirror`. Unset or unparsable values read as disabled.
+pub fn mirror_enabled(repo_path: &Path, interrupt: &AtomicBool) -> Result<bool> {
     let out = run_git(
         repo_path,
-        &["config", "--local", "--get-all", "workset.mirror"],
+        &["config", "--local", "--get", "--type=bool", "workset.mirror"],
         interrupt,
         LOCAL_TIMEOUT,
     )?;
-    // Exit code 1 means the key is unset
-    if !out.status.success() {
-        if out.status.code() == Some(1) {
-            return Ok(Vec::new());
-        }
-        bail!("git config failed: {}", stderr_summary(&out));
-    }
-    let mut mirrors: Vec<String> = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let name = line.trim();
-        if !name.is_empty() && !mirrors.iter().any(|m| m == name) {
-            mirrors.push(name.to_string());
-        }
-    }
-    Ok(mirrors)
+    Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
 }
 
-/// Replace the repo's `workset.mirror` entries with the given set
-pub fn set_mirror_remotes(repo_path: &Path, mirrors: &[String]) -> Result<()> {
+/// Enable or disable mirroring for this repo. Disabling removes the config
+/// key entirely; absent means disabled.
+pub fn set_mirror_enabled(repo_path: &Path, enabled: bool) -> Result<()> {
     let interrupt = AtomicBool::new(false);
-    let out = run_git(
-        repo_path,
-        &["config", "--local", "--unset-all", "workset.mirror"],
-        &interrupt,
-        LOCAL_TIMEOUT,
-    )?;
-    // Exit code 5 means the key didn't exist
-    if !out.status.success() && out.status.code() != Some(5) {
-        bail!("git config --unset-all failed: {}", stderr_summary(&out));
-    }
-    for mirror in mirrors {
+    if enabled {
         let out = run_git(
             repo_path,
-            &["config", "--local", "--add", "workset.mirror", mirror],
+            &["config", "--local", "--replace-all", "workset.mirror", "true"],
             &interrupt,
             LOCAL_TIMEOUT,
         )?;
         if !out.status.success() {
-            bail!("git config --add failed: {}", stderr_summary(&out));
+            bail!("git config --replace-all failed: {}", stderr_summary(&out));
+        }
+    } else {
+        let out = run_git(
+            repo_path,
+            &["config", "--local", "--unset-all", "workset.mirror"],
+            &interrupt,
+            LOCAL_TIMEOUT,
+        )?;
+        // Exit code 5 means the key didn't exist
+        if !out.status.success() && out.status.code() != Some(5) {
+            bail!("git config --unset-all failed: {}", stderr_summary(&out));
         }
     }
     Ok(())
@@ -838,59 +794,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filter_keeps_only_mirror_decisions() {
-        let decisions = vec![
-            RefDecision::Push {
-                remote: "mirror".to_string(),
-                refname: "refs/heads/main".to_string(),
-            },
-            RefDecision::Push {
-                remote: "upstream".to_string(),
-                refname: "refs/heads/main".to_string(),
-            },
-            RefDecision::Conflict {
-                remote: "upstream".to_string(),
-                refname: "refs/heads/dev".to_string(),
-                reason: "diverged (non-fast-forward)".to_string(),
-            },
-            RefDecision::Conflict {
-                remote: "mirror".to_string(),
-                refname: "refs/heads/dev".to_string(),
-                reason: "diverged (non-fast-forward)".to_string(),
-            },
-        ];
-        let filtered = filter_mirror_decisions(decisions, &["mirror".to_string()]);
-        assert_eq!(
-            filtered,
-            vec![
-                RefDecision::Push {
-                    remote: "mirror".to_string(),
-                    refname: "refs/heads/main".to_string(),
-                },
-                RefDecision::Conflict {
-                    remote: "mirror".to_string(),
-                    refname: "refs/heads/dev".to_string(),
-                    reason: "diverged (non-fast-forward)".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn error_summary_reports_config_errors_last() {
-        let mut outcome = SyncOutcome {
-            config_errors: vec!["mirror remote 'nosuch' not found".to_string()],
-            ..Default::default()
-        };
-        assert_eq!(
-            outcome.error_summary().unwrap(),
-            "mirror remote 'nosuch' not found"
-        );
-
-        outcome
-            .fetch_errors
-            .push(("a".to_string(), "unreachable".to_string()));
-        assert_eq!(outcome.error_summary().unwrap(), "fetch a: unreachable");
-    }
 }

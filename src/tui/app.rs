@@ -11,47 +11,6 @@ use std::time::{Duration, Instant};
 pub enum AppMode {
     Normal,
     CloneRepo,
-    MirrorRemotes,
-}
-
-/// State of the mirror-remotes dialog (Ctrl+R on a workspace repo)
-pub struct MirrorDialog {
-    pub repo_path: PathBuf,
-    pub display_name: String,
-    /// (remote name, is a mirror, exists as an actual git remote)
-    pub entries: Vec<(String, bool, bool)>,
-    pub selected: usize,
-    pub error: Option<String>,
-}
-
-impl MirrorDialog {
-    pub fn move_selection(&mut self, delta: isize) {
-        let len = self.entries.len();
-        if len == 0 {
-            return;
-        }
-        let len = len as isize;
-        let current = self.selected as isize;
-        self.selected = ((current + delta).rem_euclid(len)) as usize;
-    }
-
-    /// Flip the selected entry and return the resulting set of mirror names
-    /// for the caller to persist
-    pub fn toggle_selected(&mut self) -> Vec<String> {
-        if let Some(entry) = self.entries.get_mut(self.selected) {
-            entry.1 = !entry.1;
-        }
-        self.mirrors()
-    }
-
-    /// Currently checked mirror names
-    pub fn mirrors(&self) -> Vec<String> {
-        self.entries
-            .iter()
-            .filter(|(_, is_mirror, _)| *is_mirror)
-            .map(|(name, _, _)| name.clone())
-            .collect()
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -97,7 +56,6 @@ pub struct App {
     pub clone_repo_suggestions: Vec<String>,
     pub clone_repo_state: TreeState,
     pub suggestions_loading: bool,
-    pub mirror_dialog: Option<MirrorDialog>,
     pending_clones: Vec<PendingClone>,
     /// Sync status per repo display name (Syncing or SyncFailed), overlaid on
     /// the repo rows so it survives background data refreshes
@@ -141,7 +99,6 @@ impl App {
             clone_repo_suggestions: Vec::new(),
             clone_repo_state: TreeState::new(),
             suggestions_loading: false,
-            mirror_dialog: None,
             pending_clones: Vec::new(),
             sync_statuses: std::collections::HashMap::new(),
             sync_outcomes: std::collections::HashMap::new(),

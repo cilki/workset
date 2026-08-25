@@ -17,9 +17,16 @@ pub struct RepoDetails {
     pub size_bytes: Option<u64>,
     /// Number of uncommitted changes and untracked files; 0 = clean
     pub change_count: Option<usize>,
-    /// Configured workset.mirror names and whether each matches a git remote.
-    /// `Some(vec![])` means no mirrors are configured.
-    pub mirrors: Option<Vec<(String, bool)>>,
+    /// The repo's mirror configuration; when enabled, carries the remotes
+    /// that act as mirror targets
+    pub mirrors: Option<MirrorConfig>,
+}
+
+/// Whether mirroring is enabled for a repo, and the remotes it covers
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MirrorConfig {
+    Disabled,
+    Enabled(Vec<String>),
 }
 
 impl RepoDetails {
@@ -38,25 +45,21 @@ pub enum MirrorState {
     Conflict(String),
     PushError(String),
     FetchError(String),
-    /// Configured as a mirror but no git remote by this name exists
-    UnknownRemote,
     /// No sync outcome recorded yet
     Pending,
 }
 
-/// Merge the configured mirrors with the last sync outcome and the live
-/// syncing flag into one display row per mirror
+/// Merge the mirror remotes with the last sync outcome and the live syncing
+/// flag into one display row per remote
 pub fn mirror_rows(
-    mirrors: &[(String, bool)],
+    mirrors: &[String],
     outcome: Option<&SyncOutcome>,
     syncing: bool,
 ) -> Vec<(String, MirrorState)> {
     mirrors
         .iter()
-        .map(|(name, exists)| {
-            let state = if !exists {
-                MirrorState::UnknownRemote
-            } else if syncing {
+        .map(|name| {
+            let state = if syncing {
                 MirrorState::Syncing
             } else {
                 match outcome {
@@ -97,7 +100,7 @@ fn mirror_state_from_outcome(remote: &str, outcome: &SyncOutcome) -> MirrorState
 enum DetailsEvent {
     Size(PathBuf, u64),
     Changes(PathBuf, usize),
-    Mirrors(PathBuf, Vec<(String, bool)>),
+    Mirrors(PathBuf, MirrorConfig),
     /// The job for the given repo finished
     Done(PathBuf),
 }
@@ -224,26 +227,22 @@ impl DetailsLoader {
     }
 }
 
-/// Read the repo's mirror config, marking each name with whether a matching
-/// git remote exists
-fn load_mirrors(path: &Path, interrupt: &AtomicBool) -> Vec<(String, bool)> {
-    let mirrors = crate::sync::mirror_remotes(path, interrupt).unwrap_or_default();
-    let remotes = crate::sync::list_remotes(path, interrupt).unwrap_or_default();
-    mirrors
-        .into_iter()
-        .map(|name| {
-            let exists = remotes.contains(&name);
-            (name, exists)
-        })
-        .collect()
+/// Read the repo's mirror flag; when enabled, the mirror targets are all of
+/// the repo's remotes
+fn load_mirrors(path: &Path, interrupt: &AtomicBool) -> MirrorConfig {
+    if crate::sync::mirror_enabled(path, interrupt).unwrap_or(false) {
+        MirrorConfig::Enabled(crate::sync::list_remotes(path, interrupt).unwrap_or_default())
+    } else {
+        MirrorConfig::Disabled
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn mirrors(names: &[&str]) -> Vec<(String, bool)> {
-        names.iter().map(|n| (n.to_string(), true)).collect()
+    fn mirrors(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
     }
 
     #[test]
@@ -266,12 +265,6 @@ mod tests {
         };
         let rows = mirror_rows(&mirrors(&["a"]), Some(&outcome), true);
         assert_eq!(rows, vec![("a".to_string(), MirrorState::Syncing)]);
-    }
-
-    #[test]
-    fn missing_remote_reported_even_while_syncing() {
-        let rows = mirror_rows(&[("gone".to_string(), false)], None, true);
-        assert_eq!(rows, vec![("gone".to_string(), MirrorState::UnknownRemote)]);
     }
 
     #[test]

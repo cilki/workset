@@ -37,7 +37,7 @@ subcommandsWithDescriptions() {
 	printf 'list\tList all repositories with their status\n'
 	printf 'ls\tList all repositories with their status\n'
 	printf 'status\tShow workspace summary and statistics\n'
-	printf 'mirror\tMirror pushed commits to each repo'"'"'s mirror remotes\n'
+	printf 'mirror\tMirror pushed commits to a repo'"'"'s other remotes\n'
 }
 
 ## The repos created by setupWorkspace, in completion order
@@ -159,6 +159,27 @@ testBashCompleteCompPointBeyondLine() {
 	diff <(bashComplete "workset drop " 999) <(repos)
 }
 
+## After `mirror`, its subcommands are offered
+testBashCompleteMirrorSubcommands() {
+	setupWorkspace
+
+	diff <(bashComplete "workset mirror ") <(printf 'init\nsync\n')
+}
+
+## Mirror subcommands are filtered by prefix
+testBashCompleteMirrorSubcommandPrefix() {
+	setupWorkspace
+
+	[ "$(bashComplete "workset mirror i")" = "init" ]
+}
+
+## After a mirror subcommand, repos are completed
+testBashCompleteMirrorSyncRepoPaths() {
+	setupWorkspace
+
+	diff <(bashComplete "workset mirror sync ") <(repos)
+}
+
 ## Fish gets the same suggestion outside a workspace, with a description
 testFishCompleteWithoutWorkspace() {
 	leaveWorkspace
@@ -211,6 +232,21 @@ testFishCompletePartialRepoToken() {
 	setupWorkspace
 
 	diff <(fishComplete "workset drop re" | cut -f1) <(repos)
+}
+
+## Fish offers mirror subcommands after `mirror`, even mid-token
+testFishCompleteMirrorSubcommands() {
+	setupWorkspace
+
+	diff <(fishComplete "workset mirror " | cut -f1) <(printf 'init\nsync\n')
+	diff <(fishComplete "workset mirror sy" | cut -f1) <(printf 'init\nsync\n')
+}
+
+## After a mirror subcommand, fish completes repos
+testFishCompleteMirrorSyncRepoPaths() {
+	setupWorkspace
+
+	diff <(fishComplete "workset mirror sync " | cut -f1) <(repos)
 }
 
 ## An unrecognized shell is an error

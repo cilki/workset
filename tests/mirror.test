@@ -8,9 +8,9 @@ addCommit() {
 }
 
 ## Initialize a workspace holding `repo` on branch main, with two bare remotes
-## `a` and `b` both seeded with its initial commit and both opted in as mirror
-## remotes; `a` is the upstream of main. The bare remotes live outside the
-## workspace so workset doesn't treat them as repos of their own.
+## `a` and `b` both seeded with its initial commit, and mirroring enabled;
+## `a` is the upstream of main. The bare remotes live outside the workspace so
+## workset doesn't treat them as repos of their own.
 setupMirror() {
 	mkdir remotes
 	remotes=$PWD/remotes
@@ -29,10 +29,61 @@ setupMirror() {
 
 	git -C repo remote add a "$remotes/a.git"
 	git -C repo remote add b "$remotes/b.git"
-	git -C repo config --add workset.mirror a
-	git -C repo config --add workset.mirror b
+	workset mirror init
 	git -C repo push -q -u a main
 	git -C repo push -q b main
+}
+
+## mirror init stores the flag as a boolean git config value
+testMirrorInitSetsBoolFlag() {
+	setupMirror
+
+	[ "$(git -C repo config --get --type=bool workset.mirror)" = "true" ]
+}
+
+## mirror init with a pattern only enables matching repos
+testMirrorInitPatternScopesToMatch() {
+	setupMirror
+	mkdir other
+	git -C other init -q -b main
+
+	workset mirror init repo
+
+	[ "$(git -C repo config --get --type=bool workset.mirror)" = "true" ]
+	! git -C other config --get workset.mirror
+}
+
+## Running mirror init twice reports the repo as already enabled
+testMirrorInitIsIdempotent() {
+	setupMirror
+
+	output=$(workset mirror init)
+
+	echo "$output" | grep "repo - already enabled"
+	[ "$(git -C repo config --get --type=bool workset.mirror)" = "true" ]
+}
+
+## mirror init collapses legacy multi-valued config into a single flag
+testMirrorInitRepairsLegacyConfig() {
+	setupMirror
+	git -C repo config --unset-all workset.mirror
+	git -C repo config --add workset.mirror a
+	git -C repo config --add workset.mirror b
+
+	workset mirror init
+
+	[ "$(git -C repo config --get-all workset.mirror)" = "true" ]
+
+	addCommit repo new.txt
+	git -C repo push -q a main
+	workset mirror sync | grep "repo - ✓ pushed main to b"
+}
+
+## mirror without a subcommand prints usage
+testMirrorWithoutSubcommandShowsUsage() {
+	setupMirror
+
+	workset mirror 2>&1 | grep "Usage: workset mirror"
 }
 
 ## A commit the user pushed to one remote is mirrored to the others
@@ -41,7 +92,7 @@ testMirrorMirrorsPushedCommit() {
 	addCommit repo new.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror)
+	output=$(workset mirror sync)
 
 	echo "$output" | grep "repo - ✓ pushed main to b"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
@@ -55,13 +106,13 @@ testMirrorDryrunReportsWithoutPushing() {
 	addCommit repo new.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror --dryrun)
+	output=$(workset mirror sync --dryrun)
 
 	echo "$output" | grep "repo - would push main to b"
 	! echo "$output" | grep "✓ pushed"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$seeded" ]
 
-	output=$(workset mirror)
+	output=$(workset mirror sync)
 
 	echo "$output" | grep "repo - ✓ pushed main to b"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
@@ -73,7 +124,7 @@ testMirrorNeverPushesUnpushedCommits() {
 	seeded=$(git -C repo rev-parse HEAD)
 	addCommit repo local-only.txt
 
-	output=$(workset mirror)
+	output=$(workset mirror sync)
 
 	echo "$output" | grep "repo - ✓ in sync"
 	[ "$(git -C "$remotes/a.git" rev-parse main)" = "$seeded" ]
@@ -93,7 +144,7 @@ testMirrorReportsDivergenceWithoutForcing() {
 	addCommit repo kept.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror)
+	output=$(workset mirror sync)
 
 	echo "$output" | grep "repo - ⚠ main on b:"
 	! echo "$output" | grep "pushed main to b"
@@ -107,7 +158,7 @@ testMirrorLeavesLocalOnlyBranchAlone() {
 	addCommit repo feature.txt
 	git -C repo checkout -q main
 
-	output=$(workset mirror)
+	output=$(workset mirror sync)
 
 	echo "$output" | grep "repo - ✓ in sync"
 	! git -C "$remotes/a.git" rev-parse --verify refs/heads/feature
@@ -128,7 +179,7 @@ testMirrorMirrorsTagsAndReportsMismatch() {
 	git -C repo push -q a refs/tags/v2
 	git -C "$remotes/b.git" update-ref refs/tags/v2 "$old_head"
 
-	output=$(workset mirror)
+	output=$(workset mirror sync)
 
 	echo "$output" | grep "repo - ⚠ v2 on b:"
 	[ "$(git -C "$remotes/b.git" rev-parse refs/tags/v1)" = "$(git -C repo rev-parse refs/tags/v1)" ]
@@ -146,7 +197,7 @@ testMirrorRefreshesStaleUnpushedStatus() {
 	git -C repo update-ref refs/remotes/a/main HEAD~1
 	workset list | grep "repo - ⚠ unpushed"
 
-	workset mirror
+	workset mirror sync
 
 	workset list | grep "repo - ✓ clean"
 }
@@ -162,13 +213,13 @@ testMirrorContinuesPastUnreachableRemote() {
 	addCommit repo new.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror)
+	output=$(workset mirror sync)
 
 	echo "$output" | grep "repo - ✗ fetch c failed"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
 }
 
-## A repo without workset.mirror config is skipped entirely
+## A repo with mirroring disabled is skipped entirely
 testMirrorSkipsRepoWithoutMirrorConfig() {
 	setupMirror
 	git -C repo config --unset-all workset.mirror
@@ -176,69 +227,9 @@ testMirrorSkipsRepoWithoutMirrorConfig() {
 	addCommit repo new.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror)
+	output=$(workset mirror sync)
 
-	echo "$output" | grep "repo - skipped (no mirror remotes)"
+	echo "$output" | grep "repo - skipped (mirroring disabled)"
 	! echo "$output" | grep "pushed"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$seeded" ]
-}
-
-## A commit published on a non-mirror remote is still replicated to mirrors
-testMirrorMirrorsOnlyToConfiguredMirror() {
-	setupMirror
-	git -C repo config --unset-all workset.mirror
-	git -C repo config --add workset.mirror b
-	addCommit repo new.txt
-	git -C repo push -q a main
-
-	output=$(workset mirror)
-
-	echo "$output" | grep "repo - ✓ pushed main to b"
-	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
-}
-
-## A non-mirror remote is left behind without being flagged as a problem
-testMirrorLeavesNonMirrorRemoteBehind() {
-	setupMirror
-	git -C repo config --unset-all workset.mirror
-	git -C repo config --add workset.mirror b
-	seeded=$(git -C "$remotes/a.git" rev-parse main)
-	addCommit repo new.txt
-	git -C repo push -q b main
-
-	output=$(workset mirror)
-
-	echo "$output" | grep "repo - ✓ in sync"
-	[ "$(git -C "$remotes/a.git" rev-parse main)" = "$seeded" ]
-}
-
-## Divergence on a non-mirror remote is not reported as a conflict
-testMirrorIgnoresConflictsOnNonMirrorRemotes() {
-	setupMirror
-	git -C repo config --unset-all workset.mirror
-	git -C repo config --add workset.mirror b
-	# Push one commit to a, then abandon it and push a different one to b,
-	# leaving non-mirror a diverged from the published history
-	addCommit repo abandoned.txt
-	git -C repo push -q a main
-	abandoned=$(git -C repo rev-parse HEAD)
-	git -C repo reset -q --hard HEAD~1
-	addCommit repo kept.txt
-	git -C repo push -q b main
-
-	output=$(workset mirror)
-
-	echo "$output" | grep "repo - ✓ in sync"
-	! echo "$output" | grep "⚠ main on a"
-	[ "$(git -C "$remotes/a.git" rev-parse main)" = "$abandoned" ]
-}
-
-## A configured mirror that doesn't match any remote is reported
-testMirrorReportsUnknownMirrorRemote() {
-	setupMirror
-	git -C repo config --add workset.mirror nosuch
-
-	output=$(workset mirror)
-
-	echo "$output" | grep "repo - ⚠ mirror remote 'nosuch' not found"
 }

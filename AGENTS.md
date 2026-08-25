@@ -12,26 +12,25 @@ between the two should be quick and easy.
 
 ## Mirroring
 
-Mirroring is opt-in per repo: remotes listed in the multi-valued local git
-config key `workset.mirror` receive commits the user has pushed to at least one
-remote (all shared branches plus tags). Repos without any `workset.mirror`
-entries are skipped entirely — no fetch, no network activity. When mirrors are
-configured, all remotes are still fetched (the planner needs to see where a ref
-is published, and the status display needs fresh tracking refs), but only mirror
-remotes are pushed to; divergence on a non-mirror remote is not an error.
-Commits that exist only locally are never pushed. Sync runs in the background on
-TUI startup, after the interactive shell exits, when a push from another
-terminal updates `.git/refs/remotes`, and periodically while the TUI is open.
-Diverged mirror refs are reported as errors, never force-pushed.
+Mirroring is opt-in per repo: when enabled, all of the repo's remotes become
+mirrors and receive commits the user has pushed to at least one remote (all
+shared branches plus tags). Repos with mirroring disabled are skipped entirely
+— no fetch, no network activity. Commits that exist only locally are never
+pushed. Sync runs in the background on TUI startup, after the interactive
+shell exits, when a push from another terminal updates `.git/refs/remotes`,
+and periodically while the TUI is open. Diverged mirror refs are reported as
+errors, never force-pushed.
 
-Mirror remotes are toggled in the TUI with `Ctrl+R` on a workspace repo, or
-manually with `git config --add workset.mirror <remote>`. The config survives
-drop/restore because drop moves `.git` wholesale and restore copies the original
-config back over the fresh clone.
+Mirroring is enabled with `workset mirror init [pattern]` (without a pattern:
+all repos under the current directory), or toggled in the TUI with `Ctrl+R` on
+a workspace repo. The flag is stored in the boolean local git config key
+`workset.mirror` and survives drop/restore because drop moves `.git` wholesale
+and restore copies the original config back over the fresh clone.
 
 The core logic lives in `src/sync.rs`; the TUI scheduling in `SyncManager`
-(`src/tui/mod.rs`). `workset mirror` runs the same logic from the CLI;
-`workset mirror --dryrun` reports what would be pushed without pushing.
+(`src/tui/mod.rs`). `workset mirror sync` runs the same logic from the CLI;
+`workset mirror sync --dryrun` reports what would be pushed without pushing,
+and `workset mirror sync --watch` re-runs the sync every few minutes.
 
 ## Testing
 
