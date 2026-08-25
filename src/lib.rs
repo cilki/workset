@@ -275,7 +275,12 @@ pub fn check_repo_status_and_modification_time(
     let (change_count, dirty_files_time) = scan_worktree_changes(&repo, repo_path);
 
     let Some(head_ref) = head_referent(&repo) else {
-        return Ok((RepoStatus::NoCommits, Some(dirty_files_time)));
+        // With no commits, the only timestamp available is from dirty files.
+        // If the worktree is also clean, `dirty_files_time` is still at
+        // UNIX_EPOCH, which is not a real modification time — report None so
+        // callers don't render it as a spurious "56y ago".
+        let mod_time = (change_count > 0).then_some(dirty_files_time);
+        return Ok((RepoStatus::NoCommits, mod_time));
     };
 
     if change_count > 0 {
@@ -875,6 +880,34 @@ mod tests {
         fs::create_dir_all(&library_path).unwrap();
 
         assert!(workspace.library_contains(repo_path));
+    }
+
+    #[test]
+    fn no_commits_clean_repo_reports_no_modification_time() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        gix::init(repo_path).unwrap();
+
+        let (status, mod_time) = check_repo_status_and_modification_time(repo_path).unwrap();
+        assert_eq!(status, RepoStatus::NoCommits);
+        // A brand-new repo with no commits and a clean worktree has no
+        // meaningful modification time.
+        assert_eq!(mod_time, None);
+    }
+
+    #[test]
+    fn no_commits_dirty_repo_reports_file_time() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        gix::init(repo_path).unwrap();
+        fs::write(repo_path.join("untracked.txt"), "hello").unwrap();
+
+        let (status, mod_time) = check_repo_status_and_modification_time(repo_path).unwrap();
+        assert_eq!(status, RepoStatus::NoCommits);
+        // With an untracked file present there is a real time to report,
+        // and it must not be the UNIX_EPOCH sentinel.
+        let time = mod_time.expect("expected a modification time from the untracked file");
+        assert!(time > std::time::SystemTime::UNIX_EPOCH);
     }
 
     #[test]
