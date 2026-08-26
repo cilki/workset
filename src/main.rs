@@ -9,6 +9,28 @@ use workset::Workspace;
 /// How often `mirror sync --watch` re-runs; matches the TUI's SYNC_INTERVAL
 const WATCH_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Subcommands offered by shell completion when inside a workspace, each paired
+/// with the one-line description shown by shells that display it (e.g. fish).
+/// Shared by the bash and fish completers so the two can't drift apart.
+const WORKSPACE_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("clone", "Clone new repository(ies) to workspace"),
+    ("restore", "Restore repository(ies) from library"),
+    ("drop", "Drop one or more repositories"),
+    ("list", "List all repositories with their status"),
+    ("ls", "List all repositories with their status"),
+    ("status", "Show workspace summary and statistics"),
+    ("mirror", "Mirror pushed commits to a repo's other remotes"),
+];
+
+/// Subcommand offered when the current directory is not yet a workspace.
+const INIT_SUBCOMMAND: (&str, &str) = ("init", "Initialize a workspace in current directory");
+
+/// `mirror` sub-subcommands offered by shell completion.
+const MIRROR_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("init", "Enable mirroring for repository(ies)"),
+    ("sync", "Mirror pushed commits to the remotes of enabled repos"),
+];
+
 /// ANSI color codes
 mod colors {
     pub const RESET: &str = "\x1b[0m";
@@ -781,12 +803,12 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
 
     if word_index <= 1 {
         // Complete subcommands
-        let subcommands: &[&str] = if maybe_workspace.is_some() {
-            &["clone", "restore", "drop", "list", "ls", "status", "mirror"]
+        let subcommands: &[(&str, &str)] = if maybe_workspace.is_some() {
+            WORKSPACE_SUBCOMMANDS
         } else {
-            &["init"]
+            std::slice::from_ref(&INIT_SUBCOMMAND)
         };
-        for subcommand in subcommands {
+        for (subcommand, _) in subcommands {
             if subcommand.starts_with(current_word) {
                 println!("{}", subcommand);
             }
@@ -795,7 +817,7 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
         // Complete repository paths based on the subcommand
         let subcommand = words.get(1).unwrap_or(&"");
         if *subcommand == "mirror" && word_index == 2 {
-            for sub in ["init", "sync"] {
+            for (sub, _) in MIRROR_SUBCOMMANDS {
                 if sub.starts_with(current_word) {
                     println!("{}", sub);
                 }
@@ -830,16 +852,13 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
     // Determine what to complete based on context
     if words.len() <= 1 || (words.len() == 2 && !comp_line.ends_with(' ')) {
         // Complete subcommands
-        if maybe_workspace.is_some() {
-            println!("clone\tClone new repository(ies) to workspace");
-            println!("restore\tRestore repository(ies) from library");
-            println!("drop\tDrop one or more repositories");
-            println!("list\tList all repositories with their status");
-            println!("ls\tList all repositories with their status");
-            println!("status\tShow workspace summary and statistics");
-            println!("mirror\tMirror pushed commits to a repo's other remotes");
+        let subcommands: &[(&str, &str)] = if maybe_workspace.is_some() {
+            WORKSPACE_SUBCOMMANDS
         } else {
-            println!("init\tInitialize a workspace in current directory");
+            std::slice::from_ref(&INIT_SUBCOMMAND)
+        };
+        for (name, description) in subcommands {
+            println!("{}\t{}", name, description);
         }
     } else if let Some(workspace) = maybe_workspace {
         // Complete repository paths based on the subcommand
@@ -847,8 +866,9 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
         if *subcommand == "mirror"
             && (words.len() == 2 || (words.len() == 3 && !comp_line.ends_with(' ')))
         {
-            println!("init\tEnable mirroring for repository(ies)");
-            println!("sync\tMirror pushed commits to the remotes of enabled repos");
+            for (name, description) in MIRROR_SUBCOMMANDS {
+                println!("{}\t{}", name, description);
+            }
         } else if *subcommand == "restore" {
             // For restore, complete from library
             if let Ok(library_repos) = workspace.list_library() {
