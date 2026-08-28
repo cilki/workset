@@ -1,12 +1,16 @@
 //! Mirror commits to the remotes of mirror-enabled repositories.
 //!
 //! Mirroring is opt-in per repo, toggled with `workset mirror init` or
-//! `Ctrl+R` in the TUI. When enabled, all of the repo's remotes are mirror
-//! targets: for every branch and tag, the newest id published to at least one
-//! remote is propagated to the remotes that are behind or missing it — even
-//! when the local checkout is behind or doesn't have the ref at all. Local
-//! refs are never modified, and commits that exist only locally are never
-//! pushed automatically. Repos with mirroring disabled are skipped entirely.
+//! `Ctrl+R` in the TUI. The multi-valued local config keys
+//! `workset.mirrorBranches` and `workset.mirrorTags` hold glob patterns
+//! selecting which branches and tags to mirror; mirroring is enabled iff at
+//! least one pattern is set. When enabled, all of the repo's remotes are
+//! mirror targets: for every selected branch and tag, the newest id published
+//! to at least one remote is propagated to the remotes that are behind or
+//! missing it — even when the local checkout is behind or doesn't have the
+//! ref at all. Local refs are never modified, and commits that exist only
+//! locally are never pushed automatically. Repos with mirroring disabled are
+//! skipped entirely.
 //!
 //! gix has no push support yet, so all network operations shell out to the
 //! `git` CLI (consistent with the existing `gh`/`glab` shell-outs).
@@ -227,7 +231,8 @@ pub fn plan_ref_sync(
 pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Result<SyncOutcome> {
     let mut outcome = SyncOutcome::default();
 
-    if !mirror_enabled(repo_path, interrupt)? {
+    let patterns = mirror_patterns(repo_path, interrupt)?;
+    if !patterns.enabled() {
         outcome.skipped = true;
         return Ok(outcome);
     }
@@ -262,7 +267,7 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Res
             outcome.fetch_errors.clear();
             outcome.offline = true;
         } else {
-            mirror_refs(repo_path, &fetched, interrupt, dry_run, &mut outcome)?;
+            mirror_refs(repo_path, &fetched, &patterns, interrupt, dry_run, &mut outcome)?;
         }
     }
 
@@ -278,11 +283,12 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Res
 fn mirror_refs(
     repo_path: &Path,
     remotes: &[String],
+    patterns: &MirrorPatterns,
     interrupt: &AtomicBool,
     dry_run: bool,
     outcome: &mut SyncOutcome,
 ) -> Result<()> {
-    let ref_states = collect_ref_states(repo_path, remotes, interrupt)?;
+    let ref_states = collect_ref_states(repo_path, remotes, patterns, interrupt)?;
 
     // Where each published id can be fetched from, for ids (remote-only tags)
     // that the regular fetch didn't bring into the local object database
@@ -376,10 +382,12 @@ fn ensure_object_local(
     Ok(())
 }
 
-/// Gather the local and per-remote state of every branch and tag
+/// Gather the local and per-remote state of every branch and tag selected by
+/// the repo's mirror patterns
 fn collect_ref_states(
     repo_path: &Path,
     remotes: &[String],
+    patterns: &MirrorPatterns,
     interrupt: &AtomicBool,
 ) -> Result<Vec<RefState>> {
     let out = run_git(
@@ -423,6 +431,7 @@ fn collect_ref_states(
     // branch that only exists on remotes still gets mirrored
     let mut branch_names: std::collections::BTreeSet<String> = branches.keys().cloned().collect();
     branch_names.extend(tracking.keys().map(|(_, name)| name.clone()));
+    branch_names.retain(|name| patterns.matches_branch(name));
 
     let mut states = Vec::new();
     for name in branch_names {
@@ -436,6 +445,11 @@ fn collect_ref_states(
             kind: RefKind::Branch,
             remotes: remote_ids,
         });
+    }
+
+    // With no tag patterns there is nothing to ask the remotes about
+    if patterns.tags.is_empty() {
+        return Ok(states);
     }
 
     // Tracking refs don't cover tags, so ask each remote directly
@@ -468,6 +482,7 @@ fn collect_ref_states(
     }
     let mut tag_names: std::collections::BTreeSet<String> = tags.keys().cloned().collect();
     tag_names.extend(remote_tags.keys().map(|(_, name)| name.clone()));
+    tag_names.retain(|name| patterns.matches_tag(name));
     for name in tag_names {
         let remote_ids = remotes
             .iter()
@@ -590,36 +605,85 @@ fn parse_push_porcelain(stdout: &str) -> Vec<(char, String, String)> {
     results
 }
 
-/// Whether mirroring is enabled for this repo, via the boolean local git
-/// config key `workset.mirror`. Unset or unparsable values read as disabled.
-pub fn mirror_enabled(repo_path: &Path, interrupt: &AtomicBool) -> Result<bool> {
-    let out = run_git(
-        repo_path,
-        &["config", "--local", "--get", "--type=bool", "workset.mirror"],
-        interrupt,
-        LOCAL_TIMEOUT,
-    )?;
-    Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
+/// Branch and tag glob patterns controlling what a repo mirrors, from the
+/// multi-valued local git config keys `workset.mirrorBranches` and
+/// `workset.mirrorTags`. Mirroring is enabled iff at least one pattern is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirrorPatterns {
+    pub branches: Vec<String>,
+    pub tags: Vec<String>,
 }
 
-/// Enable or disable mirroring for this repo. Disabling removes the config
-/// key entirely; absent means disabled.
-pub fn set_mirror_enabled(repo_path: &Path, enabled: bool) -> Result<()> {
-    let interrupt = AtomicBool::new(false);
-    if enabled {
+impl MirrorPatterns {
+    pub fn enabled(&self) -> bool {
+        !self.branches.is_empty() || !self.tags.is_empty()
+    }
+
+    pub fn matches_branch(&self, name: &str) -> bool {
+        self.branches.iter().any(|p| glob_match(p, name))
+    }
+
+    pub fn matches_tag(&self, name: &str) -> bool {
+        self.tags.iter().any(|p| glob_match(p, name))
+    }
+}
+
+/// Render a pattern list for terminal output
+pub fn display_patterns(patterns: &[String]) -> String {
+    if patterns.is_empty() {
+        "(none)".to_string()
+    } else {
+        patterns.join(", ")
+    }
+}
+
+/// Git-style wildmatch: `*` matches any sequence (including `/`), `?` matches
+/// one character, `[...]` classes work
+fn glob_match(pattern: &str, name: &str) -> bool {
+    gix::glob::wildmatch(
+        gix::bstr::BStr::new(pattern),
+        gix::bstr::BStr::new(name),
+        gix::glob::wildmatch::Mode::empty(),
+    )
+}
+
+/// Read the repo's mirror patterns. Absent keys read as empty lists, so a
+/// repo without mirror config (including the legacy `workset.mirror` boolean,
+/// which is ignored) reads as disabled.
+pub fn mirror_patterns(repo_path: &Path, interrupt: &AtomicBool) -> Result<MirrorPatterns> {
+    let get_all = |key: &str| -> Result<Vec<String>> {
         let out = run_git(
             repo_path,
-            &["config", "--local", "--replace-all", "workset.mirror", "true"],
-            &interrupt,
+            &["config", "--local", "--get-all", key],
+            interrupt,
             LOCAL_TIMEOUT,
         )?;
         if !out.status.success() {
-            bail!("git config --replace-all failed: {}", stderr_summary(&out));
+            return Ok(Vec::new());
         }
-    } else {
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    };
+    Ok(MirrorPatterns {
+        branches: get_all("workset.mirrorBranches")?,
+        tags: get_all("workset.mirrorTags")?,
+    })
+}
+
+/// Write the repo's mirror patterns, replacing whatever was set before.
+/// Writing `MirrorPatterns::default()` removes both keys, disabling mirroring.
+pub fn set_mirror_patterns(repo_path: &Path, patterns: &MirrorPatterns) -> Result<()> {
+    let interrupt = AtomicBool::new(false);
+    for (key, values) in [
+        ("workset.mirrorBranches", &patterns.branches),
+        ("workset.mirrorTags", &patterns.tags),
+    ] {
         let out = run_git(
             repo_path,
-            &["config", "--local", "--unset-all", "workset.mirror"],
+            &["config", "--local", "--unset-all", key],
             &interrupt,
             LOCAL_TIMEOUT,
         )?;
@@ -627,8 +691,66 @@ pub fn set_mirror_enabled(repo_path: &Path, enabled: bool) -> Result<()> {
         if !out.status.success() && out.status.code() != Some(5) {
             bail!("git config --unset-all failed: {}", stderr_summary(&out));
         }
+        for value in values {
+            let out = run_git(
+                repo_path,
+                &["config", "--local", "--add", key, value],
+                &interrupt,
+                LOCAL_TIMEOUT,
+            )?;
+            if !out.status.success() {
+                bail!("git config --add failed: {}", stderr_summary(&out));
+            }
+        }
     }
     Ok(())
+}
+
+/// The repo's default branch name: the branch origin/HEAD points at, else
+/// `main` or `master` if either exists locally or on a remote, else the
+/// current branch, else the literal "main" (e.g. on a detached HEAD)
+pub fn default_branch(repo_path: &Path, interrupt: &AtomicBool) -> String {
+    let symbolic_ref = |name: &str| -> Option<String> {
+        let out = run_git(
+            repo_path,
+            &["symbolic-ref", "--quiet", "--short", name],
+            interrupt,
+            LOCAL_TIMEOUT,
+        )
+        .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    if let Some(target) = symbolic_ref("refs/remotes/origin/HEAD")
+        && let Some(branch) = target.strip_prefix("origin/")
+    {
+        return branch.to_string();
+    }
+
+    let ref_exists = |refname: &str| {
+        run_git(
+            repo_path,
+            &["show-ref", "--verify", "--quiet", refname],
+            interrupt,
+            LOCAL_TIMEOUT,
+        )
+        .is_ok_and(|out| out.status.success())
+    };
+    let remotes = list_remotes(repo_path, interrupt).unwrap_or_default();
+    for candidate in ["main", "master"] {
+        if ref_exists(&format!("refs/heads/{candidate}"))
+            || remotes
+                .iter()
+                .any(|r| ref_exists(&format!("refs/remotes/{r}/{candidate}")))
+        {
+            return candidate.to_string();
+        }
+    }
+
+    symbolic_ref("HEAD").unwrap_or_else(|| "main".to_string())
 }
 
 /// List the repository's configured remotes
@@ -925,4 +1047,53 @@ mod tests {
         );
     }
 
+    fn patterns(branches: &[&str], tags: &[&str]) -> MirrorPatterns {
+        MirrorPatterns {
+            branches: branches.iter().map(|p| p.to_string()).collect(),
+            tags: tags.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn glob_match_literal() {
+        assert!(glob_match("main", "main"));
+        assert!(!glob_match("main", "maintenance"));
+        assert!(!glob_match("main", "master"));
+    }
+
+    #[test]
+    fn glob_match_star_crosses_slashes() {
+        assert!(glob_match("*", "release/1.0/hotfix"));
+        assert!(glob_match("release/*", "release/1.0/hotfix"));
+        assert!(glob_match("v*", "v1.2.3"));
+        assert!(!glob_match("v*", "1.2.3"));
+    }
+
+    #[test]
+    fn glob_match_question_mark_single_char() {
+        assert!(glob_match("v?", "v1"));
+        assert!(!glob_match("v?", "v12"));
+    }
+
+    #[test]
+    fn mirror_patterns_match_any_value() {
+        let p = patterns(&["main", "release/*"], &[]);
+        assert!(p.matches_branch("main"));
+        assert!(p.matches_branch("release/1.0"));
+        assert!(!p.matches_branch("feature"));
+    }
+
+    #[test]
+    fn mirror_patterns_enabled_by_either_list() {
+        assert!(!patterns(&[], &[]).enabled());
+        assert!(patterns(&["main"], &[]).enabled());
+        assert!(patterns(&[], &["*"]).enabled());
+    }
+
+    #[test]
+    fn empty_pattern_list_matches_nothing() {
+        let p = patterns(&[], &["*"]);
+        assert!(!p.matches_branch("main"));
+        assert!(p.matches_tag("v1"));
+    }
 }

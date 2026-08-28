@@ -88,9 +88,16 @@ workset mirror init <repo>
 
 Once enabled, all of the repo's remotes become mirrors. Push to any remote
 (from anywhere — inside or outside workset) and the others catch up in the
-background: all shared branches and tags are propagated, commits you haven't
-pushed anywhere are never touched, and diverged refs show an error instead of
-being force-pushed. Repos that haven't opted in are left alone entirely.
+background: the selected branches and tags are propagated, commits you
+haven't pushed anywhere are never touched, and diverged refs show an error
+instead of being force-pushed. Repos that haven't opted in are left alone
+entirely. By default the repo's default branch and all tags are mirrored;
+glob patterns select more (or fewer) refs:
+
+```sh
+workset mirror init <repo> --branches main --branches 'release/*' --tags 'v*'
+```
+
 `workset mirror sync` does the same from the command line,
 `workset mirror sync --dryrun` shows what would be pushed without pushing
 anything, and `workset mirror sync --watch` keeps syncing every few minutes.

@@ -279,10 +279,10 @@ impl SyncManager {
             let tx = self.tx.clone();
             let interrupt = self.interrupt.clone();
             std::thread::spawn(move || {
-                // Check the mirror flag before reporting Started so disabled
+                // Check the mirror config before reporting Started so disabled
                 // repos never flash a "syncing" status
-                match crate::sync::mirror_enabled(&repo, &interrupt) {
-                    Ok(false) => {
+                match crate::sync::mirror_patterns(&repo, &interrupt) {
+                    Ok(patterns) if !patterns.enabled() => {
                         let _ = tx.send((repo, SyncEvent::Skipped));
                         return;
                     }
@@ -290,7 +290,7 @@ impl SyncManager {
                         let _ = tx.send((repo, SyncEvent::Failed(e.to_string())));
                         return;
                     }
-                    Ok(true) => {}
+                    Ok(_) => {}
                 }
                 let _ = tx.send((repo.clone(), SyncEvent::Started));
                 let event = match crate::sync::sync_repo(&repo, &interrupt, false) {
@@ -701,8 +701,22 @@ fn run_app<B: ratatui::backend::Backend>(
                                 .map(|repo| repo.path.clone())
                         {
                             let interrupt = AtomicBool::new(false);
-                            if let Ok(enabled) = crate::sync::mirror_enabled(&repo_path, &interrupt)
-                                && crate::sync::set_mirror_enabled(&repo_path, !enabled).is_ok()
+                            if let Ok(patterns) =
+                                crate::sync::mirror_patterns(&repo_path, &interrupt)
+                                && crate::sync::set_mirror_patterns(
+                                    &repo_path,
+                                    &if patterns.enabled() {
+                                        crate::sync::MirrorPatterns::default()
+                                    } else {
+                                        crate::sync::MirrorPatterns {
+                                            branches: vec![crate::sync::default_branch(
+                                                &repo_path, &interrupt,
+                                            )],
+                                            tags: vec!["*".to_string()],
+                                        }
+                                    },
+                                )
+                                .is_ok()
                             {
                                 // Re-read the info panel's mirror status
                                 app.details.remove(&repo_path);
@@ -1013,14 +1027,22 @@ fn info_panel_lines(app: &App) -> Vec<Line<'static>> {
                 Span::styled(hint, dim),
             ]));
         }
-        Some(MirrorConfig::Enabled(remotes)) if remotes.is_empty() => {
+        Some(MirrorConfig::Enabled { remotes, .. }) if remotes.is_empty() => {
             lines.push(Line::from(vec![
                 Span::styled("Mirrors: ", dim),
                 Span::styled("no remotes", dim),
             ]));
         }
-        Some(MirrorConfig::Enabled(remotes)) => {
+        Some(MirrorConfig::Enabled { remotes, patterns }) => {
             lines.push(Line::from(Span::styled("Mirrors:", dim)));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  branches: {}  tags: {}",
+                    crate::sync::display_patterns(&patterns.branches),
+                    crate::sync::display_patterns(&patterns.tags),
+                ),
+                dim,
+            )));
             let outcome = app.sync_outcomes.get(&repo.path);
             let syncing = app.syncing_repos.contains(&repo.path);
             for (name, state) in mirror_rows(remotes, outcome, syncing) {

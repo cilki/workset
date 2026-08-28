@@ -274,9 +274,12 @@ fn main() -> Result<()> {
                                        With --force: drop even with uncommitted changes{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
   {subcmd}status{reset}                               Show workspace summary and statistics
-  {subcmd}mirror init{reset} {arg}[pattern]{reset}                Enable mirroring for repository(ies)
-{dim}                                       All remotes of an enabled repo become mirrors
-                                       Without pattern: enables all in current directory{reset}
+  {subcmd}mirror init{reset} {arg}[pattern]{reset} {arg}[--branches <glob>]{reset} {arg}[--tags <glob>]{reset}
+{dim}                                       Enable mirroring: all remotes of an enabled repo
+                                       become mirrors for the selected branches and tags
+                                       Without pattern: enables all in current directory
+                                       Defaults: the repo's default branch and all tags
+                                       Repeat --branches/--tags to add more patterns{reset}
   {subcmd}mirror sync{reset} {arg}[pattern]{reset} {arg}[--dryrun]{reset} {arg}[--watch]{reset}
 {dim}                                       Mirror pushed commits to the remotes of enabled repos
                                        With --dryrun: show what would be pushed without pushing
@@ -292,6 +295,7 @@ fn main() -> Result<()> {
   {cmd}workset drop --delete ./old_repo{reset}          Permanently delete a repo
   {cmd}workset drop --force ./dirty_repo{reset}         Force drop repo and lose any changes
   {cmd}workset mirror init ./repo{reset}                Enable mirroring for a repo
+  {cmd}workset mirror init ./repo --tags 'v*'{reset}    Mirror only tags starting with 'v'
   {cmd}workset mirror sync --watch{reset}               Keep mirroring pushed commits
 "#,
             workset = if is_tty {
@@ -418,8 +422,10 @@ fn main() -> Result<()> {
                     match args.subcommand()? {
                         Some(sub) => match sub.as_str() {
                             "init" => {
+                                let branches: Vec<String> = args.values_from_str("--branches")?;
+                                let tags: Vec<String> = args.values_from_str("--tags")?;
                                 let pattern = args.opt_free_from_str::<String>()?;
-                                mirror_init(&workspace, pattern.as_deref())?;
+                                mirror_init(&workspace, pattern.as_deref(), branches, tags)?;
                             }
                             "sync" => {
                                 let dry_run = args.contains("--dryrun");
@@ -505,14 +511,22 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
 }
 
 /// Enable mirroring for matching workspace repos; without a pattern, for all
-/// repos under the current directory
-fn mirror_init(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
+/// repos under the current directory. Explicit --branches/--tags patterns
+/// overwrite existing config; without flags the defaults are the repo's
+/// default branch and all tags, and already-enabled repos are left alone.
+fn mirror_init(
+    workspace: &Workspace,
+    pattern: Option<&str>,
+    branches: Vec<String>,
+    tags: Vec<String>,
+) -> Result<()> {
     let root = match pattern {
         Some(_) => std::path::PathBuf::from(&workspace.path),
         None => std::env::current_dir()?,
     };
     let repos = workset::find_git_repositories(&root)?;
     let interrupt = std::sync::atomic::AtomicBool::new(false);
+    let explicit = !branches.is_empty() || !tags.is_empty();
 
     let mut matched = false;
     for repo in repos {
@@ -522,12 +536,28 @@ fn mirror_init(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
         }
         matched = true;
 
-        if workset::sync::mirror_enabled(&repo, &interrupt)? {
-            println!("  {} - already enabled", repo_name);
+        let patterns = if explicit {
+            workset::sync::MirrorPatterns {
+                branches: branches.clone(),
+                tags: tags.clone(),
+            }
         } else {
-            workset::sync::set_mirror_enabled(&repo, true)?;
-            println!("  {} - ✓ mirroring enabled", repo_name);
-        }
+            if workset::sync::mirror_patterns(&repo, &interrupt)?.enabled() {
+                println!("  {} - already enabled", repo_name);
+                continue;
+            }
+            workset::sync::MirrorPatterns {
+                branches: vec![workset::sync::default_branch(&repo, &interrupt)],
+                tags: vec!["*".to_string()],
+            }
+        };
+        workset::sync::set_mirror_patterns(&repo, &patterns)?;
+        println!(
+            "  {} - ✓ mirroring enabled (branches: {}, tags: {})",
+            repo_name,
+            workset::sync::display_patterns(&patterns.branches),
+            workset::sync::display_patterns(&patterns.tags),
+        );
     }
 
     if !matched {

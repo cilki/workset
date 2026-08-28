@@ -22,11 +22,15 @@ pub struct RepoDetails {
     pub mirrors: Option<MirrorConfig>,
 }
 
-/// Whether mirroring is enabled for a repo, and the remotes it covers
+/// Whether mirroring is enabled for a repo, and if so the remotes it covers
+/// and the branch/tag patterns it mirrors
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MirrorConfig {
     Disabled,
-    Enabled(Vec<String>),
+    Enabled {
+        remotes: Vec<String>,
+        patterns: crate::sync::MirrorPatterns,
+    },
 }
 
 impl RepoDetails {
@@ -230,11 +234,15 @@ impl DetailsLoader {
     }
 }
 
-/// Read the repo's mirror flag; when enabled, the mirror targets are all of
-/// the repo's remotes
+/// Read the repo's mirror patterns; when enabled, the mirror targets are all
+/// of the repo's remotes
 fn load_mirrors(path: &Path, interrupt: &AtomicBool) -> MirrorConfig {
-    if crate::sync::mirror_enabled(path, interrupt).unwrap_or(false) {
-        MirrorConfig::Enabled(crate::sync::list_remotes(path, interrupt).unwrap_or_default())
+    let patterns = crate::sync::mirror_patterns(path, interrupt).unwrap_or_default();
+    if patterns.enabled() {
+        MirrorConfig::Enabled {
+            remotes: crate::sync::list_remotes(path, interrupt).unwrap_or_default(),
+            patterns,
+        }
     } else {
         MirrorConfig::Disabled
     }
