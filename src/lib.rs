@@ -528,6 +528,15 @@ impl Workspace {
         PathBuf::from(&self.path).join(".workset")
     }
 
+    /// Render a repo's path relative to the workspace root as a display string,
+    /// falling back to the full path if it isn't under the workspace.
+    pub fn relative_name(&self, repo: &Path) -> String {
+        repo.strip_prefix(&self.path)
+            .unwrap_or(repo)
+            .display()
+            .to_string()
+    }
+
     /// Load workspace from current directory.
     pub fn load() -> Result<Option<Self>> {
         let mut workspace_root = std::env::current_dir()?;

@@ -488,11 +488,7 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     println!();
 
     for repo in repos {
-        let repo_name = repo
-            .strip_prefix(&workspace.path)
-            .unwrap_or(&repo)
-            .display()
-            .to_string();
+        let repo_name = workspace.relative_name(&repo);
 
         let status_str = match workset::check_repo_status(&repo) {
             Ok(workset::RepoStatus::Clean) => "✓ clean".to_string(),
@@ -520,11 +516,7 @@ fn mirror_init(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
 
     let mut matched = false;
     for repo in repos {
-        let repo_name = repo
-            .strip_prefix(&workspace.path)
-            .unwrap_or(&repo)
-            .display()
-            .to_string();
+        let repo_name = workspace.relative_name(&repo);
         if pattern.is_some_and(|p| !repo_name.contains(p)) {
             continue;
         }
@@ -559,11 +551,7 @@ fn mirror_repos(workspace: &Workspace, pattern: Option<&str>, dry_run: bool) -> 
 
     let mut matched = false;
     for repo in repos {
-        let repo_name = repo
-            .strip_prefix(&workspace.path)
-            .unwrap_or(&repo)
-            .display()
-            .to_string();
+        let repo_name = workspace.relative_name(&repo);
         if pattern.is_some_and(|p| !repo_name.contains(p)) {
             continue;
         }
