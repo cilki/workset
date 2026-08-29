@@ -670,13 +670,14 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
         let mut clean = 0;
         let mut modified = 0;
         let mut unpushed = 0;
+        let mut no_commits = 0;
 
         for repo in &repos {
             match workset::check_repo_status(repo) {
                 Ok(workset::RepoStatus::Clean) => clean += 1,
                 Ok(workset::RepoStatus::Dirty) => modified += 1,
                 Ok(workset::RepoStatus::Unpushed) => unpushed += 1,
-                Ok(workset::RepoStatus::NoCommits) => modified += 1,
+                Ok(workset::RepoStatus::NoCommits) => no_commits += 1,
                 Err(_) => {}
             }
         }
@@ -689,6 +690,9 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
         }
         if unpushed > 0 {
             println!("  ⚠ {} with unpushed commits", unpushed);
+        }
+        if no_commits > 0 {
+            println!("  ⚠ {} with no commits", no_commits);
         }
     }
 
