@@ -1505,11 +1505,8 @@ fn scan_workspace_repo(workspace_path: &str, path: PathBuf) -> Vec<RepoInfo> {
         display_name: display_name.clone(),
         status: Some(status),
         modification_time,
-        size_bytes: None, // Size not computed for workspace repos to save time
-        operation_status: RepoOperationStatus::None,
-        is_submodule: false,
-        submodule_initialized: false,
-        parent_repo_path: None,
+        // Size not computed for workspace repos to save time
+        ..Default::default()
     }];
 
     // Find and add submodules
@@ -1525,12 +1522,10 @@ fn scan_workspace_repo(workspace_path: &str, path: PathBuf) -> Vec<RepoInfo> {
                 path: path.join(&submodule.path),
                 display_name: submodule_display_name,
                 status: Some(crate::RepoStatus::Clean), // Submodule status computed separately
-                modification_time: None,
-                size_bytes: None,
-                operation_status: RepoOperationStatus::None,
                 is_submodule: true,
                 submodule_initialized: submodule.initialized,
                 parent_repo_path: Some(path.clone()),
+                ..Default::default()
             });
         }
     }
@@ -1547,10 +1542,7 @@ fn scan_library_repo(library_path: &str, repo_path: String) -> RepoInfo {
         path: full_path,
         display_name: repo_path,
         status: Some(crate::RepoStatus::Clean), // Library repos are always clean
-        operation_status: RepoOperationStatus::None,
-        is_submodule: false,
-        submodule_initialized: false,
-        parent_repo_path: None,
+        ..Default::default()
     }
 }
 
@@ -1574,13 +1566,8 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
         .map(|path| RepoInfo {
             path: path.clone(),
             display_name: workspace_display_name(&workspace.path, path),
-            status: None,
-            modification_time: None,
-            size_bytes: None,
             operation_status: RepoOperationStatus::Scanning,
-            is_submodule: false,
-            submodule_initialized: false,
-            parent_repo_path: None,
+            ..Default::default()
         })
         .collect();
     let discovered_library = library_paths
@@ -1589,12 +1576,8 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
             path: PathBuf::from(&library_path).join(repo_path),
             display_name: repo_path.clone(),
             status: Some(crate::RepoStatus::Clean),
-            modification_time: None,
-            size_bytes: None,
             operation_status: RepoOperationStatus::Scanning,
-            is_submodule: false,
-            submodule_initialized: false,
-            parent_repo_path: None,
+            ..Default::default()
         })
         .collect();
     if tx

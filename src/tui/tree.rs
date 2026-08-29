@@ -19,8 +19,9 @@ impl TreeState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum RepoOperationStatus {
+    #[default]
     None,
     /// A background git status scan is running for this repo
     Scanning,
@@ -35,7 +36,7 @@ pub enum RepoOperationStatus {
     Failed(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RepoInfo {
     pub path: PathBuf,
     pub display_name: String,

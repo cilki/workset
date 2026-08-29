@@ -170,13 +170,8 @@ impl App {
                         self.workspace_path, pending.display_name
                     )),
                     display_name: pending.display_name.clone(),
-                    status: None,
-                    modification_time: None,
-                    size_bytes: None,
                     operation_status: pending.status.clone(),
-                    is_submodule: false,
-                    submodule_initialized: false,
-                    parent_repo_path: None,
+                    ..Default::default()
                 });
             }
         }
@@ -543,12 +538,7 @@ mod tests {
             path: PathBuf::from(display_name),
             display_name: display_name.to_string(),
             status: Some(crate::RepoStatus::Clean),
-            modification_time: None,
-            size_bytes: None,
-            operation_status: super::super::tree::RepoOperationStatus::None,
-            is_submodule: false,
-            submodule_initialized: false,
-            parent_repo_path: None,
+            ..Default::default()
         }
     }
 
