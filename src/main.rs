@@ -344,6 +344,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Resolve the current workspace or report "not in a workspace" and return.
+    // Used by every subcommand that operates on an existing workspace.
+    macro_rules! require_workspace {
+        ($ws:expr) => {
+            match $ws {
+                Some(workspace) => workspace,
+                None => {
+                    error!("Not in a workspace");
+                    return Ok(());
+                }
+            }
+        };
+    }
+
     // Dispatch subcommands
     match args.subcommand()? {
         Some(command) => match command.as_str() {
@@ -362,99 +376,81 @@ fn main() -> Result<()> {
                 }
             }
             "clone" => {
-                if let Some(workspace) = maybe_workspace {
-                    if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
-                        let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
-                        clone_repos(&workspace, &pattern)?;
-                    } else {
-                        error!("Missing repository pattern for clone command");
-                        error!("Usage: workset clone <pattern>");
-                    }
+                let workspace = require_workspace!(maybe_workspace);
+                if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
+                    let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
+                    clone_repos(&workspace, &pattern)?;
                 } else {
-                    error!("Not in a workspace");
+                    error!("Missing repository pattern for clone command");
+                    error!("Usage: workset clone <pattern>");
                 }
             }
             "restore" => {
-                if let Some(workspace) = maybe_workspace {
-                    if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
-                        let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
-                        restore_repos(&workspace, &pattern)?;
-                    } else {
-                        error!("Missing repository pattern for restore command");
-                        error!("Usage: workset restore <pattern>");
-                    }
+                let workspace = require_workspace!(maybe_workspace);
+                if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
+                    let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
+                    restore_repos(&workspace, &pattern)?;
                 } else {
-                    error!("Not in a workspace");
+                    error!("Missing repository pattern for restore command");
+                    error!("Usage: workset restore <pattern>");
                 }
             }
             "drop" => {
-                if let Some(workspace) = maybe_workspace {
-                    let delete = args.contains("--delete");
-                    let force = args.contains("--force");
+                let workspace = require_workspace!(maybe_workspace);
+                let delete = args.contains("--delete");
+                let force = args.contains("--force");
 
-                    if let Some(path) = args.opt_free_from_str::<String>()? {
-                        let Ok(pattern) = path.parse::<workset::RepoPattern>();
-                        workspace.drop(&pattern, delete, force)?;
-                    } else {
-                        // Drop all repos in current directory
-                        workspace.drop_all(delete, force)?;
-                    }
+                if let Some(path) = args.opt_free_from_str::<String>()? {
+                    let Ok(pattern) = path.parse::<workset::RepoPattern>();
+                    workspace.drop(&pattern, delete, force)?;
                 } else {
-                    error!("Not in a workspace");
+                    // Drop all repos in current directory
+                    workspace.drop_all(delete, force)?;
                 }
             }
             "list" | "ls" => {
-                if let Some(workspace) = maybe_workspace {
-                    list_workspace_status(&workspace)?;
-                } else {
-                    error!("Not in a workspace");
-                }
+                let workspace = require_workspace!(maybe_workspace);
+                list_workspace_status(&workspace)?;
             }
             "status" => {
-                if let Some(workspace) = maybe_workspace {
-                    show_workspace_summary(&workspace)?;
-                } else {
-                    error!("Not in a workspace");
-                }
+                let workspace = require_workspace!(maybe_workspace);
+                show_workspace_summary(&workspace)?;
             }
             "mirror" => {
-                if let Some(workspace) = maybe_workspace {
-                    match args.subcommand()? {
-                        Some(sub) => match sub.as_str() {
-                            "init" => {
-                                let branches: Vec<String> = args.values_from_str("--branches")?;
-                                let tags: Vec<String> = args.values_from_str("--tags")?;
-                                let pattern = args.opt_free_from_str::<String>()?;
-                                mirror_init(&workspace, pattern.as_deref(), branches, tags)?;
-                            }
-                            "sync" => {
-                                let dry_run = args.contains("--dryrun");
-                                let watch = args.contains("--watch");
-                                let pattern = args.opt_free_from_str::<String>()?;
-                                loop {
-                                    mirror_repos(&workspace, pattern.as_deref(), dry_run)?;
-                                    if !watch {
-                                        break;
-                                    }
-                                    println!(
-                                        "  next sync in {}s (Ctrl+C to stop)",
-                                        WATCH_INTERVAL.as_secs()
-                                    );
-                                    std::thread::sleep(WATCH_INTERVAL);
+                let workspace = require_workspace!(maybe_workspace);
+                match args.subcommand()? {
+                    Some(sub) => match sub.as_str() {
+                        "init" => {
+                            let branches: Vec<String> = args.values_from_str("--branches")?;
+                            let tags: Vec<String> = args.values_from_str("--tags")?;
+                            let pattern = args.opt_free_from_str::<String>()?;
+                            mirror_init(&workspace, pattern.as_deref(), branches, tags)?;
+                        }
+                        "sync" => {
+                            let dry_run = args.contains("--dryrun");
+                            let watch = args.contains("--watch");
+                            let pattern = args.opt_free_from_str::<String>()?;
+                            loop {
+                                mirror_repos(&workspace, pattern.as_deref(), dry_run)?;
+                                if !watch {
+                                    break;
                                 }
+                                println!(
+                                    "  next sync in {}s (Ctrl+C to stop)",
+                                    WATCH_INTERVAL.as_secs()
+                                );
+                                std::thread::sleep(WATCH_INTERVAL);
                             }
-                            _ => {
-                                error!(command = %sub, "Unknown mirror subcommand");
-                                error!("Usage: workset mirror <init|sync> ...");
-                            }
-                        },
-                        None => {
-                            error!("Missing mirror subcommand");
+                        }
+                        _ => {
+                            error!(command = %sub, "Unknown mirror subcommand");
                             error!("Usage: workset mirror <init|sync> ...");
                         }
+                    },
+                    None => {
+                        error!("Missing mirror subcommand");
+                        error!("Usage: workset mirror <init|sync> ...");
                     }
-                } else {
-                    error!("Not in a workspace");
                 }
             }
             _ => {
@@ -465,12 +461,9 @@ fn main() -> Result<()> {
         None => {
             #[cfg(feature = "tui")]
             {
-                if let Some(workspace) = maybe_workspace {
-                    // Open TUI for interactive workspace management
-                    workset::tui::run_tui(&workspace)?;
-                } else {
-                    error!("Not in a workspace");
-                }
+                let workspace = require_workspace!(maybe_workspace);
+                // Open TUI for interactive workspace management
+                workset::tui::run_tui(&workspace)?;
             }
             #[cfg(not(feature = "tui"))]
             {
