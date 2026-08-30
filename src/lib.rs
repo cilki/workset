@@ -530,20 +530,35 @@ impl Workspace {
             .to_string()
     }
 
-    /// Load workspace from current directory.
-    pub fn load() -> Result<Option<Self>> {
-        let mut workspace_root = std::env::current_dir()?;
+    /// Locate the workspace containing the current directory without validating
+    /// it or touching the filesystem beyond the directory search.
+    ///
+    /// Suitable for read-only, side-effect-free callers such as shell
+    /// completion, which must be fast and infallible. Use [`load`](Self::load)
+    /// when the workspace is about to be operated on.
+    pub fn discover() -> Option<Self> {
+        let mut workspace_root = std::env::current_dir().ok()?;
 
         // Search up for a .workset/ directory
         loop {
-            let workset_dir = workspace_root.join(".workset");
-            if workset_dir.exists() && workset_dir.is_dir() {
+            if workspace_root.join(".workset").is_dir() {
                 let workspace = Workspace {
                     path: workspace_root.display().to_string(),
                 };
-
                 debug!(workspace_path = %workspace.path, "Found workspace");
+                return Some(workspace);
+            }
 
+            // Try parent directory
+            workspace_root = workspace_root.parent()?.to_path_buf();
+        }
+    }
+
+    /// Load workspace from current directory, validating it and ensuring the
+    /// library directory exists.
+    pub fn load() -> Result<Option<Self>> {
+        match Self::discover() {
+            Some(workspace) => {
                 // Validate the workspace configuration
                 workspace.validate()?;
 
@@ -551,14 +566,9 @@ impl Workspace {
                 std::fs::create_dir_all(workspace.library_path_buf())
                     .map_err(|e| anyhow::anyhow!("Failed to create library directory: {}", e))?;
 
-                return Ok(Some(workspace));
+                Ok(Some(workspace))
             }
-
-            // Try parent directory
-            match workspace_root.parent() {
-                Some(parent) => workspace_root = parent.to_path_buf(),
-                None => return Ok(None),
-            }
+            None => Ok(None),
         }
     }
 

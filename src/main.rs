@@ -235,18 +235,22 @@ fn main() -> Result<()> {
         )
         .init();
 
-    // Load workspace for completions or for a subcommand
-    let maybe_workspace = Workspace::load()?;
-
-    // Dispatch shell completions
-    // TODO this is wrong
+    // Dispatch shell completions before loading the workspace. Completions run
+    // on every TAB press, so they must be fast, side-effect free, and
+    // infallible: discover the workspace read-only rather than going through
+    // `load`, which validates and creates the library directory and would abort
+    // the whole process on error.
     if let Ok(shell_type) = std::env::var("_ARGCOMPLETE_") {
+        let maybe_workspace = Workspace::discover();
         return match shell_type.as_str() {
             "bash" => complete_bash(maybe_workspace),
             "fish" => complete_fish(maybe_workspace),
             _ => anyhow::bail!("Unsupported shell type: {}", shell_type),
         };
     }
+
+    // Load workspace for a subcommand
+    let maybe_workspace = Workspace::load()?;
 
     let mut args = pico_args::Arguments::from_env();
     if args.contains("--help") {
