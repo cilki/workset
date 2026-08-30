@@ -918,18 +918,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_help_line(f, app, vertical_chunks[0]);
     render_tree_panel(f, app, horizontal_chunks[0], Section::Workspace);
 
-    // Info panel above the library, sized to its content but never squeezing
-    // the library list below half the column
-    let info_lines = info_panel_lines(app);
-    let info_height = (info_lines.len() as u16 + 2).min(horizontal_chunks[1].height / 2);
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(info_height), Constraint::Min(0)])
-        .split(horizontal_chunks[1]);
-    let info =
-        Paragraph::new(info_lines).block(Block::default().borders(Borders::ALL).title("Info"));
-    f.render_widget(info, right_chunks[0]);
-    render_tree_panel(f, app, right_chunks[1], Section::Library);
+    render_tree_panel(f, app, horizontal_chunks[1], Section::Library);
 
     if show_search {
         let search_text = format!("{}_", app.search_query);
@@ -980,81 +969,98 @@ fn render_help_line(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(help, area);
 }
 
-/// Content of the info panel for the current selection: size, worktree
-/// changes, and one status row per configured mirror. Fields still being
-/// computed by the details loader show an ellipsis.
-fn info_panel_lines(app: &App) -> Vec<Line<'static>> {
+/// Detail rows rendered under the selected repo: size, worktree changes
+/// (workspace only — library repos are always clean), and one status row per
+/// mirror remote. Fields still being computed by the details loader show an
+/// ellipsis.
+fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
-    let Some(repo) = app.selected_node().and_then(|node| node.repo_info.as_ref()) else {
-        return vec![Line::from(Span::styled("no repo selected", dim))];
-    };
     let details = app.details.get(&repo.path).cloned().unwrap_or_default();
+    let indent = "  ".repeat(depth + 2);
 
-    let mut lines = vec![Line::from(Span::styled(
-        repo.display_name.clone(),
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    let mut lines = Vec::new();
 
     let size = match details.size_bytes.or(repo.size_bytes) {
         Some(bytes) => Span::raw(format_size(bytes)),
         None => Span::styled("…", dim),
     };
-    lines.push(Line::from(vec![Span::styled("Size: ", dim), size]));
+    lines.push(Line::from(vec![
+        Span::raw(indent.clone()),
+        Span::styled("Size: ", dim),
+        size,
+    ]));
 
-    let changes = match details.change_count {
-        Some(0) => Span::styled("clean", Style::default().fg(Color::Green)),
-        Some(count) => Span::styled(
-            format!("{} outstanding", count),
-            Style::default().fg(Color::Yellow),
-        ),
-        None => Span::styled("…", dim),
-    };
-    lines.push(Line::from(vec![Span::styled("Changes: ", dim), changes]));
+    if section == Section::Workspace {
+        let changes = match details.change_count {
+            Some(0) => Span::styled("clean", Style::default().fg(Color::Green)),
+            Some(count) => Span::styled(
+                format!("{} outstanding", count),
+                Style::default().fg(Color::Yellow),
+            ),
+            None => Span::styled("…", dim),
+        };
+        lines.push(Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled("Changes: ", dim),
+            changes,
+        ]));
+    }
 
     match &details.mirrors {
         None => lines.push(Line::from(vec![
+            Span::raw(indent.clone()),
             Span::styled("Mirrors: ", dim),
             Span::styled("…", dim),
         ])),
         Some(MirrorConfig::Disabled) => {
             // Mirroring can only be toggled on workspace repos
-            let hint = if app.active_section == Section::Workspace && !repo.is_submodule {
+            let hint = if section == Section::Workspace && !repo.is_submodule {
                 "off (Ctrl+R to enable)"
             } else {
                 "off"
             };
             lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
                 Span::styled("Mirrors: ", dim),
                 Span::styled(hint, dim),
             ]));
         }
         Some(MirrorConfig::Enabled { remotes, .. }) if remotes.is_empty() => {
             lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
                 Span::styled("Mirrors: ", dim),
                 Span::styled("no remotes", dim),
             ]));
         }
         Some(MirrorConfig::Enabled { remotes, patterns }) => {
-            lines.push(Line::from(Span::styled("Mirrors:", dim)));
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  branches: {}  tags: {}",
-                    crate::sync::display_patterns(&patterns.branches),
-                    crate::sync::display_patterns(&patterns.tags),
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled("Mirrors:", dim),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled(
+                    format!(
+                        "  branches: {}  tags: {}",
+                        crate::sync::display_patterns(&patterns.branches),
+                        crate::sync::display_patterns(&patterns.tags),
+                    ),
+                    dim,
                 ),
-                dim,
-            )));
+            ]));
             let outcome = app.sync_outcomes.get(&repo.path);
             let syncing = app.syncing_repos.contains(&repo.path);
             for (name, state) in mirror_rows(remotes, outcome, syncing) {
-                lines.push(mirror_status_line(name, state));
+                let mut line = mirror_status_line(name, state);
+                line.spans.insert(0, Span::raw(indent.clone()));
+                lines.push(line);
             }
         }
     }
     lines
 }
 
-/// One info-panel row showing a mirror remote and its sync state
+/// One detail row showing a mirror remote and its sync state
 fn mirror_status_line(name: String, state: MirrorState) -> Line<'static> {
     let status = match state {
         MirrorState::Syncing => Span::styled("syncing…", Style::default().fg(Color::Cyan)),
@@ -1110,7 +1116,7 @@ fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
         ),
     };
 
-    let list_items: Vec<ListItem> = items
+    let mut list_items: Vec<ListItem> = items
         .iter()
         .map(|(node, depth, _, full_path)| {
             tree_list_item(
@@ -1124,6 +1130,22 @@ fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
             )
         })
         .collect();
+
+    // Splice detail rows in below the highlighted repo. They sit strictly
+    // after the selected index, so the selection model and highlight are
+    // unaffected and the rows can't be selected. Rows may be clipped when the
+    // selection is at the bottom of the viewport, since the list keeps only
+    // the selected row visible.
+    if app.active_section == section
+        && let Some(selected) = state.selected()
+        && let Some((node, depth, _, _)) = items.get(selected)
+        && let Some(repo) = node.repo_info.as_ref()
+    {
+        let detail_items = repo_detail_lines(app, repo, section, *depth)
+            .into_iter()
+            .map(ListItem::new);
+        list_items.splice(selected + 1..selected + 1, detail_items);
+    }
 
     let list = List::new(list_items)
         .block(
@@ -1713,6 +1735,43 @@ fn get_gitlab_suggestions() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use details::RepoDetails;
+
+    #[test]
+    fn detail_lines_omit_changes_for_library() {
+        let mut app = App::new("ws".to_string(), Vec::new(), Vec::new());
+        let repo = RepoInfo {
+            path: PathBuf::from("ws/repo"),
+            display_name: "repo".to_string(),
+            ..Default::default()
+        };
+        app.details.insert(
+            repo.path.clone(),
+            RepoDetails {
+                size_bytes: Some(1024),
+                change_count: Some(3),
+                mirrors: Some(MirrorConfig::Disabled),
+            },
+        );
+
+        let render = |section| {
+            repo_detail_lines(&app, &repo, section, 0)
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let workspace = render(Section::Workspace);
+        assert!(workspace.contains("Size:"));
+        assert!(workspace.contains("Changes: 3 outstanding"));
+        assert!(workspace.contains("Mirrors:"));
+
+        let library = render(Section::Library);
+        assert!(library.contains("Size:"));
+        assert!(!library.contains("Changes:"));
+        assert!(library.contains("Mirrors:"));
+    }
 
     #[test]
     fn sync_manager_dedups_and_requeues() {

@@ -55,9 +55,3 @@ attest --bin-dir target/debug tests/
 ```
 
 ## TODO list
-
-- Add an "info" panel above "Library"?
-  - If a repo is selected, show stats
-    - Total size
-    - Clean or number of outstanding changes
-    - Show mirror(s) status
