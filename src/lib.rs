@@ -117,6 +117,20 @@ pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
     let mut current_path: Option<PathBuf> = None;
     let mut current_url: Option<String> = None;
 
+    // Emit a submodule once its section has yielded all three required fields
+    let mut flush =
+        |name: &mut Option<String>, path: &mut Option<PathBuf>, url: &mut Option<String>| {
+            if let (Some(name), Some(path), Some(url)) = (name.take(), path.take(), url.take()) {
+                let initialized = repo_path.join(&path).join(".git").exists();
+                submodules.push(SubmoduleInfo {
+                    name,
+                    path,
+                    url,
+                    initialized,
+                });
+            }
+        };
+
     for line in content.lines() {
         let line = line.trim();
 
@@ -127,20 +141,8 @@ pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
 
         // Parse [submodule "name"] section headers
         if line.starts_with('[') && line.ends_with(']') {
-            // Save previous submodule if we have all required fields
-            if let (Some(name), Some(path), Some(url)) =
-                (current_name.take(), current_path.take(), current_url.take())
-            {
-                // Check if submodule is initialized
-                let initialized = repo_path.join(&path).join(".git").exists();
-
-                submodules.push(SubmoduleInfo {
-                    name: name.clone(),
-                    path,
-                    url,
-                    initialized,
-                });
-            }
+            // Save the previous submodule before starting a new section
+            flush(&mut current_name, &mut current_path, &mut current_url);
 
             // Extract submodule name from [submodule "name"]
             if let Some(start) = line.find('"')
@@ -166,16 +168,7 @@ pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
     }
 
     // Don't forget the last submodule
-    if let (Some(name), Some(path), Some(url)) = (current_name, current_path, current_url) {
-        let initialized = repo_path.join(&path).join(".git").exists();
-
-        submodules.push(SubmoduleInfo {
-            name,
-            path,
-            url,
-            initialized,
-        });
-    }
+    flush(&mut current_name, &mut current_path, &mut current_url);
 
     Ok(submodules)
 }
@@ -939,6 +932,44 @@ mod tests {
         assert_eq!(repos.len(), 2);
         assert!(repos.iter().any(|p| p.ends_with("repo1")));
         assert!(repos.iter().any(|p| p.ends_with("repo2")));
+    }
+
+    #[test]
+    fn test_find_submodules_parses_multiple_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path();
+        fs::write(
+            repo.join(".gitmodules"),
+            "[submodule \"first\"]\n\
+             \tpath = libs/first\n\
+             \turl = https://example.com/first.git\n\
+             [submodule \"second\"]\n\
+             \tpath = libs/second\n\
+             \turl = https://example.com/second.git\n",
+        )
+        .unwrap();
+        // Only the first submodule is checked out
+        fs::create_dir_all(repo.join("libs/first/.git")).unwrap();
+
+        let submodules = find_submodules_in_repo(repo).unwrap();
+        assert_eq!(submodules.len(), 2);
+
+        let first = &submodules[0];
+        assert_eq!(first.name, "first");
+        assert_eq!(first.path, PathBuf::from("libs/first"));
+        assert_eq!(first.url, "https://example.com/first.git");
+        assert!(first.initialized);
+
+        let second = &submodules[1];
+        assert_eq!(second.name, "second");
+        assert_eq!(second.path, PathBuf::from("libs/second"));
+        assert!(!second.initialized);
+    }
+
+    #[test]
+    fn test_find_submodules_missing_file_is_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        assert!(find_submodules_in_repo(temp_dir.path()).unwrap().is_empty());
     }
 
     #[test]
