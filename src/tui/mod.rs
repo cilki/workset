@@ -6,7 +6,8 @@ mod watcher;
 
 use app::{App, AppMode, Section};
 use details::{DetailsLoader, MirrorConfig, MirrorState, mirror_rows};
-use metadata::{format_size, format_time_ago_verbose, get_repo_modification_time, get_repo_size};
+use crate::get_repo_modification_time;
+use metadata::{format_size, format_time_ago_verbose, get_repo_size};
 use tree::{RepoInfo, RepoOperationStatus, TreeNode};
 use watcher::FileWatcher;
 

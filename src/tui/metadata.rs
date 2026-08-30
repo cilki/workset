@@ -2,13 +2,10 @@ use anyhow::Result;
 use std::path::Path;
 use std::time::SystemTime;
 
-// Re-export functions from parent crate that are now available globally
-pub use crate::{format_time_ago, get_repo_modification_time};
-
 /// Format a SystemTime as a human-readable "time ago" string with " ago" suffix
 /// This is a TUI-specific wrapper that adds " ago" to the compact format from the parent
 pub fn format_time_ago_verbose(time: SystemTime) -> String {
-    let compact = format_time_ago(time);
+    let compact = crate::format_time_ago(time);
     if compact == "just now" {
         compact
     } else {
