@@ -256,6 +256,19 @@ fn main() -> Result<()> {
     if args.contains("--help") {
         let is_tty = std::io::stdout().is_terminal();
 
+        // Wrap text in a color code (and reset) only when writing to a
+        // terminal; otherwise emit the text unadorned.
+        let paint = |code: &str, text: &str| {
+            if is_tty {
+                format!("{}{}{}", code, text, colors::RESET)
+            } else {
+                text.to_string()
+            }
+        };
+        // A bare color code, suppressed when not writing to a terminal, for the
+        // inline `{cmd}...{reset}` spans in the template.
+        let code = |c: &'static str| if is_tty { c } else { "" };
+
         let help = format!(
             r#"{workset} {version}
 
@@ -302,46 +315,17 @@ fn main() -> Result<()> {
   {cmd}workset mirror init ./repo --tags 'v*'{reset}    Mirror only tags starting with 'v'
   {cmd}workset mirror sync --watch{reset}               Keep mirroring pushed commits
 "#,
-            workset = if is_tty {
-                format!("{}{}{}", colors::BOLD, "workset", colors::RESET)
-            } else {
-                "workset".to_string()
-            },
-            version = if is_tty {
-                format!(
-                    "{}{}{}",
-                    colors::CYAN,
-                    env!("CARGO_PKG_VERSION"),
-                    colors::RESET
-                )
-            } else {
-                env!("CARGO_PKG_VERSION").to_string()
-            },
-            desc_header = if is_tty {
-                format!("{}{}{}", colors::BOLD, "DESCRIPTION:", colors::RESET)
-            } else {
-                "DESCRIPTION:".to_string()
-            },
-            usage_header = if is_tty {
-                format!("{}{}{}", colors::BOLD, "USAGE:", colors::RESET)
-            } else {
-                "USAGE:".to_string()
-            },
-            commands_header = if is_tty {
-                format!("{}{}{}", colors::BOLD, "COMMANDS:", colors::RESET)
-            } else {
-                "COMMANDS:".to_string()
-            },
-            examples_header = if is_tty {
-                format!("{}{}{}", colors::BOLD, "EXAMPLES:", colors::RESET)
-            } else {
-                "EXAMPLES:".to_string()
-            },
-            cmd = if is_tty { colors::GREEN } else { "" },
-            subcmd = if is_tty { colors::CYAN } else { "" },
-            arg = if is_tty { colors::YELLOW } else { "" },
-            dim = if is_tty { colors::DIM } else { "" },
-            reset = if is_tty { colors::RESET } else { "" },
+            workset = paint(colors::BOLD, "workset"),
+            version = paint(colors::CYAN, env!("CARGO_PKG_VERSION")),
+            desc_header = paint(colors::BOLD, "DESCRIPTION:"),
+            usage_header = paint(colors::BOLD, "USAGE:"),
+            commands_header = paint(colors::BOLD, "COMMANDS:"),
+            examples_header = paint(colors::BOLD, "EXAMPLES:"),
+            cmd = code(colors::GREEN),
+            subcmd = code(colors::CYAN),
+            arg = code(colors::YELLOW),
+            dim = code(colors::DIM),
+            reset = code(colors::RESET),
         );
         print!("{}", help);
 
