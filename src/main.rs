@@ -151,12 +151,11 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
     // Clone from remote
     if let Some((provider, repo_path_str)) = pattern.provider_and_path() {
         let clone_url = format!("https://{}/{}", provider, repo_path_str);
-        let dest_path = PathBuf::from(&workspace.path).join(pattern.full_path());
 
         info!(repo = %pattern.full_path(), "Cloning repository");
 
         // TODO show progress
-        workset::gix_clone(&clone_url, &dest_path)?;
+        workset::gix_clone(&clone_url, &repo_path)?;
 
         info!(repo = %pattern.full_path(), "Successfully cloned repository");
         Ok(())
