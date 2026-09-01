@@ -732,11 +732,16 @@ pub fn list_remotes(repo_path: &Path, interrupt: &AtomicBool) -> Result<Vec<Stri
     if !out.status.success() {
         bail!("git remote failed: {}", stderr_summary(&out));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    Ok(stdout_lines(&out))
+}
+
+/// Collect a git command's stdout into trimmed, non-empty lines
+fn stdout_lines(out: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
-        .collect())
+        .collect()
 }
 
 /// Lines (added, removed) across the worktree and index relative to HEAD,
