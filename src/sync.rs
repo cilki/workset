@@ -124,7 +124,7 @@ impl SyncOutcome {
     }
 }
 
-pub(crate) fn short_ref(refname: &str) -> &str {
+pub fn short_ref(refname: &str) -> &str {
     refname
         .strip_prefix("refs/heads/")
         .or_else(|| refname.strip_prefix("refs/tags/"))

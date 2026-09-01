@@ -551,13 +551,7 @@ fn mirror_init(
 fn mirror_repos(workspace: &Workspace, pattern: Option<&str>, dry_run: bool) -> Result<()> {
     let repos = workset::find_git_repositories(Path::new(&workspace.path))?;
     let interrupt = std::sync::atomic::AtomicBool::new(false);
-    let short = |refname: &str| {
-        refname
-            .strip_prefix("refs/heads/")
-            .or_else(|| refname.strip_prefix("refs/tags/"))
-            .unwrap_or(refname)
-            .to_string()
-    };
+    let short = workset::sync::short_ref;
 
     let mut matched = false;
     for repo in repos {
