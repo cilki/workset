@@ -372,6 +372,20 @@ struct BackgroundTasks {
     details: DetailsLoader,
 }
 
+impl BackgroundTasks {
+    /// Kick off a non-progressive background rescan, seeding it with the app's
+    /// current rows so they keep their data while being refreshed.
+    fn reload(&mut self, app: &App, workspace: &Workspace) {
+        let (seed_workspace, seed_library) = app.repo_snapshot();
+        self.loader = Some(RepoLoader::start(
+            workspace,
+            seed_workspace,
+            seed_library,
+            false,
+        ));
+    }
+}
+
 /// Detect the parent shell by reading /proc/self/status
 fn detect_parent_shell() -> Option<String> {
     #[cfg(target_os = "linux")]
@@ -499,13 +513,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                             workspace.drop(&pattern, false, false)
                         },
                     )?;
-                    let (seed_workspace, seed_library) = app.repo_snapshot();
-                    background.loader = Some(RepoLoader::start(
-                        workspace,
-                        seed_workspace,
-                        seed_library,
-                        false,
-                    ));
+                    background.reload(&app, workspace);
                 }
                 Action::RestoreFromLibrary(repo_paths) => {
                     run_repo_operation(
@@ -515,13 +523,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         RepoOperationStatus::Restoring,
                         |repo_path| workspace.restore_from_library(repo_path),
                     )?;
-                    let (seed_workspace, seed_library) = app.repo_snapshot();
-                    background.loader = Some(RepoLoader::start(
-                        workspace,
-                        seed_workspace,
-                        seed_library,
-                        false,
-                    ));
+                    background.reload(&app, workspace);
                 }
                 Action::CloneRepo(repo_pattern) => {
                     // Show a placeholder repo row while the clone runs
@@ -540,13 +542,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 }
                 Action::RefreshData => {
                     // Filesystem changed - reload repository data in the background
-                    let (seed_workspace, seed_library) = app.repo_snapshot();
-                    background.loader = Some(RepoLoader::start(
-                        workspace,
-                        seed_workspace,
-                        seed_library,
-                        false,
-                    ));
+                    background.reload(&app, workspace);
                     if let Some(watcher) = file_watcher.as_mut() {
                         watcher.drain_pending();
                     }
