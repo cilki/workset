@@ -4,9 +4,9 @@ mod metadata;
 mod tree;
 mod watcher;
 
+use crate::get_repo_modification_time;
 use app::{App, AppMode, Section};
 use details::{DetailsLoader, MirrorConfig, MirrorState, mirror_rows};
-use crate::get_repo_modification_time;
 use metadata::{format_size, format_time_ago_verbose, get_repo_size};
 use tree::{RepoInfo, RepoOperationStatus, TreeNode};
 use watcher::FileWatcher;
@@ -969,7 +969,12 @@ fn render_help_line(f: &mut Frame, app: &App, area: Rect) {
 /// (workspace only — library repos are always clean), and one status row per
 /// mirror remote. Fields still being computed by the details loader show an
 /// ellipsis.
-fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize) -> Vec<Line<'static>> {
+fn repo_detail_lines(
+    app: &App,
+    repo: &RepoInfo,
+    section: Section,
+    depth: usize,
+) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let details = app.details.get(&repo.path).cloned().unwrap_or_default();
     let indent = "  ".repeat(depth + 2);

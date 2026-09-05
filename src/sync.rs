@@ -267,7 +267,14 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Res
             outcome.fetch_errors.clear();
             outcome.offline = true;
         } else {
-            mirror_refs(repo_path, &fetched, &patterns, interrupt, dry_run, &mut outcome)?;
+            mirror_refs(
+                repo_path,
+                &fetched,
+                &patterns,
+                interrupt,
+                dry_run,
+                &mut outcome,
+            )?;
         }
     }
 
@@ -358,12 +365,7 @@ fn ensure_object_local(
     sources: &BTreeMap<String, (String, String)>,
     interrupt: &AtomicBool,
 ) -> Result<()> {
-    let out = run_git(
-        repo_path,
-        &["cat-file", "-e", id],
-        interrupt,
-        LOCAL_TIMEOUT,
-    )?;
+    let out = run_git(repo_path, &["cat-file", "-e", id], interrupt, LOCAL_TIMEOUT)?;
     if out.status.success() {
         return Ok(());
     }
@@ -377,7 +379,12 @@ fn ensure_object_local(
         NETWORK_TIMEOUT,
     )?;
     if !out.status.success() {
-        bail!("fetch {} from {}: {}", refname, remote, stderr_summary(&out));
+        bail!(
+            "fetch {} from {}: {}",
+            refname,
+            remote,
+            stderr_summary(&out)
+        );
     }
     Ok(())
 }
