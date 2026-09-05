@@ -260,3 +260,19 @@ testStatusFromSubdirectory() {
 	cd projects
 	workset status | grep "Active repositories: 3"
 }
+
+## --version prints the version and works outside any workspace
+testVersionFlag() {
+	workset --version | grep -E '^workset [0-9]+\.[0-9]+\.[0-9]+'
+}
+
+## -V is a short alias for --version
+testVersionShortFlag() {
+	workset -V | grep -E '^workset [0-9]+\.[0-9]+\.[0-9]+'
+}
+
+## --version reports the version from inside a workspace too
+testVersionFlagInWorkspace() {
+	newWorkspace
+	workset --version | grep -E '^workset [0-9]+\.[0-9]+\.[0-9]+'
+}

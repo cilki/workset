@@ -248,10 +248,15 @@ fn main() -> Result<()> {
         };
     }
 
-    // Load workspace for a subcommand
-    let maybe_workspace = Workspace::load()?;
-
     let mut args = pico_args::Arguments::from_env();
+
+    // Print the version and exit. Handled before loading the workspace so
+    // `--version` works anywhere, not just inside a valid workspace.
+    if args.contains(["-V", "--version"]) {
+        println!("workset {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     if args.contains("--help") {
         let is_tty = std::io::stdout().is_terminal();
 
@@ -330,6 +335,9 @@ fn main() -> Result<()> {
 
         return Ok(());
     }
+
+    // Load the workspace for a subcommand.
+    let maybe_workspace = Workspace::load()?;
 
     // Resolve the current workspace or report "not in a workspace" and return.
     // Used by every subcommand that operates on an existing workspace.
