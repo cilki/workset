@@ -25,8 +25,12 @@ pub enum RepoOperationStatus {
     None,
     /// A background git status scan is running for this repo
     Scanning,
-    /// Commits are being mirrored to the repo's other remotes
+    /// A background sync is fetching the repo's remotes
+    Fetching,
+    /// Commits are being pushed to the repo's mirror remotes
     Syncing,
+    /// The last mirror check found refs waiting to be pushed ('s' pushes them)
+    PushPending(usize),
     /// The last mirror attempt failed or hit a conflict
     SyncFailed(String),
     Cloning,
@@ -126,6 +130,21 @@ impl TreeNode {
         }
         for child in &self.children {
             paths.extend(child.collect_repo_paths());
+        }
+        paths
+    }
+
+    /// Collect the filesystem paths of syncable repos in this subtree
+    /// (submodules are synced through their parent repo)
+    pub fn collect_syncable_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(ref repo) = self.repo_info
+            && !repo.is_submodule
+        {
+            paths.push(repo.path.clone());
+        }
+        for child in &self.children {
+            paths.extend(child.collect_syncable_paths());
         }
         paths
     }
@@ -334,6 +353,28 @@ mod tests {
         } else {
             node_at(&node.children, rest)
         }
+    }
+
+    #[test]
+    fn collect_syncable_paths_skips_submodules() {
+        let tree = build_tree(vec![
+            repo("work/foo", None),
+            repo("work/bar", None),
+            RepoInfo {
+                is_submodule: true,
+                parent_repo_path: Some(PathBuf::from("/ws/work/foo")),
+                ..repo("work/foo/sub", None)
+            },
+        ]);
+        let mut paths: Vec<PathBuf> = tree
+            .iter()
+            .flat_map(|node| node.collect_syncable_paths())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/ws/work/bar"), PathBuf::from("/ws/work/foo")]
+        );
     }
 
     #[test]

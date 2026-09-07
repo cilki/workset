@@ -79,7 +79,7 @@ Don't let Github be the only place you store your repos!
 having to sift through them to find the ones you're currently working on.
 
 **Workset** can mirror your pushed commits to the other remotes of a repo.
-Opt in per repo — press `Ctrl+R` on a repo in the TUI, or from the command
+Opt in per repo — press `m` on a repo in the TUI, or from the command
 line:
 
 ```sh
@@ -87,8 +87,10 @@ workset mirror init <repo>
 ```
 
 Once enabled, all of the repo's remotes become mirrors. Push to any remote
-(from anywhere — inside or outside workset) and the others catch up in the
-background: the selected branches and tags are propagated, commits you
+(from anywhere — inside or outside workset) and the TUI notices in the
+background: it fetches the repo's remotes and shows how many refs each mirror
+is waiting on. Nothing is pushed until you press `s`, which propagates the
+selected branches and tags to the mirrors that are behind. Commits you
 haven't pushed anywhere are never touched, and diverged refs show an error
 instead of being force-pushed. Repos that haven't opted in are left alone
 entirely. By default the repo's default branch and all tags are mirrored;
@@ -98,7 +100,7 @@ glob patterns select more (or fewer) refs:
 workset mirror init <repo> --branches main --branches 'release/*' --tags 'v*'
 ```
 
-`workset mirror sync` does the same from the command line,
+`workset mirror sync` pushes from the command line,
 `workset mirror sync --dryrun` shows what would be pushed without pushing
 anything, and `workset mirror sync --watch` keeps syncing every few minutes.
 

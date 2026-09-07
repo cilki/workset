@@ -21,13 +21,18 @@ behind or doesn't have the ref at all (e.g. a push made from another machine).
 Local refs are never modified. Repos with mirroring disabled are skipped
 entirely — no fetch, no network activity; when no tag pattern is set, remote
 tags aren't even listed. Commits that exist only locally are never pushed.
-Sync runs in the background on TUI startup, after the interactive shell
-exits, when a push from another terminal updates `.git/refs/remotes`, and
-periodically while the TUI is open. Diverged mirror refs are reported as
-errors, never force-pushed.
+The TUI never pushes on its own: a check-only sync (fetch remotes, report
+what would be pushed) runs in the background on TUI startup, after the
+interactive shell exits, when a push from another terminal updates
+`.git/refs/remotes`, and periodically while the TUI is open. Pending pushes
+show up on the repo row ("↑ N to push") and per remote in the info panel;
+pressing `s` on a repo (or a directory node, covering every repo under it)
+performs the actual push. Repo rows show "fetching" during the fetch phase
+and "syncing" only while commits are being pushed. Diverged mirror refs are
+reported as errors, never force-pushed.
 
 Mirroring is enabled with `workset mirror init [pattern]` (without a pattern:
-all repos under the current directory), or toggled in the TUI with `Ctrl+R` on
+all repos under the current directory), or toggled in the TUI with `m` on
 a workspace repo. The multi-valued local git config keys
 `workset.mirrorBranches` and `workset.mirrorTags` hold git wildmatch glob
 patterns (`*` crosses `/`) selecting what to mirror; a ref is mirrored if it
@@ -39,7 +44,8 @@ ignored. The keys survive drop/restore because drop moves `.git` wholesale
 and restore copies the original config back over the fresh clone.
 
 The core logic lives in `src/sync.rs`; the TUI scheduling in `SyncManager`
-(`src/tui/mod.rs`). `workset mirror sync` runs the same logic from the CLI;
+(`src/tui/mod.rs`). `workset mirror sync` runs the same logic from the CLI
+(pushing by default, unlike the TUI's background checks);
 `workset mirror sync --dryrun` reports what would be pushed without pushing,
 and `workset mirror sync --watch` re-runs the sync every few minutes.
 

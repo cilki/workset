@@ -1,7 +1,7 @@
 //! Mirror commits to the remotes of mirror-enabled repositories.
 //!
 //! Mirroring is opt-in per repo, toggled with `workset mirror init` or
-//! `Ctrl+R` in the TUI. The multi-valued local config keys
+//! `m` in the TUI. The multi-valued local config keys
 //! `workset.mirrorBranches` and `workset.mirrorTags` hold glob patterns
 //! selecting which branches and tags to mirror; mirroring is enabled iff at
 //! least one pattern is set. When enabled, all of the repo's remotes are
@@ -298,9 +298,18 @@ pub fn behind_counts(
 /// mirror-enabled repo. Repos with mirroring disabled are skipped without
 /// touching the network.
 ///
+/// `on_push_start` is invoked once, right before the first actual push (never
+/// on a dry run or when nothing needs pushing), so callers can distinguish
+/// the fetch phase from the push phase.
+///
 /// Blocking; intended to run on a background thread. `interrupt` is checked
 /// between git invocations and aborts the ones in flight.
-pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Result<SyncOutcome> {
+pub fn sync_repo(
+    repo_path: &Path,
+    interrupt: &AtomicBool,
+    dry_run: bool,
+    on_push_start: &dyn Fn(),
+) -> Result<SyncOutcome> {
     let mut outcome = SyncOutcome::default();
 
     let patterns = mirror_patterns(repo_path, interrupt)?;
@@ -339,7 +348,15 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool, dry_run: bool) -> Res
             outcome.fetch_errors.clear();
             outcome.offline = true;
         } else {
-            mirror_refs(repo_path, &fetched, &patterns, interrupt, dry_run, &mut outcome)?;
+            mirror_refs(
+                repo_path,
+                &fetched,
+                &patterns,
+                interrupt,
+                dry_run,
+                on_push_start,
+                &mut outcome,
+            )?;
         }
     }
 
@@ -358,6 +375,7 @@ fn mirror_refs(
     patterns: &MirrorPatterns,
     interrupt: &AtomicBool,
     dry_run: bool,
+    on_push_start: &dyn Fn(),
     outcome: &mut SyncOutcome,
 ) -> Result<()> {
     let ref_states = collect_ref_states(repo_path, remotes, patterns, interrupt)?;
@@ -395,6 +413,9 @@ fn mirror_refs(
         }
     }
 
+    if !dry_run && !pushes.is_empty() {
+        on_push_start();
+    }
     for (remote, refspecs) in pushes {
         if dry_run {
             for (_, refname) in refspecs {

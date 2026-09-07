@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 #[derive(PartialEq)]
 pub enum AppMode {
     Normal,
+    Search,
     CloneRepo,
 }
 
@@ -52,6 +53,10 @@ pub struct App {
     pub loading_progress: Option<String>,
     pub watch_disabled: bool,
     pub mode: AppMode,
+    /// Whether the keybindings overlay is shown (toggled with '?')
+    pub help_visible: bool,
+    /// Pre-rasterized logo for the help overlay; None renders text-only help
+    pub help_image: Option<ratatui_image::protocol::StatefulProtocol>,
     pub clone_repo_input: String,
     pub clone_repo_suggestions: Vec<String>,
     pub clone_repo_state: TreeState,
@@ -63,8 +68,8 @@ pub struct App {
     /// Full result of each repo's last sync, keyed by path, for the info
     /// panel's per-mirror status rows
     pub sync_outcomes: std::collections::HashMap<PathBuf, crate::sync::SyncOutcome>,
-    /// Repos with a sync currently running, keyed by path
-    pub syncing_repos: std::collections::HashSet<PathBuf>,
+    /// Phase of each repo's currently running sync, keyed by path
+    pub sync_phases: std::collections::HashMap<PathBuf, super::details::SyncPhase>,
     /// Info-panel details computed in the background, keyed by repo path
     pub details: std::collections::HashMap<PathBuf, super::details::RepoDetails>,
     /// Whether the current selection was made automatically (not by the user).
@@ -95,6 +100,8 @@ impl App {
             loading_progress: None,
             watch_disabled: false,
             mode: AppMode::Normal,
+            help_visible: false,
+            help_image: None,
             clone_repo_input: String::new(),
             clone_repo_suggestions: Vec::new(),
             clone_repo_state: TreeState::new(),
@@ -102,7 +109,7 @@ impl App {
             pending_clones: Vec::new(),
             sync_statuses: std::collections::HashMap::new(),
             sync_outcomes: std::collections::HashMap::new(),
-            syncing_repos: std::collections::HashSet::new(),
+            sync_phases: std::collections::HashMap::new(),
             details: std::collections::HashMap::new(),
             selection_is_auto: true,
         };
@@ -113,6 +120,11 @@ impl App {
     pub fn filter_repos(&mut self) {
         self.rebuild_filtered();
         self.select_first_available();
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.filter_repos();
     }
 
     /// Rebuild the filtered trees from the repo lists and the current search query

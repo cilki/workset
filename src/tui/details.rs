@@ -46,13 +46,25 @@ impl RepoDetails {
     }
 }
 
+/// Phase of a sync currently running for a repo
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncPhase {
+    /// Fetching remotes (every sync starts here; checks never leave it)
+    Fetching,
+    /// Pushing commits to mirror remotes
+    Pushing,
+}
+
 /// Display state of one mirror remote in the info panel
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MirrorState {
+    Fetching,
     Syncing,
     InSync,
     /// Refs pushed to this remote during the last sync
     Pushed(usize),
+    /// Refs the last check found waiting to be pushed to this remote
+    PendingPush(usize),
     Conflict(String),
     PushError(String),
     FetchError(String),
@@ -60,23 +72,23 @@ pub enum MirrorState {
     Pending,
 }
 
-/// Merge the mirror remotes with the last sync outcome and the live syncing
-/// flag into one display row per remote
+/// Merge the mirror remotes with the last sync outcome and the live sync
+/// phase into one display row per remote
 pub fn mirror_rows(
     mirrors: &[String],
     outcome: Option<&SyncOutcome>,
-    syncing: bool,
+    phase: Option<SyncPhase>,
 ) -> Vec<(String, MirrorState)> {
     mirrors
         .iter()
         .map(|name| {
-            let state = if syncing {
-                MirrorState::Syncing
-            } else {
-                match outcome {
+            let state = match phase {
+                Some(SyncPhase::Fetching) => MirrorState::Fetching,
+                Some(SyncPhase::Pushing) => MirrorState::Syncing,
+                None => match outcome {
                     None => MirrorState::Pending,
                     Some(o) => mirror_state_from_outcome(name, o),
-                }
+                },
             };
             (name.clone(), state)
         })
@@ -99,6 +111,14 @@ fn mirror_state_from_outcome(remote: &str, outcome: &SyncOutcome) -> MirrorState
     }
     if outcome.offline {
         return MirrorState::FetchError("unreachable".to_string());
+    }
+    let would_push = outcome
+        .would_push
+        .iter()
+        .filter(|(r, _)| r == remote)
+        .count();
+    if would_push > 0 {
+        return MirrorState::PendingPush(would_push);
     }
     let pushed = outcome.pushed.iter().filter(|(r, _)| r == remote).count();
     if pushed > 0 {
@@ -274,7 +294,7 @@ mod tests {
 
     #[test]
     fn no_outcome_reports_pending() {
-        let rows = mirror_rows(&mirrors(&["a", "b"]), None, false);
+        let rows = mirror_rows(&mirrors(&["a", "b"]), None, None);
         assert_eq!(
             rows,
             vec![
@@ -290,8 +310,37 @@ mod tests {
             pushed: vec![("a".to_string(), "refs/heads/main".to_string())],
             ..Default::default()
         };
-        let rows = mirror_rows(&mirrors(&["a"]), Some(&outcome), true);
+        let rows = mirror_rows(&mirrors(&["a"]), Some(&outcome), Some(SyncPhase::Pushing));
         assert_eq!(rows, vec![("a".to_string(), MirrorState::Syncing)]);
+    }
+
+    #[test]
+    fn fetching_phase_overrides_outcome() {
+        let outcome = SyncOutcome {
+            pushed: vec![("a".to_string(), "refs/heads/main".to_string())],
+            ..Default::default()
+        };
+        let rows = mirror_rows(&mirrors(&["a"]), Some(&outcome), Some(SyncPhase::Fetching));
+        assert_eq!(rows, vec![("a".to_string(), MirrorState::Fetching)]);
+    }
+
+    #[test]
+    fn would_push_reports_pending_push_per_remote() {
+        let outcome = SyncOutcome {
+            would_push: vec![
+                ("b".to_string(), "refs/heads/main".to_string()),
+                ("b".to_string(), "refs/tags/v1".to_string()),
+            ],
+            ..Default::default()
+        };
+        let rows = mirror_rows(&mirrors(&["a", "b"]), Some(&outcome), None);
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), MirrorState::InSync),
+                ("b".to_string(), MirrorState::PendingPush(2)),
+            ]
+        );
     }
 
     #[test]
@@ -308,7 +357,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let rows = mirror_rows(&mirrors(&["a", "b"]), Some(&outcome), false);
+        let rows = mirror_rows(&mirrors(&["a", "b"]), Some(&outcome), None);
         assert_eq!(
             rows,
             vec![
@@ -332,7 +381,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let rows = mirror_rows(&mirrors(&["a"]), Some(&outcome), false);
+        let rows = mirror_rows(&mirrors(&["a"]), Some(&outcome), None);
         assert_eq!(
             rows,
             vec![(
@@ -348,7 +397,7 @@ mod tests {
             offline: true,
             ..Default::default()
         };
-        let rows = mirror_rows(&mirrors(&["a", "b"]), Some(&outcome), false);
+        let rows = mirror_rows(&mirrors(&["a", "b"]), Some(&outcome), None);
         assert_eq!(
             rows,
             vec![
@@ -370,7 +419,7 @@ mod tests {
             fetch_errors: vec![("b".to_string(), "could not resolve host".to_string())],
             ..Default::default()
         };
-        let rows = mirror_rows(&mirrors(&["a", "b"]), Some(&outcome), false);
+        let rows = mirror_rows(&mirrors(&["a", "b"]), Some(&outcome), None);
         assert_eq!(
             rows,
             vec![
@@ -386,7 +435,7 @@ mod tests {
     #[test]
     fn clean_outcome_reports_in_sync() {
         let outcome = SyncOutcome::default();
-        let rows = mirror_rows(&mirrors(&["a"]), Some(&outcome), false);
+        let rows = mirror_rows(&mirrors(&["a"]), Some(&outcome), None);
         assert_eq!(rows, vec![("a".to_string(), MirrorState::InSync)]);
     }
 }

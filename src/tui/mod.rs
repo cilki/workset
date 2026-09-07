@@ -5,7 +5,7 @@ mod tree;
 mod watcher;
 
 use app::{App, AppMode, Section};
-use details::{DetailsLoader, MirrorState, RemoteInfo, RemotesDetail, mirror_rows};
+use details::{DetailsLoader, MirrorState, RemoteInfo, RemotesDetail, SyncPhase, mirror_rows};
 use crate::get_repo_modification_time;
 use metadata::{format_size, format_time_ago_verbose, get_repo_size};
 use tree::{RepoInfo, RepoOperationStatus, TreeNode};
@@ -25,8 +25,9 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
+use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -187,9 +188,20 @@ fn merge_discovered(pending: &mut Vec<RepoInfo>, discovered: Vec<RepoInfo>) {
     }
 }
 
+/// What a sync job is allowed to do
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncMode {
+    /// Fetch remotes and report what would be pushed, without pushing
+    Check,
+    /// Fetch remotes and actually push (triggered by 's')
+    Push,
+}
+
 /// Result of a background sync job for one repo
 enum SyncEvent {
     Started,
+    /// The job moved from fetching to actually pushing commits
+    Pushing,
     /// The repo has mirroring disabled; nothing was done
     Skipped,
     Finished(crate::sync::SyncOutcome),
@@ -202,11 +214,11 @@ enum SyncEvent {
 struct SyncManager {
     tx: mpsc::Sender<(PathBuf, SyncEvent)>,
     rx: mpsc::Receiver<(PathBuf, SyncEvent)>,
-    queue: VecDeque<PathBuf>,
+    queue: VecDeque<(PathBuf, SyncMode)>,
     in_flight: HashSet<PathBuf>,
     /// Repos that were requested again while already syncing; re-queued once
     /// the running job finishes
-    rerun_after: HashSet<PathBuf>,
+    rerun_after: HashMap<PathBuf, SyncMode>,
     recently_synced: HashMap<PathBuf, Instant>,
     last_periodic: Instant,
     /// Sync every repo once the initial scan completes. Because the outer TUI
@@ -225,7 +237,7 @@ impl SyncManager {
             rx,
             queue: VecDeque::new(),
             in_flight: HashSet::new(),
-            rerun_after: HashSet::new(),
+            rerun_after: HashMap::new(),
             recently_synced: HashMap::new(),
             last_periodic: Instant::now(),
             startup_pending: true,
@@ -234,8 +246,10 @@ impl SyncManager {
         }
     }
 
-    /// Queue a repo for syncing, deduplicating against queued and running jobs
-    fn request_sync(&mut self, repo: PathBuf, from_watcher: bool) {
+    /// Queue a repo for syncing, deduplicating against queued and running
+    /// jobs. A Push request upgrades a queued or deferred Check; a Check
+    /// never downgrades a Push.
+    fn request_sync(&mut self, repo: PathBuf, mode: SyncMode, from_watcher: bool) {
         if from_watcher
             && self
                 .recently_synced
@@ -245,18 +259,26 @@ impl SyncManager {
             return;
         }
         if self.in_flight.contains(&repo) {
-            self.rerun_after.insert(repo);
+            let deferred = self.rerun_after.entry(repo).or_insert(mode);
+            if mode == SyncMode::Push {
+                *deferred = SyncMode::Push;
+            }
             return;
         }
-        if !self.queue.contains(&repo) {
-            self.queue.push_back(repo);
+        match self.queue.iter_mut().find(|(r, _)| *r == repo) {
+            Some((_, queued)) => {
+                if mode == SyncMode::Push {
+                    *queued = SyncMode::Push;
+                }
+            }
+            None => self.queue.push_back((repo, mode)),
         }
     }
 
-    /// Queue every syncable workspace repo
+    /// Queue a mirror check for every syncable workspace repo
     fn request_sync_all(&mut self, app: &App) {
         for repo in app.syncable_repo_paths() {
-            self.request_sync(repo, false);
+            self.request_sync(repo, SyncMode::Check, false);
         }
     }
 
@@ -273,7 +295,7 @@ impl SyncManager {
     /// Spawn queued jobs up to the concurrency cap
     fn pump(&mut self) {
         while self.in_flight.len() < MAX_CONCURRENT_SYNCS {
-            let Some(repo) = self.queue.pop_front() else {
+            let Some((repo, mode)) = self.queue.pop_front() else {
                 break;
             };
             self.in_flight.insert(repo.clone());
@@ -281,7 +303,7 @@ impl SyncManager {
             let interrupt = self.interrupt.clone();
             std::thread::spawn(move || {
                 // Check the mirror config before reporting Started so disabled
-                // repos never flash a "syncing" status
+                // repos never flash a "fetching" status
                 match crate::sync::mirror_patterns(&repo, &interrupt) {
                     Ok(patterns) if !patterns.enabled() => {
                         let _ = tx.send((repo, SyncEvent::Skipped));
@@ -294,7 +316,19 @@ impl SyncManager {
                     Ok(_) => {}
                 }
                 let _ = tx.send((repo.clone(), SyncEvent::Started));
-                let event = match crate::sync::sync_repo(&repo, &interrupt, false) {
+                let on_push = {
+                    let tx = tx.clone();
+                    let repo = repo.clone();
+                    move || {
+                        let _ = tx.send((repo.clone(), SyncEvent::Pushing));
+                    }
+                };
+                let event = match crate::sync::sync_repo(
+                    &repo,
+                    &interrupt,
+                    mode == SyncMode::Check,
+                    &on_push,
+                ) {
                     Ok(outcome) => SyncEvent::Finished(outcome),
                     Err(e) => SyncEvent::Failed(e.to_string()),
                 };
@@ -309,7 +343,11 @@ impl SyncManager {
             let display_name = workspace_display_name(&self.workspace_path, &repo);
             match event {
                 SyncEvent::Started => {
-                    app.syncing_repos.insert(repo);
+                    app.sync_phases.insert(repo, SyncPhase::Fetching);
+                    app.set_sync_status(&display_name, RepoOperationStatus::Fetching);
+                }
+                SyncEvent::Pushing => {
+                    app.sync_phases.insert(repo, SyncPhase::Pushing);
                     app.set_sync_status(&display_name, RepoOperationStatus::Syncing);
                 }
                 SyncEvent::Skipped => {
@@ -317,7 +355,7 @@ impl SyncManager {
                     // Clears a stale SyncFailed overlay if the user just
                     // disabled mirroring for the repo
                     app.clear_sync_status(&display_name);
-                    app.syncing_repos.remove(&repo);
+                    app.sync_phases.remove(&repo);
                     app.sync_outcomes.remove(&repo);
                     app.details.remove(&repo);
                 }
@@ -326,13 +364,19 @@ impl SyncManager {
                     if let Some(status) = outcome.status {
                         app.apply_scan_result(&display_name, status, outcome.modification_time);
                     }
-                    match outcome.error_summary() {
-                        Some(err) => {
-                            app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err))
-                        }
-                        None => app.clear_sync_status(&display_name),
+                    if let Some(err) = outcome.error_summary() {
+                        app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err));
+                    } else if !outcome.would_push.is_empty() {
+                        // A check found refs to push; surface it on the row
+                        // until the user syncs with 's'
+                        app.set_sync_status(
+                            &display_name,
+                            RepoOperationStatus::PushPending(outcome.would_push.len()),
+                        );
+                    } else {
+                        app.clear_sync_status(&display_name);
                     }
-                    app.syncing_repos.remove(&repo);
+                    app.sync_phases.remove(&repo);
                     // The fetch may have changed what the info panel shows
                     app.details.remove(&repo);
                     // Keep the full outcome for the panel's per-mirror rows
@@ -341,7 +385,7 @@ impl SyncManager {
                 SyncEvent::Failed(err) => {
                     self.finish(&repo);
                     app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err));
-                    app.syncing_repos.remove(&repo);
+                    app.sync_phases.remove(&repo);
                 }
             }
         }
@@ -350,8 +394,8 @@ impl SyncManager {
     fn finish(&mut self, repo: &PathBuf) {
         self.in_flight.remove(repo);
         self.recently_synced.insert(repo.clone(), Instant::now());
-        if self.rerun_after.remove(repo) {
-            self.queue.push_back(repo.clone());
+        if let Some(mode) = self.rerun_after.remove(repo) {
+            self.queue.push_back((repo.clone(), mode));
         }
     }
 }
@@ -418,6 +462,44 @@ fn detect_parent_shell() -> Option<String> {
     }
 }
 
+const WORKSET_LOGO_SVG: &[u8] = include_bytes!("../../assets/workset.svg");
+
+/// Rasterize the vendored logo SVG and prepare it for the terminal's graphics
+/// protocol. Must run while raw mode is active but before the event loop
+/// starts reading stdin, since the protocol query does a terminal roundtrip.
+/// Any failure just means the help overlay renders without a logo.
+fn build_help_image() -> Option<StatefulProtocol> {
+    let tree =
+        resvg::usvg::Tree::from_data(WORKSET_LOGO_SVG, &resvg::usvg::Options::default()).ok()?;
+
+    // Rasterize at 3x for crispness, composited onto black to match the help
+    // overlay's background since the SVG itself is transparent
+    let scale = 3.0;
+    let width = (tree.size().width() * scale).ceil() as u32;
+    let height = (tree.size().height() * scale).ceil() as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    pixmap.fill(resvg::tiny_skia::Color::from_rgba8(0, 0, 0, 255));
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+
+    // tiny-skia pixels are premultiplied RGBA
+    let pixels = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|pixel| {
+            let pixel = pixel.demultiply();
+            [pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]
+        })
+        .collect();
+    let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(width, height, pixels)?);
+
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    Some(picker.new_resize_protocol(image))
+}
+
 pub fn run_tui(workspace: &Workspace) -> Result<()> {
     loop {
         // Setup terminal FIRST so we can show progress
@@ -430,6 +512,9 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         // Create app with empty data; repos stream in from the background loader
         let mut app = App::new(workspace.path.clone(), Vec::new(), Vec::new());
         app.loading_progress = Some("loading...".to_string());
+        // Query the graphics protocol now, before the event loop starts
+        // reading stdin
+        app.help_image = build_help_image();
 
         // Setup the debounced filesystem watcher on a background thread, since
         // recursively registering a large workspace can take a while and would
@@ -659,7 +744,7 @@ fn run_app<B: ratatui::backend::Backend>(
         if let Some(watcher) = file_watcher.as_mut() {
             let signals = watcher.poll();
             for repo in signals.refs_changed {
-                background.sync.request_sync(repo, true);
+                background.sync.request_sync(repo, SyncMode::Check, true);
             }
             if signals.refresh && background.loader.is_none() {
                 return Ok(Action::RefreshData);
@@ -672,13 +757,27 @@ fn run_app<B: ratatui::backend::Backend>(
             let Event::Key(key) = event::read()? else {
                 continue;
             };
+
+            // While the help overlay is open, it swallows all input except
+            // '?'/Esc to close and Ctrl+C to quit
+            if app.help_visible {
+                match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(Action::None);
+                    }
+                    KeyCode::Char('?') | KeyCode::Esc => app.help_visible = false,
+                    _ => {}
+                }
+                continue;
+            }
+
             match app.mode {
                 AppMode::Normal => match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(Action::None);
                     }
-                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+D = drop workspace repo(s) to library
+                    KeyCode::Char('d') => {
+                        // Drop workspace repo(s) to library
                         if app.active_section == Section::Workspace
                             && let Some(node) = app.selected_node()
                         {
@@ -688,8 +787,8 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                     }
-                    KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+R = toggle mirroring for the selected repo
+                    KeyCode::Char('m') => {
+                        // Toggle mirroring for the selected repo
                         if app.active_section == Section::Workspace
                             && let Some(repo_path) = app
                                 .selected_node()
@@ -717,18 +816,30 @@ fn run_app<B: ratatui::backend::Backend>(
                             {
                                 // Re-read the info panel's mirror status
                                 app.details.remove(&repo_path);
-                                // Apply the new config right away; a Skipped
-                                // event also clears any stale sync-failed
-                                // overlay
-                                background.sync.request_sync(repo_path, false);
+                                // Check against the new config right away; a
+                                // Skipped event also clears any stale
+                                // sync-failed overlay
+                                background
+                                    .sync
+                                    .request_sync(repo_path, SyncMode::Check, false);
+                            }
+                        }
+                    }
+                    KeyCode::Char('s') => {
+                        // Push pending commits to the selected node's mirrors
+                        if app.active_section == Section::Workspace
+                            && let Some(node) = app.selected_node()
+                        {
+                            for repo in node.collect_syncable_paths() {
+                                background.sync.request_sync(repo, SyncMode::Push, false);
                             }
                         }
                     }
                     KeyCode::Right | KeyCode::Left => {
                         app.toggle_expand();
                     }
-                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+A = clone repo dialog; suggestions arrive from a
+                    KeyCode::Char('c') => {
+                        // Clone repo dialog; suggestions arrive from a
                         // background thread since gh/glab may hit the network
                         app.mode = AppMode::CloneRepo;
                         app.clone_repo_input.clear();
@@ -782,6 +893,30 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                     }
+                    KeyCode::Char('?') => {
+                        app.help_visible = true;
+                    }
+                    KeyCode::Char('/') => {
+                        // Keep any existing query so '/' resumes editing an
+                        // active filter
+                        app.mode = AppMode::Search;
+                    }
+                    _ => {}
+                },
+                AppMode::Search => match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(Action::None);
+                    }
+                    KeyCode::Esc => {
+                        app.mode = AppMode::Normal;
+                        app.clear_search();
+                    }
+                    KeyCode::Enter => {
+                        // Confirm the filter and return to normal mode
+                        app.mode = AppMode::Normal;
+                    }
+                    KeyCode::Down => app.next(),
+                    KeyCode::Up => app.previous(),
                     KeyCode::Char(c) => {
                         app.search_query.push(c);
                         app.filter_repos();
@@ -887,12 +1022,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Split vertically into rows; the search box only appears while a query
-    // is being typed
-    let show_search = !app.search_query.is_empty();
+    // Split vertically into rows; the search box appears while search mode is
+    // active or a filter is applied
+    let show_search = app.mode == AppMode::Search || !app.search_query.is_empty();
     let mut constraints = vec![
-        Constraint::Length(1), // Help (at top)
-        Constraint::Min(0),    // Main area (workspace + library side by side)
+        Constraint::Min(0), // Main area (workspace + library side by side)
     ];
     if show_search {
         constraints.push(Constraint::Length(3)); // Search box
@@ -909,16 +1043,28 @@ fn ui(f: &mut Frame, app: &mut App) {
             Constraint::Percentage(50), // Workspace (left)
             Constraint::Percentage(50), // Library (right)
         ])
-        .split(vertical_chunks[1]);
+        .split(vertical_chunks[0]);
 
-    render_help_line(f, app, vertical_chunks[0]);
     render_tree_panel(f, app, horizontal_chunks[0], Section::Workspace);
 
     render_tree_panel(f, app, horizontal_chunks[1], Section::Library);
 
     if show_search {
-        let search_text = format!("{}_", app.search_query);
-        let search_style = Style::default().fg(Color::Yellow);
+        // Yellow with a cursor while editing; dimmed when the filter is
+        // merely applied
+        let (search_text, search_style, title) = if app.mode == AppMode::Search {
+            (
+                format!("{}_", app.search_query),
+                Style::default().fg(Color::Yellow),
+                "Search",
+            )
+        } else {
+            (
+                app.search_query.clone(),
+                Style::default().fg(Color::DarkGray),
+                "Filter (/ to edit)",
+            )
+        };
         let search = Paragraph::new(search_text)
             .style(search_style)
             .alignment(Alignment::Left)
@@ -926,43 +1072,105 @@ fn ui(f: &mut Frame, app: &mut App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(search_style)
-                    .title("Search"),
+                    .title(title),
             );
-        f.render_widget(search, vertical_chunks[2]);
+        f.render_widget(search, vertical_chunks[1]);
+    }
+
+    if app.help_visible {
+        render_help_dialog(f, app);
     }
 }
 
-/// Render the key-binding help line at the top of the screen
-fn render_help_line(f: &mut Frame, app: &App, area: Rect) {
+/// The keybindings shown in the help overlay
+fn help_bindings(app: &App) -> Vec<(&'static str, Color, &'static str)> {
     let enter_action = match app.active_section {
-        Section::Workspace => " open  ",
-        Section::Library => " restore  ",
+        Section::Workspace => "open",
+        Section::Library => "restore",
     };
 
-    let mut bindings: Vec<(&str, Color, &str)> = vec![
-        ("Tab", Color::Cyan, " switch  "),
-        ("↑/↓", Color::Cyan, " navigate  "),
-        ("←/→", Color::Cyan, " expand/collapse  "),
+    let mut bindings: Vec<(&'static str, Color, &'static str)> = vec![
+        ("Tab", Color::Cyan, "switch section"),
+        ("↑/↓", Color::Cyan, "navigate"),
+        ("←/→", Color::Cyan, "expand/collapse"),
         ("Enter", Color::Green, enter_action),
     ];
     if app.active_section == Section::Workspace {
-        bindings.push(("Ctrl+D", Color::Yellow, " drop  "));
-        bindings.push(("Ctrl+R", Color::Cyan, " mirror on/off  "));
+        bindings.push(("d", Color::Yellow, "drop"));
+        bindings.push(("m", Color::Cyan, "mirror on/off"));
+        bindings.push(("s", Color::Green, "sync (push)"));
     }
-    bindings.push(("Ctrl+A", Color::Magenta, " clone  "));
-    bindings.push(("Esc", Color::Red, " quit"));
+    bindings.push(("c", Color::Magenta, "clone"));
+    bindings.push(("/", Color::Yellow, "search"));
+    bindings.push(("?", Color::Cyan, "help"));
+    bindings.push(("Esc", Color::Red, "quit"));
+    bindings
+}
 
-    let mut help_spans = Vec::new();
-    for (key, color, description) in bindings {
-        help_spans.push(Span::styled(
-            key,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-        help_spans.push(Span::raw(description));
+/// Render the keybindings overlay, shown while '?' is held
+fn render_help_dialog(f: &mut Frame, app: &mut App) {
+    let bindings = help_bindings(app);
+    let image_rows: u16 = if app.help_image.is_some() { 7 } else { 0 };
+
+    let area = f.area();
+    let dialog_width = area.width.min(56);
+    let dialog_height = area.height.min(image_rows + bindings.len() as u16 + 2);
+    let dialog_area = Rect::new(
+        (area.width.saturating_sub(dialog_width)) / 2,
+        (area.height.saturating_sub(dialog_height)) / 2,
+        dialog_width,
+        dialog_height,
+    );
+
+    f.render_widget(Clear, dialog_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(image_rows), Constraint::Min(0)])
+        .split(inner);
+
+    if let Some(protocol) = app.help_image.as_mut() {
+        f.render_stateful_widget(StatefulImage::default(), chunks[0], protocol);
     }
 
-    let help = Paragraph::new(Line::from(help_spans)).alignment(Alignment::Center);
-    f.render_widget(help, area);
+    // Two aligned columns, centered as a block (centering each line
+    // individually would break the key column)
+    let key_width = bindings
+        .iter()
+        .map(|(key, _, _)| key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let block_width = key_width
+        + 2
+        + bindings
+            .iter()
+            .map(|(_, _, description)| description.chars().count())
+            .max()
+            .unwrap_or(0);
+    let indent = " ".repeat((chunks[1].width as usize).saturating_sub(block_width) / 2);
+    let lines: Vec<Line> = bindings
+        .iter()
+        .map(|(key, color, description)| {
+            let pad = " ".repeat(key_width - key.chars().count());
+            Line::from(vec![
+                Span::raw(format!("{indent}{pad}")),
+                Span::styled(
+                    *key,
+                    Style::default().fg(*color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(*description),
+            ])
+        })
+        .collect();
+    let help = Paragraph::new(lines);
+    f.render_widget(help, chunks[1]);
 }
 
 /// Detail rows rendered under the selected repo: size, worktree line changes
@@ -1025,7 +1233,7 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
         }) => {
             // Mirroring can only be toggled on workspace repos
             let hint = if section == Section::Workspace && !repo.is_submodule {
-                "mirroring off (Ctrl+R to enable)"
+                "mirroring off (m to enable)"
             } else {
                 "mirroring off"
             };
@@ -1051,9 +1259,9 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
                 Span::styled("Remotes:", dim),
             ]));
             let outcome = app.sync_outcomes.get(&repo.path);
-            let syncing = app.syncing_repos.contains(&repo.path);
+            let phase = app.sync_phases.get(&repo.path).copied();
             let names: Vec<String> = remotes.iter().map(|r| r.name.clone()).collect();
-            let states = mirror_rows(&names, outcome, syncing);
+            let states = mirror_rows(&names, outcome, phase);
             for (remote, (_, state)) in remotes.iter().zip(states) {
                 let mut line = mirror_status_line(remote, state);
                 line.spans.insert(0, Span::raw(indent.clone()));
@@ -1067,8 +1275,15 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
 /// One detail row showing a mirror remote, its sync state, and how many
 /// commits it is behind (when it is)
 fn mirror_status_line(remote: &RemoteInfo, state: MirrorState) -> Line<'static> {
-    let show_behind = remote.behind > 0 && state != MirrorState::Syncing;
+    // The behind count expresses the same lag a running or pending sync is
+    // already reporting
+    let show_behind = remote.behind > 0
+        && !matches!(
+            state,
+            MirrorState::Fetching | MirrorState::Syncing | MirrorState::PendingPush(_)
+        );
     let status = match state {
+        MirrorState::Fetching => Span::styled("fetching…", Style::default().fg(Color::DarkGray)),
         MirrorState::Syncing => Span::styled("syncing…", Style::default().fg(Color::Cyan)),
         MirrorState::InSync => Span::styled("✓ in sync", Style::default().fg(Color::Green)),
         MirrorState::Pushed(count) => Span::styled(
@@ -1078,6 +1293,14 @@ fn mirror_status_line(remote: &RemoteInfo, state: MirrorState) -> Line<'static> 
                 if count == 1 { "" } else { "s" }
             ),
             Style::default().fg(Color::Green),
+        ),
+        MirrorState::PendingPush(count) => Span::styled(
+            format!(
+                "↑ {} ref{} to push (s to sync)",
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(Color::Yellow),
         ),
         MirrorState::Conflict(msg) | MirrorState::PushError(msg) | MirrorState::FetchError(msg) => {
             Span::styled(format!("⚠ {}", msg), Style::default().fg(Color::Red))
@@ -1327,7 +1550,11 @@ fn tree_list_item<'a>(
         let (status_text, status_color) = match &repo.operation_status {
             RepoOperationStatus::None => (idle_metadata(repo), Color::DarkGray),
             RepoOperationStatus::Scanning => ("scanning".to_string(), Color::DarkGray),
+            RepoOperationStatus::Fetching => ("fetching".to_string(), Color::DarkGray),
             RepoOperationStatus::Syncing => ("syncing".to_string(), Color::Cyan),
+            RepoOperationStatus::PushPending(count) => {
+                (format!("↑ {} to push", count), Color::Yellow)
+            }
             RepoOperationStatus::SyncFailed(err) => (format!("sync failed: {}", err), Color::Red),
             RepoOperationStatus::Cloning => ("cloning...".to_string(), Color::Magenta),
             RepoOperationStatus::Dropping => ("dropping...".to_string(), Color::Yellow),
@@ -1791,14 +2018,14 @@ mod tests {
         let workspace = render(Section::Workspace);
         assert!(workspace.contains("Size:"));
         assert!(workspace.contains("Changes: +531 -95"));
-        assert!(workspace.contains("Remotes: mirroring off (Ctrl+R to enable)"));
+        assert!(workspace.contains("Remotes: mirroring off (m to enable)"));
         assert!(workspace.contains("origin"));
 
         let library = render(Section::Library);
         assert!(library.contains("Size:"));
         assert!(!library.contains("Changes:"));
         assert!(library.contains("Remotes: mirroring off"));
-        assert!(!library.contains("Ctrl+R"));
+        assert!(!library.contains("to enable"));
     }
 
     #[test]
@@ -1849,8 +2076,8 @@ mod tests {
         let mut mgr = SyncManager::new("ws".to_string());
         let repo = PathBuf::from("ws/repo");
 
-        mgr.request_sync(repo.clone(), false);
-        mgr.request_sync(repo.clone(), false);
+        mgr.request_sync(repo.clone(), SyncMode::Check, false);
+        mgr.request_sync(repo.clone(), SyncMode::Check, false);
         assert_eq!(mgr.queue.len(), 1);
 
         // Simulate the job being picked up
@@ -1858,9 +2085,9 @@ mod tests {
         mgr.in_flight.insert(repo.clone());
 
         // Requests during a running sync are deferred, not duplicated
-        mgr.request_sync(repo.clone(), false);
+        mgr.request_sync(repo.clone(), SyncMode::Check, false);
         assert!(mgr.queue.is_empty());
-        assert!(mgr.rerun_after.contains(&repo));
+        assert!(mgr.rerun_after.contains_key(&repo));
 
         // Finishing re-queues the deferred request and stamps the cooldown
         mgr.finish(&repo);
@@ -1869,11 +2096,38 @@ mod tests {
 
         // Watcher-triggered requests inside the cooldown are dropped
         mgr.queue.clear();
-        mgr.request_sync(repo.clone(), true);
+        mgr.request_sync(repo.clone(), SyncMode::Check, true);
         assert!(mgr.queue.is_empty());
 
         // Explicit (non-watcher) requests ignore the cooldown
-        mgr.request_sync(repo.clone(), false);
+        mgr.request_sync(repo.clone(), SyncMode::Check, false);
         assert_eq!(mgr.queue.len(), 1);
+    }
+
+    #[test]
+    fn sync_manager_push_upgrades_but_never_downgrades() {
+        let mut mgr = SyncManager::new("ws".to_string());
+        let repo = PathBuf::from("ws/repo");
+
+        // A push request upgrades a queued check
+        mgr.request_sync(repo.clone(), SyncMode::Check, false);
+        mgr.request_sync(repo.clone(), SyncMode::Push, false);
+        assert_eq!(mgr.queue.front(), Some(&(repo.clone(), SyncMode::Push)));
+
+        // A later check leaves the queued push alone
+        mgr.request_sync(repo.clone(), SyncMode::Check, false);
+        assert_eq!(mgr.queue.front(), Some(&(repo.clone(), SyncMode::Push)));
+        assert_eq!(mgr.queue.len(), 1);
+
+        // The same upgrade applies to requests deferred behind a running job
+        mgr.queue.clear();
+        mgr.in_flight.insert(repo.clone());
+        mgr.request_sync(repo.clone(), SyncMode::Check, false);
+        mgr.request_sync(repo.clone(), SyncMode::Push, false);
+        mgr.request_sync(repo.clone(), SyncMode::Check, false);
+        assert_eq!(mgr.rerun_after.get(&repo), Some(&SyncMode::Push));
+
+        mgr.finish(&repo);
+        assert_eq!(mgr.queue.front(), Some(&(repo, SyncMode::Push)));
     }
 }

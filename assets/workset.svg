@@ -1,0 +1,55 @@
+<svg width="261" height="69" fill="none" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <g transform="translate(3,3)">
+    <path id="curve" style="stroke:#3776c8" d="M 32 12 Q 56 20 32 32 Q 8 44 32 52" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="32" cy="12" id="top" r="6" style="fill:#3776c8"/>
+    <circle cx="32" cy="32" id="middle" r="5" style="fill:#3776c8"/>
+    <circle cx="32" cy="52" id="bottom" r="6" style="fill:#3776c8"/>
+  </g>
+  <g transform="">
+    <rect style="fill:#3776c8" id="2-0" width="7" height="7" x="57" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-0" width="7" height="7" x="57" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-0" width="7" height="7" x="57" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="4-1" width="7" height="7" x="65" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="3-2" width="7" height="7" x="73" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-3" width="7" height="7" x="81" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="2-4" width="7" height="7" x="89" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-4" width="7" height="7" x="89" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-4" width="7" height="7" x="89" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="2-6" width="7" height="7" x="102" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-6" width="7" height="7" x="102" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-6" width="7" height="7" x="102" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="2-7" width="7" height="7" x="110" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="4-7" width="7" height="7" x="110" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="2-8" width="7" height="7" x="118" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-8" width="7" height="7" x="118" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-8" width="7" height="7" x="118" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="2-10" width="7" height="7" x="131" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-10" width="7" height="7" x="131" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-10" width="7" height="7" x="131" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="2-11" width="7" height="7" x="139" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="2-13" width="7" height="7" x="152" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-13" width="7" height="7" x="152" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-13" width="7" height="7" x="152" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="3-14" width="7" height="7" x="160" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="2-15" width="7" height="7" x="168" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="4-15" width="7" height="7" x="168" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="4-17" width="7" height="7" x="181" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="2-18" width="7" height="7" x="189" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-18" width="7" height="7" x="189" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-18" width="7" height="7" x="189" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="2-19" width="7" height="7" x="197" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-21" width="7" height="7" x="210" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="2-22" width="7" height="7" x="218" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-22" width="7" height="7" x="218" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-22" width="7" height="7" x="218" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="2-23" width="7" height="7" x="226" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="4-23" width="7" height="7" x="226" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="0-25" width="7" height="7" x="239" y="7" rx="1"/>
+    <rect style="fill:#3776c8" id="1-25" width="7" height="7" x="239" y="15" rx="1"/>
+    <rect style="fill:#3776c8" id="2-25" width="7" height="7" x="239" y="23" rx="1"/>
+    <rect style="fill:#3776c8" id="3-25" width="7" height="7" x="239" y="31" rx="1"/>
+    <rect style="fill:#3776c8" id="4-25" width="7" height="7" x="239" y="39" rx="1"/>
+    <rect style="fill:#3776c8" id="1-26" width="7" height="7" x="247" y="15" rx="1"/>
+    <rect style="fill:#3776c8" id="4-26" width="7" height="7" x="247" y="39" rx="1"/>
+  </g>
+</svg>

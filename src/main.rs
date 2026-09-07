@@ -569,7 +569,7 @@ fn mirror_repos(workspace: &Workspace, pattern: Option<&str>, dry_run: bool) -> 
         }
         matched = true;
 
-        match workset::sync::sync_repo(&repo, &interrupt, dry_run) {
+        match workset::sync::sync_repo(&repo, &interrupt, dry_run, &|| {}) {
             Ok(outcome) => {
                 if outcome.skipped {
                     println!("  {} - skipped (mirroring disabled)", repo_name);
