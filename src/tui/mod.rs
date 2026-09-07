@@ -44,6 +44,8 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(300);
 /// Ignore watcher-triggered sync requests this soon after a sync finished,
 /// since the sync's own fetch writes the tracking refs the watcher observes
 const WATCHER_SYNC_COOLDOWN: Duration = Duration::from_secs(2);
+/// Below this terminal width only the active panel is shown (Tab toggles)
+const SINGLE_PANEL_THRESHOLD: u16 = 80;
 
 enum Action {
     None,
@@ -1017,6 +1019,8 @@ fn poll_suggestions(app: &mut App, background: &mut BackgroundTasks) {
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
+    app.single_panel = f.area().width < SINGLE_PANEL_THRESHOLD;
+
     if app.mode == AppMode::CloneRepo {
         render_clone_repo_dialog(f, app);
         return;
@@ -1036,18 +1040,23 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints(constraints)
         .split(f.area());
 
-    // Split the main area horizontally into workspace (left) and library (right)
-    let horizontal_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50), // Workspace (left)
-            Constraint::Percentage(50), // Library (right)
-        ])
-        .split(vertical_chunks[0]);
+    if app.single_panel {
+        // Too narrow for the side-by-side layout; show only the active panel
+        render_tree_panel(f, app, vertical_chunks[0], app.active_section);
+    } else {
+        // Split the main area horizontally into workspace (left) and library (right)
+        let horizontal_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50), // Workspace (left)
+                Constraint::Percentage(50), // Library (right)
+            ])
+            .split(vertical_chunks[0]);
 
-    render_tree_panel(f, app, horizontal_chunks[0], Section::Workspace);
+        render_tree_panel(f, app, horizontal_chunks[0], Section::Workspace);
 
-    render_tree_panel(f, app, horizontal_chunks[1], Section::Library);
+        render_tree_panel(f, app, horizontal_chunks[1], Section::Library);
+    }
 
     if show_search {
         // Yellow with a cursor while editing; dimmed when the filter is
@@ -1089,8 +1098,17 @@ fn help_bindings(app: &App) -> Vec<(&'static str, Color, &'static str)> {
         Section::Library => "restore",
     };
 
+    let tab_action = if app.single_panel {
+        match app.active_section {
+            Section::Workspace => "show library",
+            Section::Library => "show workspace",
+        }
+    } else {
+        "switch section"
+    };
+
     let mut bindings: Vec<(&'static str, Color, &'static str)> = vec![
-        ("Tab", Color::Cyan, "switch section"),
+        ("Tab", Color::Cyan, tab_action),
         ("↑/↓", Color::Cyan, "navigate"),
         ("←/→", Color::Cyan, "expand/collapse"),
         ("Enter", Color::Green, enter_action),

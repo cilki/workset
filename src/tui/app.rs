@@ -48,6 +48,10 @@ pub struct App {
     pub library_state: TreeState,
     pub search_query: String,
     pub active_section: Section,
+    /// Whether the terminal is too narrow for the side-by-side layout; set
+    /// each frame from the terminal width. Only the active section is
+    /// rendered, and Tab may switch to an empty section to reveal it.
+    pub single_panel: bool,
     pub matcher: SkimMatcherV2,
     pub workspace_path: String,
     pub loading_progress: Option<String>,
@@ -95,6 +99,7 @@ impl App {
             library_state: TreeState::new(),
             search_query: String::new(),
             active_section: Section::Workspace,
+            single_panel: false,
             matcher: SkimMatcherV2::default(),
             workspace_path,
             loading_progress: None,
@@ -302,11 +307,17 @@ impl App {
         }
     }
 
-    /// Switch to the other section if it has any items
+    /// Switch to the other section if it has any items. In single-panel mode
+    /// the other section is hidden, so Tab must reveal it even when empty.
     pub fn switch_section(&mut self) {
         let other = self.active_section.other();
         if self.section_len(other) > 0 {
             self.select(other, 0);
+            self.selection_is_auto = false;
+        } else if self.single_panel {
+            self.active_section = other;
+            self.workspace_state.select(None);
+            self.library_state.select(None);
             self.selection_is_auto = false;
         }
     }
@@ -319,7 +330,8 @@ impl App {
         self.move_selection(-1);
     }
 
-    /// Move the selection by one, crossing into the other section at the edges
+    /// Move the selection by one, crossing into the other section at the
+    /// edges when both panels are visible
     fn move_selection(&mut self, delta: isize) {
         let section = self.active_section;
         let current_len = self.section_len(section);
@@ -344,7 +356,7 @@ impl App {
         };
         if !at_edge {
             self.select(section, i.saturating_add_signed(delta));
-        } else if self.section_len(section.other()) > 0 {
+        } else if !self.single_panel && self.section_len(section.other()) > 0 {
             // Cross into the other section (top when moving down, bottom when moving up)
             let other_len = self.section_len(section.other());
             let index = if delta > 0 { 0 } else { other_len - 1 };
@@ -764,5 +776,63 @@ mod tests {
         );
         assert_eq!(app.active_section, Section::Workspace);
         assert_eq!(selected_path(&app).as_deref(), Some(path.as_str()));
+    }
+
+    #[test]
+    fn single_panel_tab_reaches_empty_section() {
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app")],
+            Vec::new(),
+        );
+        app.single_panel = true;
+
+        // Tab reveals the hidden (empty) library instead of being a no-op
+        app.switch_section();
+        assert_eq!(app.active_section, Section::Library);
+        assert!(selected_path(&app).is_none());
+        assert!(app.workspace_state.selected().is_none());
+
+        // Tab again returns to the workspace with a selection
+        app.switch_section();
+        assert_eq!(app.active_section, Section::Workspace);
+        assert_eq!(app.workspace_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn wide_mode_tab_still_refuses_empty_section() {
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app")],
+            Vec::new(),
+        );
+        let before = selected_path(&app);
+
+        app.switch_section();
+        assert_eq!(app.active_section, Section::Workspace);
+        assert_eq!(selected_path(&app), before);
+    }
+
+    #[test]
+    fn single_panel_selection_wraps_within_section() {
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app")],
+            vec![repo("github.com/bar/lib")],
+        );
+        app.single_panel = true;
+
+        // Moving up from the top wraps to the bottom of the workspace instead
+        // of crossing into the hidden library
+        app.previous();
+        assert_eq!(app.active_section, Section::Workspace);
+        let last = app.section_len(Section::Workspace) - 1;
+        assert_eq!(app.workspace_state.selected(), Some(last));
+
+        // With both panels visible, the same move crosses into the library
+        app.single_panel = false;
+        app.next();
+        assert_eq!(app.active_section, Section::Library);
+        assert_eq!(app.library_state.selected(), Some(0));
     }
 }
