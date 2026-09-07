@@ -265,10 +265,9 @@ impl DetailsLoader {
 /// far behind it is
 fn load_remotes(path: &Path, interrupt: &AtomicBool) -> RemotesDetail {
     let names = crate::sync::list_remotes(path, interrupt).unwrap_or_default();
-    let patterns = crate::sync::mirror_patterns(path, interrupt).unwrap_or_default();
-    let mirroring = patterns.enabled();
+    let mirroring = crate::sync::mirroring_enabled(path, interrupt).unwrap_or(true);
     let behind = if mirroring {
-        crate::sync::behind_counts(path, &names, &patterns, interrupt).unwrap_or_default()
+        crate::sync::behind_counts(path, &names, interrupt).unwrap_or_default()
     } else {
         Default::default()
     };

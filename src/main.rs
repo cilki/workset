@@ -6,7 +6,7 @@ use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 use workset::Workspace;
 
-/// How often `mirror sync --watch` re-runs; matches the TUI's SYNC_INTERVAL
+/// How often `mirror --watch` re-runs; matches the TUI's SYNC_INTERVAL
 const WATCH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// ANSI color codes
@@ -295,14 +295,10 @@ fn main() -> Result<()> {
                                        With --force: drop even with uncommitted changes{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
   {subcmd}status{reset}                               Show workspace summary and statistics
-  {subcmd}mirror init{reset} {arg}[pattern]{reset} {arg}[--branches <glob>]{reset} {arg}[--tags <glob>]{reset}
-{dim}                                       Enable mirroring: all remotes of an enabled repo
-                                       become mirrors for the selected branches and tags
-                                       Without pattern: enables all in current directory
-                                       Defaults: the repo's default branch and all tags
-                                       Repeat --branches/--tags to add more patterns{reset}
-  {subcmd}mirror sync{reset} {arg}[pattern]{reset} {arg}[--dryrun]{reset} {arg}[--watch]{reset}
-{dim}                                       Mirror pushed commits to the remotes of enabled repos
+  {subcmd}mirror{reset} {arg}[pattern]{reset} {arg}[--dryrun]{reset} {arg}[--watch]{reset}
+{dim}                                       Mirror pushed commits between each repo's remotes
+                                       On by default; opt a repo out with
+                                       'git config workset.mirror false'
                                        With --dryrun: show what would be pushed without pushing
                                        With --watch: keep syncing every 5 minutes{reset}
 
@@ -315,9 +311,7 @@ fn main() -> Result<()> {
   {cmd}workset drop{reset}                              Drop all repos in current dir
   {cmd}workset drop --delete ./old_repo{reset}          Permanently delete a repo
   {cmd}workset drop --force ./dirty_repo{reset}         Force drop repo and lose any changes
-  {cmd}workset mirror init ./repo{reset}                Enable mirroring for a repo
-  {cmd}workset mirror init ./repo --tags 'v*'{reset}    Mirror only tags starting with 'v'
-  {cmd}workset mirror sync --watch{reset}               Keep mirroring pushed commits
+  {cmd}workset mirror --watch{reset}                    Keep mirroring pushed commits
 "#,
             workset = paint(colors::BOLD, "workset"),
             version = paint(colors::CYAN, env!("CARGO_PKG_VERSION")),
@@ -413,39 +407,19 @@ fn main() -> Result<()> {
             }
             "mirror" => {
                 let workspace = require_workspace!(maybe_workspace);
-                match args.subcommand()? {
-                    Some(sub) => match sub.as_str() {
-                        "init" => {
-                            let branches: Vec<String> = args.values_from_str("--branches")?;
-                            let tags: Vec<String> = args.values_from_str("--tags")?;
-                            let pattern = args.opt_free_from_str::<String>()?;
-                            mirror_init(&workspace, pattern.as_deref(), branches, tags)?;
-                        }
-                        "sync" => {
-                            let dry_run = args.contains("--dryrun");
-                            let watch = args.contains("--watch");
-                            let pattern = args.opt_free_from_str::<String>()?;
-                            loop {
-                                mirror_repos(&workspace, pattern.as_deref(), dry_run)?;
-                                if !watch {
-                                    break;
-                                }
-                                println!(
-                                    "  next sync in {}s (Ctrl+C to stop)",
-                                    WATCH_INTERVAL.as_secs()
-                                );
-                                std::thread::sleep(WATCH_INTERVAL);
-                            }
-                        }
-                        _ => {
-                            error!(command = %sub, "Unknown mirror subcommand");
-                            error!("Usage: workset mirror <init|sync> ...");
-                        }
-                    },
-                    None => {
-                        error!("Missing mirror subcommand");
-                        error!("Usage: workset mirror <init|sync> ...");
+                let dry_run = args.contains("--dryrun");
+                let watch = args.contains("--watch");
+                let pattern = args.opt_free_from_str::<String>()?;
+                loop {
+                    mirror_repos(&workspace, pattern.as_deref(), dry_run)?;
+                    if !watch {
+                        break;
                     }
+                    println!(
+                        "  next sync in {}s (Ctrl+C to stop)",
+                        WATCH_INTERVAL.as_secs()
+                    );
+                    std::thread::sleep(WATCH_INTERVAL);
                 }
             }
             _ => {
@@ -495,62 +469,6 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
         println!("  {} - {}", repo_name, status_str);
     }
 
-    Ok(())
-}
-
-/// Enable mirroring for matching workspace repos; without a pattern, for all
-/// repos under the current directory. Explicit --branches/--tags patterns
-/// overwrite existing config; without flags the defaults are the repo's
-/// default branch and all tags, and already-enabled repos are left alone.
-fn mirror_init(
-    workspace: &Workspace,
-    pattern: Option<&str>,
-    branches: Vec<String>,
-    tags: Vec<String>,
-) -> Result<()> {
-    let root = match pattern {
-        Some(_) => std::path::PathBuf::from(&workspace.path),
-        None => std::env::current_dir()?,
-    };
-    let repos = workset::find_git_repositories(&root)?;
-    let interrupt = std::sync::atomic::AtomicBool::new(false);
-    let explicit = !branches.is_empty() || !tags.is_empty();
-
-    let mut matched = false;
-    for repo in repos {
-        let repo_name = workspace.relative_name(&repo);
-        if pattern.is_some_and(|p| !repo_name.contains(p)) {
-            continue;
-        }
-        matched = true;
-
-        let patterns = if explicit {
-            workset::sync::MirrorPatterns {
-                branches: branches.clone(),
-                tags: tags.clone(),
-            }
-        } else {
-            if workset::sync::mirror_patterns(&repo, &interrupt)?.enabled() {
-                println!("  {} - already enabled", repo_name);
-                continue;
-            }
-            workset::sync::MirrorPatterns {
-                branches: vec![workset::sync::default_branch(&repo, &interrupt)],
-                tags: vec!["*".to_string()],
-            }
-        };
-        workset::sync::set_mirror_patterns(&repo, &patterns)?;
-        println!(
-            "  {} - ✓ mirroring enabled (branches: {}, tags: {})",
-            repo_name,
-            workset::sync::display_patterns(&patterns.branches),
-            workset::sync::display_patterns(&patterns.tags),
-        );
-    }
-
-    if !matched {
-        println!("No repositories matched");
-    }
     Ok(())
 }
 
@@ -798,13 +716,7 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
     } else if let Some(workspace) = maybe_workspace {
         // Complete repository paths based on the subcommand
         let subcommand = words.get(1).unwrap_or(&"");
-        if *subcommand == "mirror" && word_index == 2 {
-            for sub in ["init", "sync"] {
-                if sub.starts_with(current_word) {
-                    println!("{}", sub);
-                }
-            }
-        } else if *subcommand == "restore" {
+        if *subcommand == "restore" {
             // For restore, complete from library
             if let Ok(library_repos) = workspace.list_library() {
                 for repo in library_repos {
@@ -848,12 +760,7 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
     } else if let Some(workspace) = maybe_workspace {
         // Complete repository paths based on the subcommand
         let subcommand = words.get(1).unwrap_or(&"");
-        if *subcommand == "mirror"
-            && (words.len() == 2 || (words.len() == 3 && !comp_line.ends_with(' ')))
-        {
-            println!("init\tEnable mirroring for repository(ies)");
-            println!("sync\tMirror pushed commits to the remotes of enabled repos");
-        } else if *subcommand == "restore" {
+        if *subcommand == "restore" {
             // For restore, complete from library
             if let Ok(library_repos) = workspace.list_library() {
                 for repo in library_repos {

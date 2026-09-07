@@ -8,9 +8,10 @@ addCommit() {
 }
 
 ## Initialize a workspace holding `repo` on branch main, with two bare remotes
-## `a` and `b` both seeded with its initial commit, and mirroring enabled;
-## `a` is the upstream of main. The bare remotes live outside the workspace so
-## workset doesn't treat them as repos of their own.
+## `a` and `b` both seeded with its initial commit; `a` is the upstream of
+## main. Mirroring is on by default, so no config is needed. The bare remotes
+## live outside the workspace so workset doesn't treat them as repos of their
+## own.
 setupMirror() {
 	mkdir remotes
 	remotes=$PWD/remotes
@@ -29,75 +30,38 @@ setupMirror() {
 
 	git -C repo remote add a "$remotes/a.git"
 	git -C repo remote add b "$remotes/b.git"
-	workset mirror init
 	git -C repo push -q -u a main
 	git -C repo push -q b main
 }
 
-## mirror init stores the default branch and all-tags patterns
-testMirrorInitSetsDefaultPatterns() {
+## Mirroring is on without any workset config in the repo
+testMirrorEnabledWithoutConfig() {
 	setupMirror
-
-	[ "$(git -C repo config --get-all workset.mirrorBranches)" = "main" ]
-	[ "$(git -C repo config --get-all workset.mirrorTags)" = "*" ]
-}
-
-## mirror init with a pattern only enables matching repos
-testMirrorInitPatternScopesToMatch() {
-	setupMirror
-	mkdir other
-	git -C other init -q -b main
-
-	workset mirror init repo
-
-	[ "$(git -C repo config --get-all workset.mirrorBranches)" = "main" ]
-	! git -C other config --get workset.mirrorBranches
-	! git -C other config --get workset.mirrorTags
-}
-
-## Running mirror init twice reports the repo as already enabled
-testMirrorInitIsIdempotent() {
-	setupMirror
-
-	output=$(workset mirror init)
-
-	echo "$output" | grep "repo - already enabled"
-	[ "$(git -C repo config --get-all workset.mirrorBranches)" = "main" ]
-	[ "$(git -C repo config --get-all workset.mirrorTags)" = "*" ]
-}
-
-## --branches/--tags flags are stored verbatim, repeated flags add values
-testMirrorInitFlagsStoreMultipleValues() {
-	setupMirror
-
-	workset mirror init --branches main --branches 'release/*' --tags 'v?' repo
-
-	[ "$(git -C repo config --get-all workset.mirrorBranches)" = "$(printf 'main\nrelease/*')" ]
-	[ "$(git -C repo config --get-all workset.mirrorTags)" = "v?" ]
-}
-
-## The legacy boolean workset.mirror flag is ignored; repos holding only it
-## read as mirroring-disabled
-testMirrorIgnoresLegacyBoolFlag() {
-	setupMirror
-	git -C repo config --unset-all workset.mirrorBranches
-	git -C repo config --unset-all workset.mirrorTags
-	git -C repo config workset.mirror true
-	seeded=$(git -C "$remotes/b.git" rev-parse main)
 	addCommit repo new.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
-	echo "$output" | grep "repo - skipped (mirroring disabled)"
-	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$seeded" ]
+	! git -C repo config --local --get workset.mirror
+	! echo "$output" | grep "skipped"
+	echo "$output" | grep "repo - ✓ pushed main to b"
+	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
 }
 
-## mirror without a subcommand prints usage
-testMirrorWithoutSubcommandShowsUsage() {
+## The old pattern keys are ignored and don't restrict what is mirrored
+testMirrorStalePatternKeysIgnored() {
 	setupMirror
+	git -C repo config workset.mirrorBranches nonexistent
+	git -C repo config workset.mirrorTags 'v*'
+	addCommit repo new.txt
+	git -C repo tag x1
+	git -C repo push -q a main refs/tags/x1
 
-	workset mirror 2>&1 | grep "Usage: workset mirror"
+	output=$(workset mirror)
+
+	echo "$output" | grep "repo - ✓ pushed"
+	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
+	[ "$(git -C "$remotes/b.git" rev-parse refs/tags/x1)" = "$(git -C repo rev-parse refs/tags/x1)" ]
 }
 
 ## A commit the user pushed to one remote is mirrored to the others
@@ -106,7 +70,7 @@ testMirrorMirrorsPushedCommit() {
 	addCommit repo new.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ✓ pushed main to b"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
@@ -120,13 +84,13 @@ testMirrorDryrunReportsWithoutPushing() {
 	addCommit repo new.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror sync --dryrun)
+	output=$(workset mirror --dryrun)
 
 	echo "$output" | grep "repo - would push main to b"
 	! echo "$output" | grep "✓ pushed"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$seeded" ]
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ✓ pushed main to b"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
@@ -138,7 +102,7 @@ testMirrorNeverPushesUnpushedCommits() {
 	seeded=$(git -C repo rev-parse HEAD)
 	addCommit repo local-only.txt
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ✓ in sync"
 	[ "$(git -C "$remotes/a.git" rev-parse main)" = "$seeded" ]
@@ -158,7 +122,7 @@ testMirrorPropagatesPushFromAnotherMachine() {
 	addCommit ../elsewhere elsewhere.txt
 	git -C ../elsewhere push -q origin main
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ✓ pushed main to b"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C ../elsewhere rev-parse HEAD)" ]
@@ -176,7 +140,7 @@ testMirrorPropagatesRemoteOnlyTag() {
 	git -C ../elsewhere tag v9
 	git -C ../elsewhere push -q origin refs/tags/v9
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ✓ pushed v9 to b"
 	[ "$(git -C "$remotes/b.git" rev-parse refs/tags/v9)" = "$(git -C ../elsewhere rev-parse refs/tags/v9)" ]
@@ -195,7 +159,7 @@ testMirrorReportsDivergenceWithoutForcing() {
 	addCommit repo kept.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ⚠ main on b:"
 	! echo "$output" | grep "pushed main to b"
@@ -209,7 +173,7 @@ testMirrorLeavesLocalOnlyBranchAlone() {
 	addCommit repo feature.txt
 	git -C repo checkout -q main
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ✓ in sync"
 	! git -C "$remotes/a.git" rev-parse --verify refs/heads/feature
@@ -230,7 +194,7 @@ testMirrorMirrorsTagsAndReportsMismatch() {
 	git -C repo push -q a refs/tags/v2
 	git -C "$remotes/b.git" update-ref refs/tags/v2 "$old_head"
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ⚠ v2 on b:"
 	[ "$(git -C "$remotes/b.git" rev-parse refs/tags/v1)" = "$(git -C repo rev-parse refs/tags/v1)" ]
@@ -248,7 +212,7 @@ testMirrorRefreshesStaleUnpushedStatus() {
 	git -C repo update-ref refs/remotes/a/main HEAD~1
 	workset list | grep "repo - ⚠ unpushed"
 
-	workset mirror sync
+	workset mirror
 
 	workset list | grep "repo - ✓ clean"
 }
@@ -264,7 +228,7 @@ testMirrorContinuesPastUnreachableRemote() {
 	addCommit repo new.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ✗ fetch c failed"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
@@ -275,70 +239,37 @@ testMirrorReportsUnreachableInsteadOfInSync() {
 	setupMirror
 	rm -rf "$remotes/a.git" "$remotes/b.git"
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - ⚠ remotes unreachable"
 	! echo "$output" | grep "in sync"
 }
 
-## A repo with mirroring disabled is skipped entirely
-testMirrorSkipsRepoWithoutMirrorConfig() {
+## A repo opted out with workset.mirror = false is skipped entirely
+testMirrorSkipsOptedOutRepo() {
 	setupMirror
-	git -C repo config --unset-all workset.mirrorBranches
-	git -C repo config --unset-all workset.mirrorTags
+	git -C repo config workset.mirror false
 	seeded=$(git -C "$remotes/b.git" rev-parse main)
 	addCommit repo new.txt
 	git -C repo push -q a main
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
 	echo "$output" | grep "repo - skipped (mirroring disabled)"
 	! echo "$output" | grep "pushed"
 	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$seeded" ]
 }
 
-## A published branch not matching the branch pattern is not mirrored
-testMirrorBranchPatternExcludesBranch() {
+## A published branch other than the default branch is mirrored too
+testMirrorMirrorsNonDefaultBranch() {
 	setupMirror
 	git -C repo checkout -q -b feature
 	addCommit repo feature.txt
 	git -C repo push -q a feature
 	git -C repo checkout -q main
 
-	output=$(workset mirror sync)
+	output=$(workset mirror)
 
-	echo "$output" | grep "repo - ✓ in sync"
-	! git -C "$remotes/b.git" rev-parse --verify refs/heads/feature
-}
-
-## Only tags matching the tag pattern are mirrored
-testMirrorTagPatternFilters() {
-	setupMirror
-	git -C repo config --replace-all workset.mirrorTags 'v*'
-	git -C repo tag v1
-	git -C repo tag x1
-	git -C repo push -q a refs/tags/v1 refs/tags/x1
-
-	output=$(workset mirror sync)
-
-	echo "$output" | grep "repo - ✓ pushed v1 to b"
-	[ "$(git -C "$remotes/b.git" rev-parse refs/tags/v1)" = "$(git -C repo rev-parse refs/tags/v1)" ]
-	! git -C "$remotes/b.git" rev-parse --verify refs/tags/x1
-}
-
-## A tags-only config still counts as enabled and mirrors tags but no branches
-testMirrorOnlyTagsIsEnabled() {
-	setupMirror
-	git -C repo config --unset-all workset.mirrorBranches
-	seeded=$(git -C "$remotes/b.git" rev-parse main)
-	addCommit repo new.txt
-	git -C repo tag v1
-	git -C repo push -q a main refs/tags/v1
-
-	output=$(workset mirror sync)
-
-	! echo "$output" | grep "skipped"
-	echo "$output" | grep "repo - ✓ pushed v1 to b"
-	[ "$(git -C "$remotes/b.git" rev-parse refs/tags/v1)" = "$(git -C repo rev-parse refs/tags/v1)" ]
-	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$seeded" ]
+	echo "$output" | grep "repo - ✓ pushed feature to b"
+	[ "$(git -C "$remotes/b.git" rev-parse feature)" = "$(git -C repo rev-parse feature)" ]
 }

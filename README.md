@@ -78,31 +78,27 @@ Don't let Github be the only place you store your repos!
 **Workset** makes it easy to keep local copies of all of your repos without
 having to sift through them to find the ones you're currently working on.
 
-**Workset** can mirror your pushed commits to the other remotes of a repo.
-Opt in per repo — press `m` on a repo in the TUI, or from the command
-line:
+**Workset** mirrors your pushed commits to the other remotes of a repo — on
+by default, no setup needed. All of a repo's remotes are mirrors for all of
+its branches and tags. Push to any remote (from anywhere — inside or outside
+workset) and the TUI notices in the background: it fetches the repo's remotes
+and shows how many refs each mirror is waiting on. Nothing is pushed until
+you press `s`, which propagates the branches and tags to the mirrors that are
+behind. Commits you haven't pushed anywhere are never touched, and diverged
+refs show an error instead of being force-pushed.
+
+To opt a repo out, press `m` on it in the TUI, or set the config key
+directly:
 
 ```sh
-workset mirror init <repo>
+git config workset.mirror false
 ```
 
-Once enabled, all of the repo's remotes become mirrors. Push to any remote
-(from anywhere — inside or outside workset) and the TUI notices in the
-background: it fetches the repo's remotes and shows how many refs each mirror
-is waiting on. Nothing is pushed until you press `s`, which propagates the
-selected branches and tags to the mirrors that are behind. Commits you
-haven't pushed anywhere are never touched, and diverged refs show an error
-instead of being force-pushed. Repos that haven't opted in are left alone
-entirely. By default the repo's default branch and all tags are mirrored;
-glob patterns select more (or fewer) refs:
+Opted-out repos are left alone entirely.
 
-```sh
-workset mirror init <repo> --branches main --branches 'release/*' --tags 'v*'
-```
-
-`workset mirror sync` pushes from the command line,
-`workset mirror sync --dryrun` shows what would be pushed without pushing
-anything, and `workset mirror sync --watch` keeps syncing every few minutes.
+`workset mirror` pushes from the command line, `workset mirror --dryrun`
+shows what would be pushed without pushing anything, and
+`workset mirror --watch` keeps syncing every few minutes.
 
 Background pushes never prompt for credentials (SSH runs in batch mode), so
 use an SSH agent or credential helper for remotes that need authentication.

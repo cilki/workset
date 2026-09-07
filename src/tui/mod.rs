@@ -306,8 +306,8 @@ impl SyncManager {
             std::thread::spawn(move || {
                 // Check the mirror config before reporting Started so disabled
                 // repos never flash a "fetching" status
-                match crate::sync::mirror_patterns(&repo, &interrupt) {
-                    Ok(patterns) if !patterns.enabled() => {
+                match crate::sync::mirroring_enabled(&repo, &interrupt) {
+                    Ok(false) => {
                         let _ = tx.send((repo, SyncEvent::Skipped));
                         return;
                     }
@@ -315,7 +315,7 @@ impl SyncManager {
                         let _ = tx.send((repo, SyncEvent::Failed(e.to_string())));
                         return;
                     }
-                    Ok(_) => {}
+                    Ok(true) => {}
                 }
                 let _ = tx.send((repo.clone(), SyncEvent::Started));
                 let on_push = {
@@ -799,22 +799,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 .map(|repo| repo.path.clone())
                         {
                             let interrupt = AtomicBool::new(false);
-                            if let Ok(patterns) =
-                                crate::sync::mirror_patterns(&repo_path, &interrupt)
-                                && crate::sync::set_mirror_patterns(
-                                    &repo_path,
-                                    &if patterns.enabled() {
-                                        crate::sync::MirrorPatterns::default()
-                                    } else {
-                                        crate::sync::MirrorPatterns {
-                                            branches: vec![crate::sync::default_branch(
-                                                &repo_path, &interrupt,
-                                            )],
-                                            tags: vec!["*".to_string()],
-                                        }
-                                    },
-                                )
-                                .is_ok()
+                            if let Ok(enabled) =
+                                crate::sync::mirroring_enabled(&repo_path, &interrupt)
+                                && crate::sync::set_mirroring(&repo_path, !enabled).is_ok()
                             {
                                 // Re-read the info panel's mirror status
                                 app.details.remove(&repo_path);

@@ -174,21 +174,20 @@ testRepeatedDropRestoreCycles() {
 	done
 }
 
-## Git config, including the workset mirror patterns and remote URLs,
+## Git config, including the workset mirror opt-out and remote URLs,
 ## survives a drop/restore round trip
 testDropRestorePreservesConfig() {
 	newWorkspace
 	createRepo config-repo 1
 	git -C config-repo remote add a https://example.com/a.git
 	git -C config-repo remote add b https://example.com/b.git
-	workset mirror init config-repo
+	git -C config-repo config workset.mirror false
 	git -C config-repo config custom.key custom-value
 
 	workset drop config-repo
 	workset restore config-repo
 
-	[ "$(git -C config-repo config --get-all workset.mirrorBranches)" = "main" ]
-	[ "$(git -C config-repo config --get-all workset.mirrorTags)" = "*" ]
+	[ "$(git -C config-repo config workset.mirror)" = "false" ]
 	[ "$(git -C config-repo config custom.key)" = "custom-value" ]
 	[ "$(git -C config-repo remote get-url a)" = "https://example.com/a.git" ]
 	[ "$(git -C config-repo remote get-url b)" = "https://example.com/b.git" ]

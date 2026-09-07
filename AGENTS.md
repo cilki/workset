@@ -12,15 +12,14 @@ between the two should be quick and easy.
 
 ## Mirroring
 
-Mirroring is opt-in per repo: when enabled, all of the repo's remotes become
-mirrors and receive commits the user has pushed to at least one remote, for
-the branches and tags selected by the repo's mirror patterns. Propagation is
-remote→remote: for each selected ref the newest published id is mirrored to
-the remotes that are behind or missing it, even when the local checkout is
-behind or doesn't have the ref at all (e.g. a push made from another machine).
-Local refs are never modified. Repos with mirroring disabled are skipped
-entirely — no fetch, no network activity; when no tag pattern is set, remote
-tags aren't even listed. Commits that exist only locally are never pushed.
+Mirroring is on by default: all of a repo's remotes are mirrors and receive
+commits the user has pushed to at least one remote, for every branch and tag.
+Propagation is remote→remote: for each ref the newest published id is
+mirrored to the remotes that are behind or missing it, even when the local
+checkout is behind or doesn't have the ref at all (e.g. a push made from
+another machine). Local refs are never modified. Repos with mirroring
+disabled are skipped entirely — no fetch, no network activity. Commits that
+exist only locally are never pushed.
 The TUI never pushes on its own: a check-only sync (fetch remotes, report
 what would be pushed) runs in the background on TUI startup, after the
 interactive shell exits, when a push from another terminal updates
@@ -31,23 +30,18 @@ performs the actual push. Repo rows show "fetching" during the fetch phase
 and "syncing" only while commits are being pushed. Diverged mirror refs are
 reported as errors, never force-pushed.
 
-Mirroring is enabled with `workset mirror init [pattern]` (without a pattern:
-all repos under the current directory), or toggled in the TUI with `m` on
-a workspace repo. The multi-valued local git config keys
-`workset.mirrorBranches` and `workset.mirrorTags` hold git wildmatch glob
-patterns (`*` crosses `/`) selecting what to mirror; a ref is mirrored if it
-matches any value of its key, and mirroring counts as enabled iff at least one
-pattern is set. Enabling defaults to the repo's detected default branch plus
-all tags (`*`); `mirror init --branches <glob>` / `--tags <glob>` (repeatable)
-store explicit patterns instead. The legacy boolean `workset.mirror` key is
-ignored. The keys survive drop/restore because drop moves `.git` wholesale
-and restore copies the original config back over the fresh clone.
+A repo opts out by setting the local git config key `workset.mirror` to
+false; any other value (or no key at all) means enabled. The TUI toggles the
+key with `m` on a workspace repo. The old multi-valued pattern keys
+`workset.mirrorBranches` and `workset.mirrorTags` are ignored. The key
+survives drop/restore because drop moves `.git` wholesale and restore copies
+the original config back over the fresh clone.
 
 The core logic lives in `src/sync.rs`; the TUI scheduling in `SyncManager`
-(`src/tui/mod.rs`). `workset mirror sync` runs the same logic from the CLI
+(`src/tui/mod.rs`). `workset mirror` runs the same logic from the CLI
 (pushing by default, unlike the TUI's background checks);
-`workset mirror sync --dryrun` reports what would be pushed without pushing,
-and `workset mirror sync --watch` re-runs the sync every few minutes.
+`workset mirror --dryrun` reports what would be pushed without pushing,
+and `workset mirror --watch` re-runs the sync every few minutes.
 
 ## Testing
 
