@@ -40,6 +40,10 @@ pub enum RepoOperationStatus {
 pub struct RepoInfo {
     pub path: PathBuf,
     pub display_name: String,
+    /// Where this repo sits in the tree: host/path derived from its origin
+    /// (or first) remote URL. None falls back to `display_name`, i.e. the
+    /// on-disk layout. Never used to identify the repo — only to group it.
+    pub tree_path: Option<String>,
     /// Git status, or None while it hasn't been scanned yet
     pub status: Option<crate::RepoStatus>,
     /// Modification time (for sorting and display)
@@ -69,21 +73,6 @@ pub struct TreeNode {
 }
 
 impl TreeNode {
-    pub fn new_repo(repo: RepoInfo) -> Self {
-        let name = repo
-            .display_name
-            .split('/')
-            .next_back()
-            .unwrap_or(&repo.display_name)
-            .to_string();
-        Self {
-            name,
-            repo_info: Some(repo),
-            children: Vec::new(),
-            expanded: false,
-        }
-    }
-
     pub fn new_directory(name: String) -> Self {
         Self {
             name,
@@ -170,39 +159,17 @@ pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
 
     let mut root_nodes: Vec<TreeNode> = Vec::new();
 
-    // Build tree from regular repos
+    // Build tree from regular repos, grouped by remote URL when known. Two
+    // clones of the same URL collide on the same node; the later one falls
+    // back to its on-disk placement so both stay visible.
     for repo in sorted_repos {
-        let parts: Vec<&str> = repo.display_name.split('/').collect();
-
-        if parts.is_empty() {
-            continue;
-        }
-
-        let mut current_level = &mut root_nodes;
-
-        for (i, part) in parts.iter().enumerate() {
-            let is_last = i == parts.len() - 1;
-
-            // Find or create node at this level
-            let node_idx = current_level.iter().position(|n| n.name == *part);
-
-            if let Some(idx) = node_idx {
-                if is_last {
-                    // Update existing node with repo info
-                    current_level[idx].repo_info = Some(repo.clone());
-                }
-                current_level = &mut current_level[idx].children;
-            } else {
-                // Create new node
-                let new_node = if is_last {
-                    TreeNode::new_repo(repo.clone())
-                } else {
-                    TreeNode::new_directory((*part).to_string())
-                };
-                current_level.push(new_node);
-                let new_idx = current_level.len() - 1;
-                current_level = &mut current_level[new_idx].children;
-            }
+        let grouping = repo
+            .tree_path
+            .clone()
+            .unwrap_or_else(|| repo.display_name.clone());
+        if !insert_repo_at(&mut root_nodes, &grouping, &repo) && repo.tree_path.is_some() {
+            let fallback = repo.display_name.clone();
+            insert_repo_at(&mut root_nodes, &fallback, &repo);
         }
     }
 
@@ -212,6 +179,46 @@ pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
     }
 
     root_nodes
+}
+
+/// Insert a repo at the slash-separated path, creating directory nodes along
+/// the way. Returns false when another repo already occupies the target node.
+fn insert_repo_at(root_nodes: &mut Vec<TreeNode>, path: &str, repo: &RepoInfo) -> bool {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return true;
+    }
+
+    let mut current_level = root_nodes;
+    for (i, part) in parts.iter().enumerate() {
+        let is_last = i == parts.len() - 1;
+        let node_idx = current_level.iter().position(|n| n.name == *part);
+
+        if let Some(idx) = node_idx {
+            if is_last {
+                if current_level[idx].repo_info.is_some() {
+                    return false;
+                }
+                current_level[idx].repo_info = Some(repo.clone());
+            }
+            current_level = &mut current_level[idx].children;
+        } else {
+            let new_node = if is_last {
+                TreeNode {
+                    name: (*part).to_string(),
+                    repo_info: Some(repo.clone()),
+                    children: Vec::new(),
+                    expanded: false,
+                }
+            } else {
+                TreeNode::new_directory((*part).to_string())
+            };
+            current_level.push(new_node);
+            let new_idx = current_level.len() - 1;
+            current_level = &mut current_level[new_idx].children;
+        }
+    }
+    true
 }
 
 /// Helper function to insert a submodule into the tree as a child of its parent repo
@@ -303,5 +310,65 @@ pub fn toggle_node_at_path(mut nodes: &mut [TreeNode], path: &[usize]) {
 
     if let Some(node) = nodes.get_mut(last) {
         node.toggle_expand();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo(display_name: &str, tree_path: Option<&str>) -> RepoInfo {
+        RepoInfo {
+            path: PathBuf::from(format!("/ws/{display_name}")),
+            display_name: display_name.to_string(),
+            tree_path: tree_path.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn node_at<'a>(nodes: &'a [TreeNode], path: &[&str]) -> Option<&'a TreeNode> {
+        let (first, rest) = path.split_first()?;
+        let node = nodes.iter().find(|n| n.name == *first)?;
+        if rest.is_empty() {
+            Some(node)
+        } else {
+            node_at(&node.children, rest)
+        }
+    }
+
+    #[test]
+    fn repos_grouped_by_remote_tree_path() {
+        let tree = build_tree(vec![repo("work/foo", Some("github.com/fossable/foo"))]);
+        let node = node_at(&tree, &["github.com", "fossable", "foo"]).unwrap();
+        assert_eq!(
+            node.repo_info.as_ref().unwrap().path,
+            PathBuf::from("/ws/work/foo")
+        );
+        assert!(node_at(&tree, &["work"]).is_none());
+    }
+
+    #[test]
+    fn repos_without_remote_fall_back_to_disk_layout() {
+        let tree = build_tree(vec![repo("work/foo", None)]);
+        assert!(node_at(&tree, &["work", "foo"]).unwrap().repo_info.is_some());
+    }
+
+    #[test]
+    fn clones_of_the_same_url_both_stay_visible() {
+        let tree = build_tree(vec![
+            repo("a/one", Some("github.com/x/y")),
+            repo("b/two", Some("github.com/x/y")),
+        ]);
+        assert_eq!(count_repos_in_trees(&tree), 2);
+        let primary = node_at(&tree, &["github.com", "x", "y"]).unwrap();
+        assert_eq!(
+            primary.repo_info.as_ref().unwrap().path,
+            PathBuf::from("/ws/a/one")
+        );
+        let fallback = node_at(&tree, &["b", "two"]).unwrap();
+        assert_eq!(
+            fallback.repo_info.as_ref().unwrap().path,
+            PathBuf::from("/ws/b/two")
+        );
     }
 }

@@ -15,27 +15,34 @@ const DETAILS_DEBOUNCE: Duration = Duration::from_millis(250);
 #[derive(Clone, Default)]
 pub struct RepoDetails {
     pub size_bytes: Option<u64>,
-    /// Number of uncommitted changes and untracked files; 0 = clean
-    pub change_count: Option<usize>,
-    /// The repo's mirror configuration; when enabled, carries the remotes
-    /// that act as mirror targets
-    pub mirrors: Option<MirrorConfig>,
+    /// Lines (added, removed) across uncommitted changes and untracked files;
+    /// (0, 0) = clean
+    pub line_changes: Option<(usize, usize)>,
+    /// The repo's remotes and its mirror state
+    pub remotes: Option<RemotesDetail>,
 }
 
-/// Whether mirroring is enabled for a repo, and if so the remotes it covers
-/// and the branch/tag patterns it mirrors
+/// The repo's remotes as shown in the detail rows
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MirrorConfig {
-    Disabled,
-    Enabled {
-        remotes: Vec<String>,
-        patterns: crate::sync::MirrorPatterns,
-    },
+pub struct RemotesDetail {
+    /// Whether mirroring is enabled; per-remote sync states are only
+    /// meaningful when it is
+    pub mirroring: bool,
+    pub remotes: Vec<RemoteInfo>,
+}
+
+/// One remote as shown in the repo detail
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteInfo {
+    pub name: String,
+    /// Commits this remote is missing from the newest published id across the
+    /// mirrored branches, per the local tracking refs; 0 = up to date
+    pub behind: usize,
 }
 
 impl RepoDetails {
     fn is_complete(&self) -> bool {
-        self.size_bytes.is_some() && self.change_count.is_some() && self.mirrors.is_some()
+        self.size_bytes.is_some() && self.line_changes.is_some() && self.remotes.is_some()
     }
 }
 
@@ -106,8 +113,8 @@ fn mirror_state_from_outcome(remote: &str, outcome: &SyncOutcome) -> MirrorState
 /// in the cache.
 enum DetailsEvent {
     Size(PathBuf, u64),
-    Changes(PathBuf, usize),
-    Mirrors(PathBuf, MirrorConfig),
+    Changes(PathBuf, (usize, usize)),
+    Remotes(PathBuf, RemotesDetail),
     /// The job for the given repo finished
     Done(PathBuf),
 }
@@ -156,10 +163,10 @@ impl DetailsLoader {
         }
         // Library repos have no worktree, and a repo the scan saw as Clean or
         // Unpushed has no changes to count
-        if entry.change_count.is_none()
+        if entry.line_changes.is_none()
             && (is_library || matches!(status, Some(RepoStatus::Clean | RepoStatus::Unpushed)))
         {
-            entry.change_count = Some(0);
+            entry.line_changes = Some((0, 0));
         }
 
         if entry.is_complete() {
@@ -193,15 +200,15 @@ impl DetailsLoader {
         // Fastest first so the panel fills in progressively; failures send
         // fallback values so the entry completes instead of respawning forever
         std::thread::spawn(move || {
-            if current.mirrors.is_none() {
-                let _ = tx.send(DetailsEvent::Mirrors(
+            if current.remotes.is_none() {
+                let _ = tx.send(DetailsEvent::Remotes(
                     path.clone(),
-                    load_mirrors(&path, &interrupt),
+                    load_remotes(&path, &interrupt),
                 ));
             }
-            if current.change_count.is_none() {
-                let count = crate::count_worktree_changes(&path).unwrap_or(0);
-                let _ = tx.send(DetailsEvent::Changes(path.clone(), count));
+            if current.line_changes.is_none() {
+                let counts = crate::sync::count_diff_lines(&path, &interrupt).unwrap_or((0, 0));
+                let _ = tx.send(DetailsEvent::Changes(path.clone(), counts));
             }
             if current.size_bytes.is_none() {
                 let size = super::metadata::get_repo_size(&path).unwrap_or(0);
@@ -218,11 +225,11 @@ impl DetailsLoader {
                 DetailsEvent::Size(path, size) => {
                     app.details.entry(path).or_default().size_bytes = Some(size);
                 }
-                DetailsEvent::Changes(path, count) => {
-                    app.details.entry(path).or_default().change_count = Some(count);
+                DetailsEvent::Changes(path, counts) => {
+                    app.details.entry(path).or_default().line_changes = Some(counts);
                 }
-                DetailsEvent::Mirrors(path, mirrors) => {
-                    app.details.entry(path).or_default().mirrors = Some(mirrors);
+                DetailsEvent::Remotes(path, remotes) => {
+                    app.details.entry(path).or_default().remotes = Some(remotes);
                 }
                 DetailsEvent::Done(path) => {
                     if self.in_flight.as_ref() == Some(&path) {
@@ -234,17 +241,26 @@ impl DetailsLoader {
     }
 }
 
-/// Read the repo's mirror patterns; when enabled, the mirror targets are all
-/// of the repo's remotes
-fn load_mirrors(path: &Path, interrupt: &AtomicBool) -> MirrorConfig {
+/// List the repo's remotes; when mirroring is enabled, annotate each with how
+/// far behind it is
+fn load_remotes(path: &Path, interrupt: &AtomicBool) -> RemotesDetail {
+    let names = crate::sync::list_remotes(path, interrupt).unwrap_or_default();
     let patterns = crate::sync::mirror_patterns(path, interrupt).unwrap_or_default();
-    if patterns.enabled() {
-        MirrorConfig::Enabled {
-            remotes: crate::sync::list_remotes(path, interrupt).unwrap_or_default(),
-            patterns,
-        }
+    let mirroring = patterns.enabled();
+    let behind = if mirroring {
+        crate::sync::behind_counts(path, &names, &patterns, interrupt).unwrap_or_default()
     } else {
-        MirrorConfig::Disabled
+        Default::default()
+    };
+    RemotesDetail {
+        mirroring,
+        remotes: names
+            .into_iter()
+            .map(|name| RemoteInfo {
+                behind: behind.get(&name).copied().unwrap_or(0),
+                name,
+            })
+            .collect(),
     }
 }
 

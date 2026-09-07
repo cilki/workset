@@ -5,7 +5,7 @@ mod tree;
 mod watcher;
 
 use app::{App, AppMode, Section};
-use details::{DetailsLoader, MirrorConfig, MirrorState, mirror_rows};
+use details::{DetailsLoader, MirrorState, RemoteInfo, RemotesDetail, mirror_rows};
 use crate::get_repo_modification_time;
 use metadata::{format_size, format_time_ago_verbose, get_repo_size};
 use tree::{RepoInfo, RepoOperationStatus, TreeNode};
@@ -965,14 +965,14 @@ fn render_help_line(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(help, area);
 }
 
-/// Detail rows rendered under the selected repo: size, worktree changes
-/// (workspace only — library repos are always clean), and one status row per
-/// mirror remote. Fields still being computed by the details loader show an
-/// ellipsis.
+/// Detail rows rendered under the selected repo: size, worktree line changes
+/// (workspace only — library repos are always clean), and one row per remote
+/// with its mirror state. Fields still being computed by the details loader
+/// show an ellipsis.
 fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let details = app.details.get(&repo.path).cloned().unwrap_or_default();
-    let indent = "  ".repeat(depth + 2);
+    let indent = "  ".repeat(depth + 3);
 
     let mut lines = Vec::new();
 
@@ -987,67 +987,75 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
     ]));
 
     if section == Section::Workspace {
-        let changes = match details.change_count {
-            Some(0) => Span::styled("clean", Style::default().fg(Color::Green)),
-            Some(count) => Span::styled(
-                format!("{} outstanding", count),
-                Style::default().fg(Color::Yellow),
-            ),
-            None => Span::styled("…", dim),
-        };
-        lines.push(Line::from(vec![
-            Span::raw(indent.clone()),
-            Span::styled("Changes: ", dim),
-            changes,
-        ]));
+        let mut line = vec![Span::raw(indent.clone()), Span::styled("Changes: ", dim)];
+        match details.line_changes {
+            Some((0, 0)) => line.push(Span::styled("clean", Style::default().fg(Color::Green))),
+            Some((added, removed)) => {
+                line.push(Span::styled(
+                    format!("+{}", added),
+                    Style::default().fg(Color::Green),
+                ));
+                line.push(Span::raw(" "));
+                line.push(Span::styled(
+                    format!("-{}", removed),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            None => line.push(Span::styled("…", dim)),
+        }
+        lines.push(Line::from(line));
     }
 
-    match &details.mirrors {
+    match &details.remotes {
         None => lines.push(Line::from(vec![
             Span::raw(indent.clone()),
-            Span::styled("Mirrors: ", dim),
+            Span::styled("Remotes: ", dim),
             Span::styled("…", dim),
         ])),
-        Some(MirrorConfig::Disabled) => {
+        Some(detail) if detail.remotes.is_empty() => {
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled("Remotes: ", dim),
+                Span::styled("none", dim),
+            ]));
+        }
+        Some(RemotesDetail {
+            mirroring: false,
+            remotes,
+        }) => {
             // Mirroring can only be toggled on workspace repos
             let hint = if section == Section::Workspace && !repo.is_submodule {
-                "off (Ctrl+R to enable)"
+                "mirroring off (Ctrl+R to enable)"
             } else {
-                "off"
+                "mirroring off"
             };
             lines.push(Line::from(vec![
                 Span::raw(indent.clone()),
-                Span::styled("Mirrors: ", dim),
+                Span::styled("Remotes: ", dim),
                 Span::styled(hint, dim),
             ]));
+            for remote in remotes {
+                lines.push(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::raw("  "),
+                    Span::raw(remote.name.clone()),
+                ]));
+            }
         }
-        Some(MirrorConfig::Enabled { remotes, .. }) if remotes.is_empty() => {
+        Some(RemotesDetail {
+            mirroring: true,
+            remotes,
+        }) => {
             lines.push(Line::from(vec![
                 Span::raw(indent.clone()),
-                Span::styled("Mirrors: ", dim),
-                Span::styled("no remotes", dim),
-            ]));
-        }
-        Some(MirrorConfig::Enabled { remotes, patterns }) => {
-            lines.push(Line::from(vec![
-                Span::raw(indent.clone()),
-                Span::styled("Mirrors:", dim),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw(indent.clone()),
-                Span::styled(
-                    format!(
-                        "  branches: {}  tags: {}",
-                        crate::sync::display_patterns(&patterns.branches),
-                        crate::sync::display_patterns(&patterns.tags),
-                    ),
-                    dim,
-                ),
+                Span::styled("Remotes:", dim),
             ]));
             let outcome = app.sync_outcomes.get(&repo.path);
             let syncing = app.syncing_repos.contains(&repo.path);
-            for (name, state) in mirror_rows(remotes, outcome, syncing) {
-                let mut line = mirror_status_line(name, state);
+            let names: Vec<String> = remotes.iter().map(|r| r.name.clone()).collect();
+            let states = mirror_rows(&names, outcome, syncing);
+            for (remote, (_, state)) in remotes.iter().zip(states) {
+                let mut line = mirror_status_line(remote, state);
                 line.spans.insert(0, Span::raw(indent.clone()));
                 lines.push(line);
             }
@@ -1056,8 +1064,10 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
     lines
 }
 
-/// One detail row showing a mirror remote and its sync state
-fn mirror_status_line(name: String, state: MirrorState) -> Line<'static> {
+/// One detail row showing a mirror remote, its sync state, and how many
+/// commits it is behind (when it is)
+fn mirror_status_line(remote: &RemoteInfo, state: MirrorState) -> Line<'static> {
+    let show_behind = remote.behind > 0 && state != MirrorState::Syncing;
     let status = match state {
         MirrorState::Syncing => Span::styled("syncing…", Style::default().fg(Color::Cyan)),
         MirrorState::InSync => Span::styled("✓ in sync", Style::default().fg(Color::Green)),
@@ -1076,12 +1086,19 @@ fn mirror_status_line(name: String, state: MirrorState) -> Line<'static> {
             Span::styled("not synced yet", Style::default().fg(Color::DarkGray))
         }
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw("  "),
-        Span::raw(name),
-        Span::raw("  "),
+        Span::raw(remote.name.clone()),
+        Span::raw(" "),
         status,
-    ])
+    ];
+    if show_behind {
+        spans.push(Span::styled(
+            format!("  ↓ {} behind", remote.behind),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Render the workspace or library tree panel
@@ -1522,6 +1539,7 @@ fn scan_workspace_repo(workspace_path: &str, path: PathBuf) -> Vec<RepoInfo> {
     let mut infos = vec![RepoInfo {
         path: path.clone(),
         display_name: display_name.clone(),
+        tree_path: crate::remote_tree_path(&path),
         status: Some(status),
         modification_time,
         // Size not computed for workspace repos to save time
@@ -1558,6 +1576,7 @@ fn scan_library_repo(library_path: &str, repo_path: String) -> RepoInfo {
     RepoInfo {
         modification_time: get_repo_modification_time(&full_path).ok(),
         size_bytes: get_repo_size(&full_path).ok(),
+        tree_path: crate::remote_tree_path(&full_path),
         path: full_path,
         display_name: repo_path,
         status: Some(crate::RepoStatus::Clean), // Library repos are always clean
@@ -1585,18 +1604,23 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
         .map(|path| RepoInfo {
             path: path.clone(),
             display_name: workspace_display_name(&workspace.path, path),
+            tree_path: crate::remote_tree_path(path),
             operation_status: RepoOperationStatus::Scanning,
             ..Default::default()
         })
         .collect();
     let discovered_library = library_paths
         .iter()
-        .map(|repo_path| RepoInfo {
-            path: PathBuf::from(&library_path).join(repo_path),
-            display_name: repo_path.clone(),
-            status: Some(crate::RepoStatus::Clean),
-            operation_status: RepoOperationStatus::Scanning,
-            ..Default::default()
+        .map(|repo_path| {
+            let path = PathBuf::from(&library_path).join(repo_path);
+            RepoInfo {
+                tree_path: crate::remote_tree_path(&path),
+                path,
+                display_name: repo_path.clone(),
+                status: Some(crate::RepoStatus::Clean),
+                operation_status: RepoOperationStatus::Scanning,
+                ..Default::default()
+            }
         })
         .collect();
     if tx
@@ -1745,8 +1769,14 @@ mod tests {
             repo.path.clone(),
             RepoDetails {
                 size_bytes: Some(1024),
-                change_count: Some(3),
-                mirrors: Some(MirrorConfig::Disabled),
+                line_changes: Some((531, 95)),
+                remotes: Some(RemotesDetail {
+                    mirroring: false,
+                    remotes: vec![RemoteInfo {
+                        name: "origin".to_string(),
+                        behind: 0,
+                    }],
+                }),
             },
         );
 
@@ -1760,13 +1790,58 @@ mod tests {
 
         let workspace = render(Section::Workspace);
         assert!(workspace.contains("Size:"));
-        assert!(workspace.contains("Changes: 3 outstanding"));
-        assert!(workspace.contains("Mirrors:"));
+        assert!(workspace.contains("Changes: +531 -95"));
+        assert!(workspace.contains("Remotes: mirroring off (Ctrl+R to enable)"));
+        assert!(workspace.contains("origin"));
 
         let library = render(Section::Library);
         assert!(library.contains("Size:"));
         assert!(!library.contains("Changes:"));
-        assert!(library.contains("Mirrors:"));
+        assert!(library.contains("Remotes: mirroring off"));
+        assert!(!library.contains("Ctrl+R"));
+    }
+
+    #[test]
+    fn detail_lines_show_remote_status_and_behind_counts() {
+        let mut app = App::new("ws".to_string(), Vec::new(), Vec::new());
+        let repo = RepoInfo {
+            path: PathBuf::from("ws/repo"),
+            display_name: "repo".to_string(),
+            ..Default::default()
+        };
+        app.details.insert(
+            repo.path.clone(),
+            RepoDetails {
+                size_bytes: Some(1024),
+                line_changes: Some((0, 0)),
+                remotes: Some(RemotesDetail {
+                    mirroring: true,
+                    remotes: vec![
+                        RemoteInfo {
+                            name: "origin".to_string(),
+                            behind: 0,
+                        },
+                        RemoteInfo {
+                            name: "mirror".to_string(),
+                            behind: 3,
+                        },
+                    ],
+                }),
+            },
+        );
+
+        let text = repo_detail_lines(&app, &repo, Section::Workspace, 0)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Changes: clean"));
+        assert!(text.contains("Remotes:"));
+        assert!(text.contains("origin not synced yet"));
+        assert!(text.contains("mirror not synced yet"));
+        assert!(text.contains("↓ 3 behind"));
+        assert!(!text.contains("↓ 0"));
+        assert!(!text.contains("branches:"));
     }
 
     #[test]

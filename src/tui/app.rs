@@ -123,9 +123,11 @@ impl App {
         } else {
             // Filter repos by fuzzy-matching the search query
             let workspace_repos = self.workspace_repos_with_overlays();
+            // Match against the path shown in the tree
             let matches = |r: &&RepoInfo| {
+                let shown = r.tree_path.as_deref().unwrap_or(&r.display_name);
                 self.matcher
-                    .fuzzy_match(&r.display_name, &self.search_query)
+                    .fuzzy_match(shown, &self.search_query)
                     .is_some()
             };
             self.filtered_workspace =

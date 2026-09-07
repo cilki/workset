@@ -219,6 +219,56 @@ pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
     Ok(repo)
 }
 
+/// Tree-grouping path derived from a git remote URL, e.g.
+/// "git@github.com:fossable/workset.git" -> "github.com/fossable/workset".
+/// None for URLs without a host (local paths, file://).
+pub fn url_tree_path(url: &str) -> Option<String> {
+    let url = url.trim();
+    let (host, path) = if let Some((scheme, rest)) = url.split_once("://") {
+        if !matches!(scheme, "http" | "https" | "ssh" | "git") {
+            return None;
+        }
+        rest.split_once('/')?
+    } else {
+        // scp-like: [user@]host:path — the colon must come before any slash
+        let (host, path) = url.split_once(':')?;
+        if host.contains('/') {
+            return None;
+        }
+        (host, path)
+    };
+
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    let host = host
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(host, |(h, _)| h);
+
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(format!("{}/{}", host, path))
+}
+
+/// Tree-grouping path from the repo's origin remote (or its alphabetically
+/// first remote when origin is absent), read via gix without spawning git.
+/// None when the repo has no remotes or the URL has no host.
+pub fn remote_tree_path(repo_path: &Path) -> Option<String> {
+    let repo = gix::open_opts(repo_path, gix::open::Options::isolated()).ok()?;
+    let config = repo.config_snapshot();
+    let url = config
+        .string("remote.origin.url")
+        .or_else(|| {
+            let name = repo.remote_names().into_iter().next()?;
+            config.string(format!("remote.{}.url", name).as_str())
+        })?
+        .to_string();
+    url_tree_path(&url)
+}
+
 /// Repository status information
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoStatus {
@@ -438,14 +488,6 @@ fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime>
     let timestamp = commit.time()?.seconds;
 
     Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
-}
-
-/// Count uncommitted changes and untracked files in the worktree. Walks the
-/// full status iterator; use the check_repo_status* functions when only a
-/// boolean is needed, since they stop at the first change.
-pub fn count_worktree_changes(repo_path: &Path) -> Result<usize> {
-    let repo = gix::open(repo_path)?;
-    Ok(scan_worktree_changes(&repo, repo_path).0)
 }
 
 /// Scan the worktree once, returning the number of changed or untracked files
@@ -849,6 +891,43 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn url_tree_path_normalizes_remote_urls() {
+        let cases = [
+            (
+                "https://github.com/fossable/workset.git",
+                Some("github.com/fossable/workset"),
+            ),
+            (
+                "https://github.com/fossable/workset",
+                Some("github.com/fossable/workset"),
+            ),
+            (
+                "https://gitlab.com/group/sub/project.git",
+                Some("gitlab.com/group/sub/project"),
+            ),
+            ("http://example.com/a/b/", Some("example.com/a/b")),
+            ("https://user:pass@host/a/b", Some("host/a/b")),
+            (
+                "git@github.com:fossable/workset.git",
+                Some("github.com/fossable/workset"),
+            ),
+            (
+                "ssh://git@host.example:2222/org/repo.git",
+                Some("host.example/org/repo"),
+            ),
+            ("git://host/a/b", Some("host/a/b")),
+            ("file:///srv/git/repo.git", None),
+            ("/home/user/.workset/github.com/foo/bar", None),
+            ("../relative/repo", None),
+            ("~/repos/foo", None),
+            ("", None),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(url_tree_path(url).as_deref(), expected, "url: {url}");
+        }
+    }
+
+    #[test]
     fn set_core_bare_replaces_existing_entry() {
         let config = "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = x\n";
         let updated = set_core_bare(config, true);
@@ -892,6 +971,39 @@ mod tests {
         fs::create_dir_all(&library_path).unwrap();
 
         assert!(workspace.library_contains(repo_path));
+    }
+
+    #[test]
+    fn remote_tree_path_prefers_origin() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        gix::init(repo_path).unwrap();
+
+        // No remotes yet
+        assert_eq!(remote_tree_path(repo_path), None);
+
+        let config_path = repo_path.join(".git").join("config");
+        let config = fs::read_to_string(&config_path).unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "{config}[remote \"backup\"]\n\turl = https://example.com/other/place.git\n\
+                 [remote \"origin\"]\n\turl = git@github.com:fossable/workset.git\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            remote_tree_path(repo_path).as_deref(),
+            Some("github.com/fossable/workset")
+        );
+
+        // Without origin, the first remote is used
+        let config = fs::read_to_string(&config_path).unwrap();
+        fs::write(&config_path, config.replace("\"origin\"", "\"upstream\"")).unwrap();
+        assert_eq!(
+            remote_tree_path(repo_path).as_deref(),
+            Some("example.com/other/place")
+        );
     }
 
     #[test]

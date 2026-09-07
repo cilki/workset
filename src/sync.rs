@@ -142,32 +142,14 @@ pub fn plan_ref_sync(
     ancestry: &mut dyn FnMut(&str, &str) -> Ancestry,
 ) -> Vec<RefDecision> {
     let refname = state.refname();
-    let mut published = state.remotes.iter().filter_map(|(_, id)| id.as_deref());
-    let Some(first_published) = published.next() else {
-        // Never-published ref: never touched
-        return Vec::new();
-    };
-
     let mut decisions = Vec::new();
     match state.kind {
         RefKind::Branch => {
-            // The candidate is the newest published id, preferring the local
-            // id when it is itself published
-            let local_published = state.local.as_deref().filter(|local| {
-                state
-                    .remotes
-                    .iter()
-                    .any(|(_, id)| id.as_deref() == Some(local))
-            });
-            let mut candidate = local_published.unwrap_or(first_published);
-            for (_, id) in &state.remotes {
-                if let Some(id) = id.as_deref()
-                    && id != candidate
-                    && ancestry(candidate, id) == Ancestry::LocalBehind
-                {
-                    candidate = id;
-                }
-            }
+            let Some(candidate) = newest_published(state, ancestry) else {
+                // Never-published ref: never touched
+                return Vec::new();
+            };
+            let candidate = candidate.as_str();
             for (remote, id) in &state.remotes {
                 match id.as_deref() {
                     None => decisions.push(RefDecision::Push {
@@ -193,6 +175,11 @@ pub fn plan_ref_sync(
             }
         }
         RefKind::Tag => {
+            let Some(first_published) = state.remotes.iter().find_map(|(_, id)| id.as_deref())
+            else {
+                // Never-published ref: never touched
+                return Vec::new();
+            };
             // Tags are compared by identity only and never rewritten. A local
             // tag takes precedence; otherwise the first remote's id is the
             // one the others must match.
@@ -220,6 +207,91 @@ pub fn plan_ref_sync(
         }
     }
     decisions
+}
+
+/// The id a branch's mirrors should converge on: the newest id published to
+/// any remote, preferring the local id when it is itself published. None when
+/// the ref was never pushed anywhere.
+fn newest_published(
+    state: &RefState,
+    ancestry: &mut dyn FnMut(&str, &str) -> Ancestry,
+) -> Option<String> {
+    let first_published = state.remotes.iter().find_map(|(_, id)| id.as_deref())?;
+    let local_published = state.local.as_deref().filter(|local| {
+        state
+            .remotes
+            .iter()
+            .any(|(_, id)| id.as_deref() == Some(local))
+    });
+    let mut candidate = local_published.unwrap_or(first_published);
+    for (_, id) in &state.remotes {
+        if let Some(id) = id.as_deref()
+            && id != candidate
+            && ancestry(candidate, id) == Ancestry::LocalBehind
+        {
+            candidate = id;
+        }
+    }
+    Some(candidate.to_string())
+}
+
+/// Sum how many commits each remote is behind the newest published id of the
+/// given branch states. Remotes missing a ref or diverged contribute nothing
+/// — the sync planner reports those separately.
+pub fn plan_behind_counts(
+    states: &[RefState],
+    ancestry: &mut dyn FnMut(&str, &str) -> Ancestry,
+    count_range: &mut dyn FnMut(&str, &str) -> usize,
+) -> BTreeMap<String, usize> {
+    let mut behind: BTreeMap<String, usize> = BTreeMap::new();
+    for state in states {
+        if state.kind != RefKind::Branch {
+            continue;
+        }
+        let Some(candidate) = newest_published(state, ancestry) else {
+            continue;
+        };
+        for (remote, id) in &state.remotes {
+            if let Some(id) = id.as_deref()
+                && id != candidate
+                && ancestry(&candidate, id) == Ancestry::LocalAhead
+            {
+                let count = count_range(id, &candidate);
+                if count > 0 {
+                    *behind.entry(remote.clone()).or_default() += count;
+                }
+            }
+        }
+    }
+    behind
+}
+
+/// Per-remote counts of commits missing from each remote, computed from the
+/// local tracking refs of the mirrored branches (no network — counts are
+/// stale until the next fetch, which is fine for a UI indicator).
+pub fn behind_counts(
+    repo_path: &Path,
+    remotes: &[String],
+    patterns: &MirrorPatterns,
+    interrupt: &AtomicBool,
+) -> Result<BTreeMap<String, usize>> {
+    let states = collect_branch_states(repo_path, remotes, patterns, interrupt)?;
+    let mut ancestry =
+        |local: &str, other: &str| compare_ancestry(repo_path, local, other, interrupt);
+    let mut count_range = |behind_id: &str, candidate: &str| {
+        let range = format!("{}..{}", behind_id, candidate);
+        run_git(
+            repo_path,
+            &["rev-list", "--count", &range],
+            interrupt,
+            LOCAL_TIMEOUT,
+        )
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
+        .unwrap_or(0)
+    };
+    Ok(plan_behind_counts(&states, &mut ancestry, &mut count_range))
 }
 
 /// Fetch all remotes, then mirror published refs to every remote of a
@@ -380,6 +452,22 @@ fn ensure_object_local(
         bail!("fetch {} from {}: {}", refname, remote, stderr_summary(&out));
     }
     Ok(())
+}
+
+/// Gather the local and per-remote state of every branch selected by the
+/// repo's mirror patterns, from local branch heads and tracking refs alone.
+/// Ignoring the tag patterns keeps this off the network entirely.
+fn collect_branch_states(
+    repo_path: &Path,
+    remotes: &[String],
+    patterns: &MirrorPatterns,
+    interrupt: &AtomicBool,
+) -> Result<Vec<RefState>> {
+    let branches_only = MirrorPatterns {
+        branches: patterns.branches.clone(),
+        tags: Vec::new(),
+    };
+    collect_ref_states(repo_path, remotes, &branches_only, interrupt)
 }
 
 /// Gather the local and per-remote state of every branch and tag selected by
@@ -766,6 +854,50 @@ pub fn list_remotes(repo_path: &Path, interrupt: &AtomicBool) -> Result<Vec<Stri
         .collect())
 }
 
+/// Lines (added, removed) across the worktree and index relative to HEAD,
+/// with untracked file contents counted as additions
+pub fn count_diff_lines(repo_path: &Path, interrupt: &AtomicBool) -> Result<(usize, usize)> {
+    let mut added = 0;
+    let mut removed = 0;
+
+    // Binary files show "-" in numstat and count as 0 lines; a failing diff
+    // (no commits yet, so no HEAD) just means there is no diff to count
+    if let Ok(out) = run_git(
+        repo_path,
+        &["diff", "HEAD", "--numstat"],
+        interrupt,
+        LOCAL_TIMEOUT,
+    ) && out.status.success()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut fields = line.split('\t');
+            let count = |field: Option<&str>| field.and_then(|f| f.parse().ok()).unwrap_or(0);
+            added += count(fields.next());
+            removed += count(fields.next());
+        }
+    }
+
+    let out = run_git(
+        repo_path,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        interrupt,
+        LOCAL_TIMEOUT,
+    )?;
+    if !out.status.success() {
+        bail!("git ls-files failed: {}", stderr_summary(&out));
+    }
+    for file in out.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()) {
+        let path = repo_path.join(String::from_utf8_lossy(file).as_ref());
+        if let Ok(contents) = std::fs::read(&path) {
+            added += contents.iter().filter(|b| **b == b'\n').count();
+            if contents.last().is_some_and(|b| *b != b'\n') {
+                added += 1;
+            }
+        }
+    }
+    Ok((added, removed))
+}
+
 fn stderr_summary(out: &Output) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr);
     stderr
@@ -789,7 +921,13 @@ fn run_git(
         .args(args)
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+        // BatchMode alone rejects hosts not yet in known_hosts, since there is
+        // no terminal to confirm on; accept-new trusts a host's key on first
+        // contact but still fails hard if a known key ever changes
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -oBatchMode=yes -oStrictHostKeyChecking=accept-new",
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1011,6 +1149,41 @@ mod tests {
     fn local_only_tag_untouched() {
         let state = tag(Some("t"), &[("a", None), ("mirror", None)]);
         assert!(plan_ref_sync(&state, &mut stub_ancestry(&[])).is_empty());
+    }
+
+    #[test]
+    fn behind_counts_summed_across_branches() {
+        let states = [
+            branch(Some("b"), &[("a", Some("b")), ("mirror", Some("a"))]),
+            branch(Some("d"), &[("a", Some("d")), ("mirror", Some("c"))]),
+        ];
+        let mut ancestry = stub_ancestry(&["ab", "cd"]);
+        let mut count = |behind: &str, candidate: &str| -> usize {
+            match (behind, candidate) {
+                ("a", "b") => 3,
+                ("c", "d") => 2,
+                other => panic!("unexpected range {:?}", other),
+            }
+        };
+        let counts = plan_behind_counts(&states, &mut ancestry, &mut count);
+        assert_eq!(counts, BTreeMap::from([("mirror".to_string(), 5)]));
+    }
+
+    #[test]
+    fn missing_diverged_and_unpublished_refs_not_counted() {
+        let states = [
+            // Remote missing the ref: sync reports it as a push, not "behind"
+            branch(Some("b"), &[("a", Some("b")), ("mirror", None)]),
+            // Diverged remote: reported as a conflict, not "behind"
+            branch(Some("x"), &[("a", Some("x")), ("mirror", Some("y"))]),
+            // Never-published ref: not mirrored at all
+            branch(Some("z"), &[("a", None), ("mirror", None)]),
+            // Tags are identity-only and carry no commit distance
+            tag(Some("t"), &[("a", Some("t")), ("mirror", Some("s"))]),
+        ];
+        let mut ancestry = stub_ancestry(&[]);
+        let mut count = |_: &str, _: &str| -> usize { panic!("no range should be counted") };
+        assert!(plan_behind_counts(&states, &mut ancestry, &mut count).is_empty());
     }
 
     #[test]
