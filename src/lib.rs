@@ -57,12 +57,8 @@ impl RepoPattern {
 /// Represents a git submodule within a repository
 #[derive(Debug, Clone)]
 pub struct SubmoduleInfo {
-    /// The submodule name from .gitmodules
-    pub name: String,
     /// Relative path within parent repo
     pub path: PathBuf,
-    /// Clone URL
-    pub url: String,
     /// Whether submodule is checked out
     pub initialized: bool,
 }
@@ -113,23 +109,15 @@ pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
     let mut submodules = Vec::new();
 
     // Simple parser for .gitmodules INI format
-    let mut current_name: Option<String> = None;
     let mut current_path: Option<PathBuf> = None;
-    let mut current_url: Option<String> = None;
 
-    // Emit a submodule once its section has yielded all three required fields
-    let mut flush =
-        |name: &mut Option<String>, path: &mut Option<PathBuf>, url: &mut Option<String>| {
-            if let (Some(name), Some(path), Some(url)) = (name.take(), path.take(), url.take()) {
-                let initialized = repo_path.join(&path).join(".git").exists();
-                submodules.push(SubmoduleInfo {
-                    name,
-                    path,
-                    url,
-                    initialized,
-                });
-            }
-        };
+    // Emit a submodule once its section has yielded a path
+    let mut flush = |path: &mut Option<PathBuf>| {
+        if let Some(path) = path.take() {
+            let initialized = repo_path.join(&path).join(".git").exists();
+            submodules.push(SubmoduleInfo { path, initialized });
+        }
+    };
 
     for line in content.lines() {
         let line = line.trim();
@@ -142,15 +130,7 @@ pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
         // Parse [submodule "name"] section headers
         if line.starts_with('[') && line.ends_with(']') {
             // Save the previous submodule before starting a new section
-            flush(&mut current_name, &mut current_path, &mut current_url);
-
-            // Extract submodule name from [submodule "name"]
-            if let Some(start) = line.find('"')
-                && let Some(end) = line.rfind('"')
-                && start < end
-            {
-                current_name = Some(line[start + 1..end].to_string());
-            }
+            flush(&mut current_path);
             continue;
         }
 
@@ -159,16 +139,14 @@ pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
             let key = line[..eq_pos].trim();
             let value = line[eq_pos + 1..].trim();
 
-            match key {
-                "path" => current_path = Some(PathBuf::from(value)),
-                "url" => current_url = Some(value.to_string()),
-                _ => {} // Ignore other fields
+            if key == "path" {
+                current_path = Some(PathBuf::from(value));
             }
         }
     }
 
     // Don't forget the last submodule
-    flush(&mut current_name, &mut current_path, &mut current_url);
+    flush(&mut current_path);
 
     Ok(submodules)
 }
@@ -1077,13 +1055,10 @@ mod tests {
         assert_eq!(submodules.len(), 2);
 
         let first = &submodules[0];
-        assert_eq!(first.name, "first");
         assert_eq!(first.path, PathBuf::from("libs/first"));
-        assert_eq!(first.url, "https://example.com/first.git");
         assert!(first.initialized);
 
         let second = &submodules[1];
-        assert_eq!(second.name, "second");
         assert_eq!(second.path, PathBuf::from("libs/second"));
         assert!(!second.initialized);
     }
