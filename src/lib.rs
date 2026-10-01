@@ -262,18 +262,16 @@ pub enum RepoStatus {
 
 /// Check repository status (commits, changes, unpushed) in a single pass
 pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
-    let repo = match gix::open(repo_path) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                path = %repo_path.display(),
-                error = %e,
-                "Failed to open repository"
-            );
-            return Ok(RepoStatus::NoCommits);
-        }
+    let Some(repo) = open_repo(repo_path) else {
+        return Ok(RepoStatus::NoCommits);
     };
-    check_repo_status_with_handle(&repo, repo_path)
+    let Some(head_ref) = head_referent(&repo) else {
+        return Ok(RepoStatus::NoCommits);
+    };
+    if worktree_is_dirty(&repo, repo_path) {
+        return Ok(RepoStatus::Dirty);
+    }
+    Ok(check_unpushed_status(&repo, head_ref))
 }
 
 /// Check repository status and get modification time in a single repo open
@@ -281,85 +279,47 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
 pub fn check_repo_status_and_modification_time(
     repo_path: &Path,
 ) -> Result<(RepoStatus, Option<std::time::SystemTime>)> {
-    let repo = match gix::open(repo_path) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                path = %repo_path.display(),
-                error = %e,
-                "Failed to open repository"
-            );
-            return Ok((RepoStatus::NoCommits, None));
-        }
+    let Some(repo) = open_repo(repo_path) else {
+        return Ok((RepoStatus::NoCommits, None));
     };
 
-    let (change_count, dirty_files_time) = scan_worktree_changes(&repo, repo_path);
+    let dirty_time = dirty_files_time(&repo, repo_path);
 
     let Some(head_ref) = head_referent(&repo) else {
-        // With no commits, the only timestamp available is from dirty files.
-        // If the worktree is also clean, `dirty_files_time` is still at
-        // UNIX_EPOCH, which is not a real modification time — report None so
-        // callers don't render it as a spurious "56y ago".
-        let mod_time = (change_count > 0).then_some(dirty_files_time);
-        return Ok((RepoStatus::NoCommits, mod_time));
+        // With no commits, the only timestamp available is from dirty files;
+        // a clean worktree has none, so callers don't render a spurious
+        // "56y ago" from the UNIX epoch.
+        return Ok((RepoStatus::NoCommits, dirty_time));
     };
 
-    if change_count > 0 {
+    if let Some(dirty_time) = dirty_time {
         // For dirty repos, use the max of last commit time and dirty file times
         let commit_time = get_last_commit_time(&repo).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        return Ok((RepoStatus::Dirty, Some(commit_time.max(dirty_files_time))));
+        return Ok((RepoStatus::Dirty, Some(commit_time.max(dirty_time))));
     }
 
     let status = check_unpushed_status(&repo, head_ref);
     Ok((status, get_last_commit_time(&repo).ok()))
 }
 
+/// Open a repository, logging and returning None when it can't be opened
+fn open_repo(repo_path: &Path) -> Option<gix::Repository> {
+    match gix::open(repo_path) {
+        Ok(repo) => Some(repo),
+        Err(e) => {
+            warn!(
+                path = %repo_path.display(),
+                error = %e,
+                "Failed to open repository"
+            );
+            None
+        }
+    }
+}
+
 /// Get the HEAD reference, or None if the repository has no commits
 fn head_referent(repo: &gix::Repository) -> Option<gix::Reference<'_>> {
     repo.head().ok()?.try_into_referent()
-}
-
-/// Check repository status using an already-opened repository handle.
-/// Stops scanning the worktree at the first change found.
-fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Result<RepoStatus> {
-    let Some(head_ref) = head_referent(repo) else {
-        return Ok(RepoStatus::NoCommits);
-    };
-
-    // Check for uncommitted changes using a single status call
-    let platform = match repo.status(gix::progress::Discard) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                path = %repo_path.display(),
-                error = %e,
-                "Failed to create status platform"
-            );
-            return Ok(RepoStatus::Clean);
-        }
-    };
-
-    // Check both tracked changes and untracked files in one pass
-    let has_changes = match platform
-        .untracked_files(gix::status::UntrackedFiles::Files)
-        .into_index_worktree_iter(Vec::new())
-    {
-        Ok(mut iter) => iter.by_ref().flatten().next().is_some(),
-        Err(e) => {
-            warn!(
-                path = %repo_path.display(),
-                error = %e,
-                "Failed to check for changes"
-            );
-            false
-        }
-    };
-
-    if has_changes {
-        return Ok(RepoStatus::Dirty);
-    }
-
-    Ok(check_unpushed_status(repo, head_ref))
 }
 
 /// Classify a repository with no uncommitted changes as Clean or Unpushed
@@ -468,15 +428,15 @@ fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime>
     Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
 }
 
-/// Scan the worktree once, returning the number of changed or untracked files
-/// and the most recent modification time among them
-fn scan_worktree_changes(
+/// Walk the repository's changed and untracked files in a single status pass,
+/// calling `visit` with the worktree path of each. Stops as soon as `visit`
+/// returns false, so callers that only need to know whether the worktree is
+/// dirty don't pay for the rest of the walk.
+fn walk_worktree_changes(
     repo: &gix::Repository,
     repo_path: &Path,
-) -> (usize, std::time::SystemTime) {
-    let mut change_count = 0;
-    let mut latest_time = std::time::SystemTime::UNIX_EPOCH;
-
+    mut visit: impl FnMut(PathBuf) -> bool,
+) {
     let platform = match repo.status(gix::progress::Discard) {
         Ok(p) => p,
         Err(e) => {
@@ -485,37 +445,56 @@ fn scan_worktree_changes(
                 error = %e,
                 "Failed to create status platform"
             );
-            return (change_count, latest_time);
+            return;
         }
     };
 
-    // Iterate both tracked changes and untracked files in one pass
-    match platform
+    // Tracked changes and untracked files come from the same iterator
+    let iter = match platform
         .untracked_files(gix::status::UntrackedFiles::Files)
         .into_index_worktree_iter(Vec::new())
     {
-        Ok(iter) => {
-            for item in iter.flatten() {
-                change_count += 1;
-                let file_path = repo_path.join(gix::path::from_bstr(item.rela_path()));
-                if let Ok(metadata) = std::fs::metadata(&file_path)
-                    && let Ok(modified) = metadata.modified()
-                    && modified > latest_time
-                {
-                    latest_time = modified;
-                }
-            }
-        }
+        Ok(iter) => iter,
         Err(e) => {
             warn!(
                 path = %repo_path.display(),
                 error = %e,
                 "Failed to check for changes"
             );
+            return;
+        }
+    };
+
+    for item in iter.flatten() {
+        if !visit(repo_path.join(gix::path::from_bstr(item.rela_path()))) {
+            return;
         }
     }
+}
 
-    (change_count, latest_time)
+/// Whether the worktree holds any uncommitted change or untracked file
+fn worktree_is_dirty(repo: &gix::Repository, repo_path: &Path) -> bool {
+    let mut dirty = false;
+    walk_worktree_changes(repo, repo_path, |_| {
+        dirty = true;
+        false
+    });
+    dirty
+}
+
+/// The most recent modification time among the changed and untracked files,
+/// or None when the worktree is clean. Files that can't be stat'd count as the
+/// UNIX epoch, so a dirty worktree always yields some time.
+fn dirty_files_time(repo: &gix::Repository, repo_path: &Path) -> Option<std::time::SystemTime> {
+    let mut latest = None;
+    walk_worktree_changes(repo, repo_path, |file_path| {
+        let modified = std::fs::metadata(&file_path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        latest = latest.max(Some(modified));
+        true
+    });
+    latest
 }
 
 /// A `Workspace` is filesystem directory containing git repositories checked out
