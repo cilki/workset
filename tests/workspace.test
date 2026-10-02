@@ -29,11 +29,38 @@ testInit() {
 	mkdir ws
 	cd ws
 
-	workset init
+	workset init | grep "^Initialized workspace in "
 	[ -d .workset ]
 
-	workset init
+	workset init | grep "^Workspace already initialized in "
 	[ -d .workset ]
+}
+
+## Commands that need a workspace say so and fail outside one
+testCommandsOutsideWorkspaceFail() {
+	for command in list status drop mirror; do
+		output=$(workset $command 2>&1) && exit 1
+		echo "$output" | grep "Not in a workspace"
+	done
+}
+
+## An unrecognized subcommand fails instead of silently doing nothing
+testUnknownCommandFails() {
+	newWorkspace
+
+	output=$(workset frobnicate 2>&1) && exit 1
+	echo "$output" | grep "Unknown command: frobnicate"
+}
+
+## Commands that need a pattern fail when it's missing
+testMissingPatternFails() {
+	newWorkspace
+
+	output=$(workset clone 2>&1) && exit 1
+	echo "$output" | grep "Missing repository pattern"
+
+	output=$(workset restore 2>&1) && exit 1
+	echo "$output" | grep "Missing repository pattern"
 }
 
 ## A clean repo moves to the library and comes back with its files
@@ -41,28 +68,116 @@ testDropAndRestore() {
 	newWorkspace
 	createRepo test-repo 3
 
-	workset drop test-repo
+	workset drop test-repo | grep -- "test-repo - ✓ dropped"
 	[ ! -e test-repo ]
 	[ -d .workset/test-repo ]
 
-	workset restore test-repo
+	workset restore test-repo | grep "^Restored test-repo$"
 	[ -d test-repo/.git ]
 	[ -f test-repo/file0.txt ]
 	[ -f test-repo/file1.txt ]
 	[ -f test-repo/file2.txt ]
 }
 
-## A repo with uncommitted changes is left where it is. Note workset only
-## warns about this, so the assertion is on the filesystem, not the exit code.
+## A repo with uncommitted changes is left where it is, and the drop reports
+## why it refused and fails
 testDropRefusesDirtyRepo() {
 	newWorkspace
 	createRepo dirty-repo 2
 	echo "uncommitted changes" >dirty-repo/dirty.txt
 
-	workset drop dirty-repo
+	output=$(workset drop dirty-repo 2>&1) && exit 1
+	echo "$output" | grep -- "dirty-repo - ⚠ kept (uncommitted changes"
 
 	[ -d dirty-repo/.git ]
 	[ ! -e .workset/dirty-repo ]
+}
+
+## A repo holding commits that aren't on any remote is left where it is
+testDropRefusesUnpushedRepo() {
+	newWorkspace
+	# The bare remote lives outside the workspace so workset doesn't treat it
+	# as a repo of its own
+	git init -q --bare "$PWD/../remote.git"
+	createRepo unpushed-repo 1
+	git -C unpushed-repo remote add origin "$PWD/../remote.git"
+	git -C unpushed-repo push -q -u origin main
+	echo "local" >unpushed-repo/local.txt
+	git -C unpushed-repo add local.txt
+	git -C unpushed-repo commit -q -m "local only"
+
+	output=$(workset drop unpushed-repo 2>&1) && exit 1
+	echo "$output" | grep -- "unpushed-repo - ⚠ kept (unpushed commits"
+
+	[ -d unpushed-repo/.git ]
+	[ ! -e .workset/unpushed-repo ]
+}
+
+## A pattern that matches nothing is reported as a failure
+testDropUnmatchedPatternFails() {
+	newWorkspace
+	createRepo other-repo 1
+
+	output=$(workset drop no-such-repo 2>&1) && exit 1
+	echo "$output" | grep "No repository in the workspace matches 'no-such-repo'"
+
+	[ -d other-repo/.git ]
+}
+
+## Dropping everything in a directory with no repos is reported as a failure
+testDropAllWithoutReposFails() {
+	newWorkspace
+	mkdir empty
+	cd empty
+
+	output=$(workset drop 2>&1) && exit 1
+	echo "$output" | grep "No repositories found in the current directory"
+}
+
+## A drop that leaves some repos behind reports both halves and still fails
+testDropAllReportsPartialSuccess() {
+	newWorkspace
+	createRepo clean-repo 1
+	createRepo dirty-repo 1
+	echo "uncommitted changes" >dirty-repo/dirty.txt
+
+	output=$(workset drop 2>&1) && exit 1
+	echo "$output" | grep -- "clean-repo - ✓ dropped"
+	echo "$output" | grep -- "dirty-repo - ⚠ kept (uncommitted changes"
+
+	[ ! -e clean-repo ]
+	[ -d dirty-repo/.git ]
+}
+
+## Restoring something that isn't in the library is reported as a failure
+testRestoreUnmatchedPatternFails() {
+	newWorkspace
+	createRepo stored-repo 1
+	workset drop stored-repo
+
+	output=$(workset restore no-such-repo 2>&1) && exit 1
+	echo "$output" | grep "No repository in the library matches 'no-such-repo'"
+}
+
+## Restoring from an empty library is reported as a failure
+testRestoreFromEmptyLibraryFails() {
+	newWorkspace
+
+	output=$(workset restore anything 2>&1) && exit 1
+	echo "$output" | grep "The library is empty"
+}
+
+## Restoring a repo that is already checked out is reported as a failure
+testRestoreAlreadyInWorkspaceFails() {
+	newWorkspace
+	createRepo present-repo 1
+	workset drop present-repo
+	workset restore present-repo
+
+	output=$(workset restore present-repo 2>&1) && exit 1
+	echo "$output" | grep "present-repo is already in the workspace"
+
+	[ -d present-repo/.git ]
 }
 
 ## --force drops a repo despite its uncommitted changes
@@ -172,36 +287,12 @@ testDropBareNameFromSubdirectory() {
 	[ -d ../../.workset/github.com/user/project ]
 }
 
-## Dropping reports which repos it moved to the library
-testDropReportsWhatItDropped() {
-	newWorkspace
-	createRepo reported-repo
-
-	workset drop reported-repo | grep "reported-repo - ✓ dropped"
-}
-
 ## --delete says so instead of claiming the repo was dropped to the library
 testDropWithDeleteReportsDeletion() {
 	newWorkspace
 	createRepo delete-me
 
-	workset drop --delete delete-me | grep "delete-me - ✓ deleted"
-}
-
-## Refusing to drop a dirty repo is reported rather than silently ignored
-testDropReportsRefusedDirtyRepo() {
-	newWorkspace
-	createRepo dirty-repo 2
-	echo "uncommitted changes" >dirty-repo/dirty.txt
-
-	workset drop dirty-repo | grep -- "dirty-repo - ⚠ kept (uncommitted changes"
-}
-
-## A pattern that matches nothing says so instead of exiting silently
-testDropReportsNoMatch() {
-	newWorkspace
-
-	workset drop does-not-exist | grep "No repositories matched"
+	workset drop --delete delete-me | grep -- "delete-me - ✓ deleted"
 }
 
 ## Restore matches library paths by substring, so a bare repo name is enough

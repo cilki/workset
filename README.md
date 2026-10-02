@@ -54,6 +54,18 @@ run them from.
 ❯ workset restore jq
 ```
 
+Every command reports what it did and exits non-zero when it couldn't do all of
+it, so `workset` composes with other commands:
+
+```sh
+# Repos with uncommitted or unpushed changes are named, and the drop fails
+❯ workset drop
+  github.com/jqlang/jq - ✓ dropped
+  github.com/fossable/workset - ⚠ kept (uncommitted changes, use --force to drop anyway)
+❯ echo $?
+1
+```
+
 Two read-only commands report on the whole workspace, no matter which
 directory you run them from:
 

@@ -12,7 +12,7 @@ use tree::{RepoInfo, RepoOperationStatus, TreeNode};
 use watcher::FileWatcher;
 
 use crate::{RepoPattern, Workspace, find_git_repositories};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
@@ -598,7 +598,21 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         |repo_path| {
                             // Tree paths are already workspace-relative
                             let Ok(pattern) = repo_path.parse::<RepoPattern>();
-                            workspace.drop(&pattern, false, false).map(|_| ())
+                            // A repo left in place (uncommitted or unpushed
+                            // changes) is a failure as far as the UI is
+                            // concerned, so the row says why instead of
+                            // silently reporting success
+                            let report = workspace.drop(&pattern, false, false)?;
+                            match report.skipped.first() {
+                                Some((_, crate::RepoStatus::Dirty)) => {
+                                    bail!("uncommitted changes")
+                                }
+                                Some((_, crate::RepoStatus::Unpushed)) => {
+                                    bail!("unpushed commits")
+                                }
+                                Some(_) => bail!("outstanding changes"),
+                                None => Ok(()),
+                            }
                         },
                     )?;
                     background.reload(&app, workspace);
