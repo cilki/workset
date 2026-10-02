@@ -596,8 +596,9 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         &repo_paths,
                         RepoOperationStatus::Dropping,
                         |repo_path| {
+                            // Tree paths are already workspace-relative
                             let Ok(pattern) = repo_path.parse::<RepoPattern>();
-                            workspace.drop(&pattern, false, false)
+                            workspace.drop(&pattern, false, false).map(|_| ())
                         },
                     )?;
                     background.reload(&app, workspace);

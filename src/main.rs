@@ -389,13 +389,19 @@ fn main() -> Result<()> {
                 let delete = args.contains("--delete");
                 let force = args.contains("--force");
 
-                if let Some(path) = args.opt_free_from_str::<String>()? {
-                    let Ok(pattern) = path.parse::<workset::RepoPattern>();
-                    workspace.drop(&pattern, delete, force)?;
+                let report = if let Some(path) = args.opt_free_from_str::<String>()? {
+                    // Patterns are relative to the current directory first, so
+                    // 'workset drop ./repo' works from the repo's parent
+                    let cwd = std::env::current_dir()?;
+                    let Ok(pattern) = workspace
+                        .resolve_pattern(&cwd, &path)
+                        .parse::<workset::RepoPattern>();
+                    workspace.drop(&pattern, delete, force)?
                 } else {
                     // Drop all repos in current directory
-                    workspace.drop_all(delete, force)?;
-                }
+                    workspace.drop_all(delete, force)?
+                };
+                report_drop(&report, delete);
             }
             "list" | "ls" => {
                 let workspace = require_workspace!(maybe_workspace);
@@ -470,6 +476,33 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Report what a drop did, in the same style as `list` and `mirror`. Without
+/// this the command is completely silent: the refusals and no-match cases are
+/// logged at levels the default filter hides.
+fn report_drop(report: &workset::DropReport, delete: bool) {
+    let verb = if delete { "deleted" } else { "dropped" };
+
+    for repo in &report.dropped {
+        println!("  {} - ✓ {}", repo, verb);
+    }
+
+    for (repo, status) in &report.skipped {
+        let reason = match status {
+            workset::RepoStatus::Dirty => "uncommitted changes",
+            workset::RepoStatus::Unpushed => "unpushed commits",
+            _ => "not clean",
+        };
+        println!(
+            "  {} - ⚠ kept ({}, use --force to drop anyway)",
+            repo, reason
+        );
+    }
+
+    if report.is_empty() {
+        println!("No repositories matched");
+    }
 }
 
 /// Mirror pushed commits to the remotes of mirror-enabled repos, printing
