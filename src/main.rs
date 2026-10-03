@@ -280,10 +280,16 @@ fn main() -> Result<()> {
   Manage git repos with working sets.
 
 {usage_header}
+  {cmd}workset{reset} [--help] [--version]
   {cmd}workset{reset} init
   {cmd}workset{reset} clone <repo pattern>
   {cmd}workset{reset} restore <repo pattern>
   {cmd}workset{reset} drop [repo pattern] [--delete] [--force]
+  {cmd}workset{reset} list
+  {cmd}workset{reset} status
+  {cmd}workset{reset} mirror [repo pattern] [--dryrun] [--watch]
+{dim}
+  Without a subcommand, the interactive TUI opens; '?' shows its keybindings.{reset}
 
 {commands_header}
   {subcmd}init{reset}                                 Initialize a workspace in current directory

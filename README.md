@@ -14,7 +14,7 @@
 |                 |                                                                                                                                                                                     |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Workspace**   | Local directory where you clone Git repositories. Initialized with `workset init`.                                                                                                  |
-| **Library**     | Local directory (default: `~/.workset`) where **workset** keeps your repos when they're not in your workspace.                                                                      |
+| **Library**     | The workspace's own `.workset/` directory, created by `workset init`, where **workset** keeps your repos when they're not in your workspace.                                        |
 | **Working Set** | Set of repos in your workspace at any given time.                                                                                                                                   |
 | **Drop**        | Move a repo from your workspace to the library. The repo disappears from your workspace, but remains in the library. Only "clean" repos without uncommitted changes can be dropped. |
 | **Restore**     | Bringing a repos from the library back into your workspace.                                                                                                                         |
@@ -23,7 +23,10 @@
 
 ## Quickstart
 
-All `workset` commands run in reference to the current directory.
+`workset init` and a bare `workset drop` act on the current directory. `clone`
+and `restore` place a repo at its full path under the workspace root, and
+`list`, `status` and `mirror` always cover the whole workspace, wherever you
+run them from.
 
 ```sh
 # Initialize a new workspace in the current directory
@@ -35,12 +38,13 @@ All `workset` commands run in reference to the current directory.
 # The repository's local path always reflects the remote path
 ❯ cd ./github.com/jqlang/jq
 
-# Drop the repo from the working set (it remains in the library: ~/.workset)
+# Drop the repo from the working set (it remains in the library, which is the
+# .workset directory in the workspace root)
 ❯ cd ..
 ❯ workset drop ./jq
 
 # Or, you can drop all repositories in the current directory (any that have
-# unpushed changes will not be touched).
+# uncommitted or unpushed changes will not be touched).
 ❯ workset drop
 
 # If you don't want a repo to remain in the library, use --delete
@@ -50,9 +54,37 @@ All `workset` commands run in reference to the current directory.
 ❯ workset restore jq
 ```
 
-The shell autocomplete is smart enough to look at your CWD and suggest repos
-that you might want to restore into your working set. Repos that were dropped
-most recently are prioritized.
+Two read-only commands report on the whole workspace, no matter which
+directory you run them from:
+
+```sh
+# Every repo in the workspace, with its status
+❯ workset list
+Repositories in workspace (/home/user/workspace):
+
+  github.com/jqlang/jq - ✓ clean
+  github.com/fossable/workset - ⚠ modified
+
+# Workspace and library totals
+❯ workset status
+Workspace: /home/user/workspace
+
+Library: /home/user/workspace/.workset
+  12 repository(ies) in library
+
+Active repositories: 2
+  ✓ 1 clean
+  ⚠ 1 with uncommitted changes
+```
+
+Running `workset` with no subcommand opens the TUI, where `?` shows the
+keybindings.
+
+Shell completion fills in the repo paths for you: `restore` suggests everything
+in the library, while `drop` and `mirror` suggest the repos currently in your
+working set. Candidates are always workspace-relative paths, so they work from
+any directory inside the workspace. Under fish, each workspace repo is
+annotated with its status and how long ago it changed.
 
 ## Keep your working set small
 
@@ -98,7 +130,9 @@ Opted-out repos are left alone entirely.
 
 `workset mirror` pushes from the command line, `workset mirror --dryrun`
 shows what would be pushed without pushing anything, and
-`workset mirror --watch` keeps syncing every few minutes.
+`workset mirror --watch` re-runs the sync every five minutes. An optional
+pattern limits the run to the repos whose workspace-relative path contains it,
+so `workset mirror github.com/jqlang` covers just that one user's repos.
 
 Background pushes never prompt for credentials (SSH runs in batch mode), so
 use an SSH agent or credential helper for remotes that need authentication.
@@ -140,5 +174,5 @@ source /path/to/workset/completions/workset.bash
 cp /path/to/workset/completions/workset.fish ~/.config/fish/completions/
 ```
 
-Completions are generated dynamically by the `workset` binary itself: `drop`
-suggests repos in your workspace, and `restore` suggests repos in your library.
+Completions are generated dynamically by the `workset` binary itself, which the
+scripts above invoke on every TAB press.
