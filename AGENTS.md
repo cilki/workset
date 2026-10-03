@@ -34,8 +34,10 @@ A repo opts out by setting the local git config key `workset.mirror` to
 false; any other value (or no key at all) means enabled. The TUI toggles the
 key with `m` on a workspace repo. The old multi-valued pattern keys
 `workset.mirrorBranches` and `workset.mirrorTags` are ignored. The key
-survives drop/restore because drop moves `.git` wholesale and restore copies
-the original config back over the fresh clone.
+survives drop/restore because both directions move `.git` wholesale: drop
+moves it into the library, restore moves it back out (cloning out of the
+library only to materialize the worktree, then discarding the clone's own
+git directory).
 
 The core logic lives in `src/sync.rs`; the TUI scheduling in `SyncManager`
 (`src/tui/mod.rs`). `workset mirror` runs the same logic from the CLI

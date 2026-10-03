@@ -231,6 +231,40 @@ testRepeatedDropRestoreCycles() {
 	done
 }
 
+## Every local branch comes back, not just the one HEAD pointed at, and the
+## commits only reachable from them are still there
+testDropRestorePreservesLocalBranches() {
+	newWorkspace
+	createRepo branchy 1
+
+	git -C branchy checkout -q -b side
+	echo side >branchy/side.txt
+	git -C branchy add side.txt
+	git -C branchy commit -q -m "only on side"
+	side=$(git -C branchy rev-parse side)
+	git -C branchy checkout -q main
+
+	workset drop branchy
+	workset restore branchy
+
+	[ "$(git -C branchy rev-parse side)" = "$side" ]
+	[ "$(git -C branchy branch --show-current)" = "main" ]
+}
+
+## Restoring moves the repo out of the library rather than leaving a stale
+## duplicate behind for the next drop to overwrite
+testRestoreEmptiesLibraryEntry() {
+	newWorkspace
+	createRepo moved 1
+
+	workset drop moved
+	[ -d .workset/moved ]
+
+	workset restore moved
+	[ ! -e .workset/moved ]
+	workset status | grep "0 repository(ies) in library"
+}
+
 ## Git config, including the workset mirror opt-out and remote URLs,
 ## survives a drop/restore round trip
 testDropRestorePreservesConfig() {

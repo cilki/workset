@@ -788,12 +788,16 @@ impl Workspace {
         Ok(())
     }
 
-    /// Restore a repository from the library to the workspace.
+    /// Restore a repository from the library to the workspace, the exact
+    /// inverse of `store_in_library`: the git directory moves back out of the
+    /// library whole, so every local branch, tag, reflog and config key the
+    /// repo had when it was dropped comes back with it.
+    ///
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
     pub fn restore_from_library(&self, relative_path: &str) -> Result<()> {
         let library_path = self.library_path();
-        let source = format!("{}/{}", library_path, relative_path);
-        let dest = format!("{}/{}", self.path, relative_path);
+        let source = PathBuf::from(&library_path).join(relative_path);
+        let dest = PathBuf::from(&self.path).join(relative_path);
 
         // Verify the library entry exists
         if std::fs::metadata(&source).is_err() {
@@ -803,19 +807,42 @@ impl Workspace {
             );
         }
 
-        // The library config is the original workspace config, moved wholesale
-        // by store_in_library. Read it before cloning so it can be restored
-        // verbatim afterwards.
-        let source_config = std::fs::read_to_string(Path::new(&source).join("config"))?;
+        // Cloning out of the library is what materializes the worktree; its
+        // git directory is thrown away again right below. A clone only
+        // creates a local branch for HEAD, so keeping it would silently drop
+        // every other branch (and any commit only reachable from one).
+        gix_clone(&source.to_string_lossy(), &dest)?;
 
-        // Clone from the library using gix
-        gix_clone(&source, Path::new(&dest))?;
+        let git_dir = dest.join(".git");
+        let discarded = dest.join(".git.workset-restore");
+        std::fs::rename(&git_dir, &discarded)?;
+        if let Err(e) = std::fs::rename(&source, &git_dir) {
+            // Put the clone back so the worktree isn't left without a repo
+            let _ = std::fs::rename(&discarded, &git_dir);
+            return Err(anyhow::anyhow!(
+                "Failed to move repository out of the library: {}",
+                e
+            ));
+        }
 
-        // Replace the fresh clone's config (which points its origin at the
-        // library) with the original config, preserving remotes, workset.*
-        // keys, and any other settings the repo had when it was dropped
-        let dest_config_path = std::path::Path::new(&dest).join(".git/config");
-        std::fs::write(&dest_config_path, set_core_bare(&source_config, false))?;
+        // The index the repo had when it was dropped describes the worktree as
+        // it was then, which the fresh checkout only matches if the drop was
+        // clean. The clone's index always matches what it just wrote, so adopt
+        // that one and let everything else come from the library. A library
+        // entry without commits checks out nothing and so has no index to
+        // adopt, in which case the empty worktree matches no index at all.
+        let checked_out_index = discarded.join("index");
+        if checked_out_index.exists() {
+            std::fs::rename(&checked_out_index, git_dir.join("index"))?;
+        } else {
+            let _ = std::fs::remove_file(git_dir.join("index"));
+        }
+        std::fs::remove_dir_all(&discarded)?;
+
+        // The library keeps its copy bare; a workspace checkout is not
+        let config_path = git_dir.join("config");
+        let config = std::fs::read_to_string(&config_path)?;
+        std::fs::write(&config_path, set_core_bare(&config, false))?;
 
         Ok(())
     }
