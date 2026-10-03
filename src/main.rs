@@ -166,6 +166,16 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
     }
 }
 
+/// Workspace-relative paths of the checked-out repos whose path contains
+/// `pattern`, matching how the library is searched.
+fn workspace_matches(workspace: &Workspace, pattern: &str) -> Result<Vec<String>> {
+    Ok(workset::find_git_repositories(Path::new(&workspace.path))?
+        .iter()
+        .map(|repo| workspace.relative_name(repo))
+        .filter(|name| name.contains(pattern))
+        .collect())
+}
+
 /// Restore repositories from library matching the pattern. Returns false when
 /// nothing was restored, so the caller can exit non-zero.
 fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
@@ -173,11 +183,6 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
 
     // Get all repos from library
     let library_repos = workspace.list_library()?;
-
-    if library_repos.is_empty() {
-        eprintln!("The library is empty");
-        return Ok(false);
-    }
 
     // Filter repos that match the pattern
     let pattern_str = pattern.full_path();
@@ -188,7 +193,20 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         .collect();
 
     if matching_repos.is_empty() {
-        eprintln!("No repository in the library matches '{}'", pattern_str);
+        // Restoring moves a repo out of the library, so one that's already
+        // checked out is missing from the library rather than present in it.
+        // Saying it's in the workspace beats claiming the library has nothing
+        // matching, which reads like the repo was lost.
+        let in_workspace = workspace_matches(workspace, &pattern_str)?;
+        if !in_workspace.is_empty() {
+            for repo in in_workspace {
+                eprintln!("{} is already in the workspace", repo);
+            }
+        } else if library_repos.is_empty() {
+            eprintln!("The library is empty");
+        } else {
+            eprintln!("No repository in the library matches '{}'", pattern_str);
+        }
         return Ok(false);
     }
 
