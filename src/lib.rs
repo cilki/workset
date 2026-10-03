@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 pub mod sync;
 #[cfg(feature = "tui")]
@@ -258,6 +258,24 @@ pub enum RepoStatus {
     NoCommits,
     /// Repository has unpushed commits (but is otherwise clean)
     Unpushed,
+}
+
+/// The outcome of a drop, so the caller can report it to the user
+#[derive(Debug, Default)]
+pub struct DropReport {
+    /// Workspace-relative paths of the repos that were dropped
+    pub dropped: Vec<String>,
+
+    /// Repos left where they are, each with the status that blocked the drop
+    pub skipped: Vec<(String, RepoStatus)>,
+}
+
+impl DropReport {
+    /// Whether nothing was dropped and nothing was skipped, which means the
+    /// pattern matched no repository at all
+    pub fn is_empty(&self) -> bool {
+        self.dropped.is_empty() && self.skipped.is_empty()
+    }
 }
 
 /// Check repository status (commits, changes, unpushed) in a single pass
@@ -582,8 +600,35 @@ impl Workspace {
     }
 
     /// Search the workspace for local repos matching the given pattern.
+    ///
+    /// Patterns are always interpreted relative to the workspace root; see
+    /// [`resolve_pattern`](Self::resolve_pattern) for turning a pattern the
+    /// user typed relative to their current directory into one of these.
     pub fn search(&self, pattern: &RepoPattern) -> Result<Vec<PathBuf>> {
         find_git_repositories(&Path::new(&self.path).join(pattern.full_path()))
+    }
+
+    /// Rewrite a pattern that names a path under `cwd` into a workspace-relative
+    /// one.
+    ///
+    /// The CLI documents patterns as relative to the current directory
+    /// (`workset drop ./repo`), but [`search`](Self::search) only ever looks
+    /// workspace-relative, so `./repo` — and a bare `repo` — matched nothing
+    /// whenever the current directory wasn't the workspace root. Patterns that
+    /// don't name an existing path inside the workspace are returned unchanged,
+    /// so a full workspace-relative pattern keeps working from any directory.
+    pub fn resolve_pattern(&self, cwd: &Path, pattern: &str) -> String {
+        let resolved = Path::new(&self.path)
+            .canonicalize()
+            .and_then(|root| Ok((root, cwd.join(pattern).canonicalize()?)))
+            .ok()
+            .and_then(|(root, target)| {
+                let relative = target.strip_prefix(root).ok()?;
+                // The workspace root itself isn't a pattern for any repo
+                (!relative.as_os_str().is_empty()).then(|| relative.display().to_string())
+            });
+
+        resolved.unwrap_or_else(|| pattern.to_string())
     }
 
     /// Clone/open a repository in this workspace
@@ -612,88 +657,66 @@ impl Workspace {
         Ok(repo_path)
     }
 
-    /// Drop a repository from this workspace
-    pub fn drop(&self, pattern: &RepoPattern, delete: bool, force: bool) -> Result<()> {
+    /// Drop the repositories matching a pattern from this workspace
+    pub fn drop(&self, pattern: &RepoPattern, delete: bool, force: bool) -> Result<DropReport> {
         debug!("Drop requested for pattern: {:?}", pattern);
 
-        let repos = self.search(pattern)?;
-
-        if repos.is_empty() {
-            warn!(pattern = %pattern.full_path(), "No repositories found matching pattern");
-            return Ok(());
+        let mut report = DropReport::default();
+        for repo in self.search(pattern)? {
+            self.drop_repo(&repo, delete, force, &mut report)?;
         }
-
-        for repo in repos {
-            self.drop_repo(&repo, delete, force)?;
-        }
-        Ok(())
+        Ok(report)
     }
 
     /// Drop all repositories in the current directory
-    pub fn drop_all(&self, delete: bool, force: bool) -> Result<()> {
+    pub fn drop_all(&self, delete: bool, force: bool) -> Result<DropReport> {
         debug!("Drop all requested in current directory");
 
         let cwd = std::env::current_dir()?;
-        let mut dropped = 0;
-        let mut skipped = 0;
-
+        let mut report = DropReport::default();
         for repo in find_git_repositories(&cwd)? {
-            if self.drop_repo(&repo, delete, force)? {
-                dropped += 1;
-            } else {
-                skipped += 1;
-            }
+            self.drop_repo(&repo, delete, force, &mut report)?;
         }
-
-        if dropped > 0 {
-            info!(count = dropped, "Dropped repositories");
-        }
-        if skipped > 0 {
-            warn!(
-                count = skipped,
-                "Skipped repositories - use --force to drop anyway"
-            );
-        }
-
-        Ok(())
+        Ok(report)
     }
 
     /// Drop a single repository: store it in the library (unless deleting) and
-    /// remove it from the workspace. Returns false if the repo was skipped
-    /// because it has uncommitted or unpushed changes.
-    fn drop_repo(&self, repo: &Path, delete: bool, force: bool) -> Result<bool> {
-        // Check for uncommitted changes unless --force is given
+    /// remove it from the workspace, recording the outcome in `report`. A repo
+    /// with uncommitted or unpushed changes is left alone unless `force`.
+    fn drop_repo(
+        &self,
+        repo: &Path,
+        delete: bool,
+        force: bool,
+        report: &mut DropReport,
+    ) -> Result<()> {
+        let relative_path = repo
+            .strip_prefix(&self.path)
+            .unwrap_or(repo)
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+
+        // Check for uncommitted or unpushed changes unless --force is given
         if !force {
-            match check_repo_status(repo)? {
-                RepoStatus::Dirty => {
-                    warn!(repo = %repo.display(), "Refusing to drop repository with uncommitted changes");
-                    warn!("Use --force to drop anyway");
-                    return Ok(false);
-                }
-                RepoStatus::Unpushed => {
-                    warn!(repo = %repo.display(), "Refusing to drop repository with unpushed commits");
-                    warn!("Use --force to drop anyway");
-                    return Ok(false);
-                }
-                _ => {}
+            let status = check_repo_status(repo)?;
+            if matches!(status, RepoStatus::Dirty | RepoStatus::Unpushed) {
+                debug!(repo = %repo.display(), ?status, "Refusing to drop repository");
+                report.skipped.push((relative_path, status));
+                return Ok(());
             }
         }
 
         if !delete {
             // Store the repository in the library using workspace-relative path
-            let relative_path = repo
-                .strip_prefix(&self.path)
-                .unwrap_or(repo)
-                .to_string_lossy()
-                .trim_start_matches('/')
-                .to_string();
             self.store_in_library(&relative_path)?;
         }
 
         // Remove the directory
         debug!(path = ?repo, "Removing directory");
         std::fs::remove_dir_all(repo)?;
-        Ok(true)
+        report.dropped.push(relative_path);
+        Ok(())
     }
 
     /// Attempt to clone a repository from configured remotes or infer the clone URL
@@ -928,6 +951,60 @@ mod tests {
         fs::create_dir_all(&library_path).unwrap();
 
         assert!(workspace.library_contains(repo_path));
+    }
+
+    #[test]
+    fn resolve_pattern_is_relative_to_the_current_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().to_string_lossy().to_string(),
+        };
+        let parent = temp_dir.path().join("github.com/user");
+        fs::create_dir_all(parent.join("project")).unwrap();
+
+        // From the repo's parent, both the documented './repo' form and a bare
+        // name resolve to the repo's workspace-relative path
+        assert_eq!(
+            workspace.resolve_pattern(&parent, "./project"),
+            "github.com/user/project"
+        );
+        assert_eq!(
+            workspace.resolve_pattern(&parent, "project"),
+            "github.com/user/project"
+        );
+
+        // A full workspace-relative pattern names nothing under the parent, so
+        // it is left alone and still matches from there
+        assert_eq!(
+            workspace.resolve_pattern(&parent, "github.com/user/project"),
+            "github.com/user/project"
+        );
+
+        // From the workspace root, a workspace-relative pattern is unchanged
+        assert_eq!(
+            workspace.resolve_pattern(temp_dir.path(), "github.com/user/project"),
+            "github.com/user/project"
+        );
+    }
+
+    #[test]
+    fn resolve_pattern_keeps_patterns_it_cannot_place_in_the_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        let root = temp_dir.path().join("ws");
+        fs::create_dir_all(root.join("repo")).unwrap();
+        fs::create_dir_all(temp_dir.path().join("outside")).unwrap();
+
+        // Nonexistent paths can't be resolved, so the pattern passes through
+        assert_eq!(workspace.resolve_pattern(&root, "missing"), "missing");
+
+        // Neither are paths that escape the workspace
+        assert_eq!(workspace.resolve_pattern(&root, "../outside"), "../outside");
+
+        // Nor the workspace root itself, which names no repo
+        assert_eq!(workspace.resolve_pattern(&root, "."), ".");
     }
 
     #[test]

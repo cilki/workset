@@ -147,6 +147,63 @@ testDropFullPathFromSubdirectory() {
 	[ -d ../../.workset/github.com/user/project ]
 }
 
+## A drop pattern is resolved against the current directory first, so the
+## './repo' form from the README works from the repo's parent
+testDropRelativePathFromSubdirectory() {
+	newWorkspace
+	createRepo github.com/user/project
+
+	cd github.com/user
+	workset drop ./project
+
+	[ ! -e project ]
+	[ -d ../../.workset/github.com/user/project ]
+}
+
+## A bare repo name resolves against the current directory too
+testDropBareNameFromSubdirectory() {
+	newWorkspace
+	createRepo github.com/user/project
+
+	cd github.com/user
+	workset drop project
+
+	[ ! -e project ]
+	[ -d ../../.workset/github.com/user/project ]
+}
+
+## Dropping reports which repos it moved to the library
+testDropReportsWhatItDropped() {
+	newWorkspace
+	createRepo reported-repo
+
+	workset drop reported-repo | grep "reported-repo - ✓ dropped"
+}
+
+## --delete says so instead of claiming the repo was dropped to the library
+testDropWithDeleteReportsDeletion() {
+	newWorkspace
+	createRepo delete-me
+
+	workset drop --delete delete-me | grep "delete-me - ✓ deleted"
+}
+
+## Refusing to drop a dirty repo is reported rather than silently ignored
+testDropReportsRefusedDirtyRepo() {
+	newWorkspace
+	createRepo dirty-repo 2
+	echo "uncommitted changes" >dirty-repo/dirty.txt
+
+	workset drop dirty-repo | grep -- "dirty-repo - ⚠ kept (uncommitted changes"
+}
+
+## A pattern that matches nothing says so instead of exiting silently
+testDropReportsNoMatch() {
+	newWorkspace
+
+	workset drop does-not-exist | grep "No repositories matched"
+}
+
 ## Restore matches library paths by substring, so a bare repo name is enough
 testRestoreFromSubdirectory() {
 	newWorkspace
