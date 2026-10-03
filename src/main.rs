@@ -1,9 +1,10 @@
 use anyhow::Result;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::process::ExitCode;
 use std::time::Duration;
+use tracing::debug;
 use tracing::level_filters::LevelFilter;
-use tracing::{error, info};
 use workset::Workspace;
 
 /// How often `mirror --watch` re-runs; matches the TUI's SYNC_INTERVAL
@@ -19,8 +20,9 @@ mod colors {
     pub const DIM: &str = "\x1b[2m";
 }
 
-/// Clone repositories matching the pattern
-fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<()> {
+/// Clone repositories matching the pattern. Returns false when nothing was
+/// cloned, so the caller can exit non-zero.
+fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -29,11 +31,7 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
         // Check if this is a partial path for mass cloning
         if (provider == "github.com" || provider == "gitlab.com") && !path.contains('/') {
             // This is a user/org pattern like "github.com/user" - use gh/glab to mass clone
-            info!(
-                provider = %provider,
-                path = %path,
-                "Fetching list of repositories"
-            );
+            println!("Fetching the repository list for {}/{}", provider, path);
 
             // Get list of repos using gh/glab
             let output = if provider == "github.com" {
@@ -85,14 +83,15 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
             };
 
             if repos.is_empty() {
-                info!(provider = %provider, path = %path, "No repositories found");
-                return Ok(());
+                eprintln!("No repositories found for {}/{}", provider, path);
+                return Ok(false);
             }
 
-            info!(count = repos.len(), "Found repositories, starting clone");
+            println!("Found {} repository(ies)", repos.len());
 
             let mut cloned = 0;
             let mut skipped = 0;
+            let mut failed = 0;
 
             for repo in repos {
                 let Ok(repo_pattern) =
@@ -107,73 +106,77 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
 
                 // Clone the individual repo
                 match clone_single_repo(workspace, &repo_pattern) {
-                    Ok(_) => {
-                        cloned += 1;
-                    }
+                    Ok(true) => cloned += 1,
+                    Ok(false) => skipped += 1,
                     Err(e) => {
-                        error!(repo = %repo_pattern.full_path(), error = %e, "Failed to clone repository");
+                        failed += 1;
+                        eprintln!("Failed to clone {}: {}", repo_pattern.full_path(), e);
                     }
                 }
             }
 
-            info!(
-                cloned = cloned,
-                skipped = skipped,
-                "Completed cloning repositories"
+            println!(
+                "Cloned {} repository(ies), skipped {}, failed {}",
+                cloned, skipped, failed
             );
-            return Ok(());
+            return Ok(failed == 0);
         }
     }
 
     // Not a mass clone pattern, just clone the single repo
-    clone_single_repo(workspace, pattern)?;
-    Ok(())
+    clone_single_repo(workspace, pattern)
 }
 
-/// Clone a single repository
-fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<()> {
+/// Clone a single repository. Returns false when the repo was not cloned
+/// because it is already in the workspace or the library.
+fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
     use std::path::PathBuf;
 
     let repo_path = PathBuf::from(&workspace.path).join(pattern.full_path());
 
     // Check if repo already exists in workspace
     if repo_path.exists() {
-        info!(repo = %pattern.full_path(), "Repository already exists");
-        return Ok(());
+        eprintln!("{} is already in the workspace", pattern.full_path());
+        return Ok(false);
     }
 
     // Check if it exists in library first
     if workspace.library_contains(&pattern.full_path()) {
-        info!(repo = %pattern.full_path(), "Repository found in library, use 'restore' instead");
-        return Ok(());
+        eprintln!(
+            "{} is in the library; run 'workset restore {}' instead",
+            pattern.full_path(),
+            pattern.full_path()
+        );
+        return Ok(false);
     }
 
     // Clone from remote
     if let Some((provider, repo_path_str)) = pattern.provider_and_path() {
         let clone_url = format!("https://{}/{}", provider, repo_path_str);
 
-        info!(repo = %pattern.full_path(), "Cloning repository");
+        println!("Cloning {}", clone_url);
 
         // TODO show progress
         workset::gix_clone(&clone_url, &repo_path)?;
 
-        info!(repo = %pattern.full_path(), "Successfully cloned repository");
-        Ok(())
+        println!("Cloned {}", pattern.full_path());
+        Ok(true)
     } else {
         anyhow::bail!("No provider specified. Use format like github.com/user/repo");
     }
 }
 
-/// Restore repositories from library matching the pattern
-fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<()> {
+/// Restore repositories from library matching the pattern. Returns false when
+/// nothing was restored, so the caller can exit non-zero.
+fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
     use std::path::PathBuf;
 
     // Get all repos from library
     let library_repos = workspace.list_library()?;
 
     if library_repos.is_empty() {
-        info!("Library is empty");
-        return Ok(());
+        eprintln!("The library is empty");
+        return Ok(false);
     }
 
     // Filter repos that match the pattern
@@ -185,46 +188,38 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         .collect();
 
     if matching_repos.is_empty() {
-        info!(pattern = %pattern_str, "No repositories found in library matching pattern");
-        return Ok(());
+        eprintln!("No repository in the library matches '{}'", pattern_str);
+        return Ok(false);
     }
 
-    info!(
-        count = matching_repos.len(),
-        "Found matching repositories in library"
-    );
-
     let mut restored = 0;
-    let mut skipped = 0;
+    let mut failed = 0;
 
     for repo_path in matching_repos {
         // Check if already exists in workspace
         let dest_path = PathBuf::from(&workspace.path).join(&repo_path);
         if dest_path.exists() {
-            skipped += 1;
+            eprintln!("{} is already in the workspace", repo_path);
             continue;
         }
 
         // Restore from library
         match workspace.restore_from_library(&repo_path) {
             Ok(_) => {
+                println!("Restored {}", repo_path);
                 restored += 1;
             }
             Err(e) => {
-                error!(repo = %repo_path, error = %e, "Failed to restore repository");
+                failed += 1;
+                eprintln!("Failed to restore {}: {}", repo_path, e);
             }
         }
     }
 
-    info!(
-        restored = restored,
-        skipped = skipped,
-        "Completed restoring repositories"
-    );
-    Ok(())
+    Ok(restored > 0 && failed == 0)
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -242,8 +237,8 @@ fn main() -> Result<()> {
     if let Ok(shell_type) = std::env::var("_ARGCOMPLETE_") {
         let maybe_workspace = Workspace::discover();
         return match shell_type.as_str() {
-            "bash" => complete_bash(maybe_workspace),
-            "fish" => complete_fish(maybe_workspace),
+            "bash" => complete_bash(maybe_workspace).map(|()| ExitCode::SUCCESS),
+            "fish" => complete_fish(maybe_workspace).map(|()| ExitCode::SUCCESS),
             _ => anyhow::bail!("Unsupported shell type: {}", shell_type),
         };
     }
@@ -254,7 +249,7 @@ fn main() -> Result<()> {
     // `--version` works anywhere, not just inside a valid workspace.
     if args.contains(["-V", "--version"]) {
         println!("workset {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     if args.contains("--help") {
@@ -333,61 +328,67 @@ fn main() -> Result<()> {
         );
         print!("{}", help);
 
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Load the workspace for a subcommand.
     let maybe_workspace = Workspace::load()?;
 
-    // Resolve the current workspace or report "not in a workspace" and return.
-    // Used by every subcommand that operates on an existing workspace.
+    // Resolve the current workspace or report "not in a workspace" and return
+    // failure. Used by every subcommand that operates on an existing workspace.
     macro_rules! require_workspace {
         ($ws:expr) => {
             match $ws {
                 Some(workspace) => workspace,
                 None => {
-                    error!("Not in a workspace");
-                    return Ok(());
+                    eprintln!("Not in a workspace (run 'workset init' to create one)");
+                    return Ok(ExitCode::FAILURE);
                 }
             }
         };
     }
 
-    // Dispatch subcommands
-    match args.subcommand()? {
+    // Whether the subcommand did what it was asked to do. Anything the user
+    // requested but didn't get (a repo that couldn't be dropped, a pattern that
+    // matched nothing, a missing argument) clears this so the process exits
+    // non-zero and scripts can tell.
+    let succeeded = match args.subcommand()? {
         Some(command) => match command.as_str() {
             "init" => {
                 let workspace_path = std::env::current_dir()?;
                 let library_path = workspace_path.join(".workset");
 
                 if library_path.exists() {
-                    info!(
-                        path = %workspace_path.display(),
-                        "Workspace already initialized"
+                    println!(
+                        "Workspace already initialized in {}",
+                        workspace_path.display()
                     );
                 } else {
                     std::fs::create_dir_all(&library_path)?;
-                    info!(path = %workspace_path.display(), "Initialized workspace");
+                    println!("Initialized workspace in {}", workspace_path.display());
                 }
+                true
             }
             "clone" => {
                 let workspace = require_workspace!(maybe_workspace);
                 if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
                     let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
-                    clone_repos(&workspace, &pattern)?;
+                    clone_repos(&workspace, &pattern)?
                 } else {
-                    error!("Missing repository pattern for clone command");
-                    error!("Usage: workset clone <pattern>");
+                    eprintln!("Missing repository pattern");
+                    eprintln!("Usage: workset clone <pattern>");
+                    false
                 }
             }
             "restore" => {
                 let workspace = require_workspace!(maybe_workspace);
                 if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
                     let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
-                    restore_repos(&workspace, &pattern)?;
+                    restore_repos(&workspace, &pattern)?
                 } else {
-                    error!("Missing repository pattern for restore command");
-                    error!("Usage: workset restore <pattern>");
+                    eprintln!("Missing repository pattern");
+                    eprintln!("Usage: workset restore <pattern>");
+                    false
                 }
             }
             "drop" => {
@@ -395,27 +396,31 @@ fn main() -> Result<()> {
                 let delete = args.contains("--delete");
                 let force = args.contains("--force");
 
-                let report = if let Some(path) = args.opt_free_from_str::<String>()? {
-                    // Patterns are relative to the current directory first, so
-                    // 'workset drop ./repo' works from the repo's parent
-                    let cwd = std::env::current_dir()?;
-                    let Ok(pattern) = workspace
-                        .resolve_pattern(&cwd, &path)
-                        .parse::<workset::RepoPattern>();
-                    workspace.drop(&pattern, delete, force)?
-                } else {
+                let requested = args.opt_free_from_str::<String>()?;
+                let report = match &requested {
+                    Some(path) => {
+                        // Patterns are relative to the current directory first,
+                        // so 'workset drop ./repo' works from the repo's parent
+                        let cwd = std::env::current_dir()?;
+                        let Ok(pattern) = workspace
+                            .resolve_pattern(&cwd, path)
+                            .parse::<workset::RepoPattern>();
+                        workspace.drop(&pattern, delete, force)?
+                    }
                     // Drop all repos in current directory
-                    workspace.drop_all(delete, force)?
+                    None => workspace.drop_all(delete, force)?,
                 };
-                report_drop(&report, delete);
+                report_drop(&report, delete, requested.as_deref())
             }
             "list" | "ls" => {
                 let workspace = require_workspace!(maybe_workspace);
                 list_workspace_status(&workspace)?;
+                true
             }
             "status" => {
                 let workspace = require_workspace!(maybe_workspace);
                 show_workspace_summary(&workspace)?;
+                true
             }
             "mirror" => {
                 let workspace = require_workspace!(maybe_workspace);
@@ -433,10 +438,12 @@ fn main() -> Result<()> {
                     );
                     std::thread::sleep(WATCH_INTERVAL);
                 }
+                true
             }
             _ => {
-                error!(command = %command, "Unknown command");
-                error!("Run 'workset --help' for usage information");
+                eprintln!("Unknown command: {}", command);
+                eprintln!("Run 'workset --help' for usage information");
+                false
             }
         },
         None => {
@@ -445,14 +452,57 @@ fn main() -> Result<()> {
                 let workspace = require_workspace!(maybe_workspace);
                 // Open TUI for interactive workspace management
                 workset::tui::run_tui(&workspace)?;
+                true
             }
             #[cfg(not(feature = "tui"))]
             {
                 anyhow::bail!("No command provided. TUI feature is disabled.")
             }
         }
+    };
+
+    Ok(if succeeded {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Report what a drop request did and whether it did everything asked. A repo
+/// left in place because of outstanding changes, or a pattern that matched
+/// nothing, counts as a failure, so the caller can exit non-zero.
+fn report_drop(report: &workset::DropReport, delete: bool, pattern: Option<&str>) -> bool {
+    let verb = if delete { "deleted" } else { "dropped" };
+
+    for repo in &report.dropped {
+        println!("  {} - ✓ {}", repo, verb);
     }
-    Ok(())
+
+    for (repo, status) in &report.skipped {
+        let reason = match status {
+            workset::RepoStatus::Dirty => "uncommitted changes",
+            workset::RepoStatus::Unpushed => "unpushed commits",
+            // drop_repo only ever blocks on the two statuses above
+            other => {
+                debug!(?other, "Unexpected drop blocker");
+                "outstanding changes"
+            }
+        };
+        eprintln!(
+            "  {} - ⚠ kept ({}, use --force to drop anyway)",
+            repo, reason
+        );
+    }
+
+    if report.is_empty() {
+        match pattern {
+            Some(pattern) => eprintln!("No repository in the workspace matches '{}'", pattern),
+            None => eprintln!("No repositories found in the current directory"),
+        }
+        return false;
+    }
+
+    report.skipped.is_empty()
 }
 
 /// List all repositories in the workspace with their status
@@ -482,33 +532,6 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Report what a drop did, in the same style as `list` and `mirror`. Without
-/// this the command is completely silent: the refusals and no-match cases are
-/// logged at levels the default filter hides.
-fn report_drop(report: &workset::DropReport, delete: bool) {
-    let verb = if delete { "deleted" } else { "dropped" };
-
-    for repo in &report.dropped {
-        println!("  {} - ✓ {}", repo, verb);
-    }
-
-    for (repo, status) in &report.skipped {
-        let reason = match status {
-            workset::RepoStatus::Dirty => "uncommitted changes",
-            workset::RepoStatus::Unpushed => "unpushed commits",
-            _ => "not clean",
-        };
-        println!(
-            "  {} - ⚠ kept ({}, use --force to drop anyway)",
-            repo, reason
-        );
-    }
-
-    if report.is_empty() {
-        println!("No repositories matched");
-    }
 }
 
 /// Mirror pushed commits to the remotes of mirror-enabled repos, printing
