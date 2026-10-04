@@ -38,7 +38,7 @@ testInit() {
 
 ## Commands that need a workspace say so and fail outside one
 testCommandsOutsideWorkspaceFail() {
-	for command in list status drop mirror; do
+	for command in list status drop; do
 		output=$(workset $command 2>&1) && exit 1
 		echo "$output" | grep "Not in a workspace"
 	done
@@ -356,20 +356,18 @@ testRestoreEmptiesLibraryEntry() {
 	workset status | grep "0 repository(ies) in library"
 }
 
-## Git config, including the workset mirror opt-out and remote URLs,
-## survives a drop/restore round trip
+## Git config, including custom keys and remote URLs, survives a
+## drop/restore round trip
 testDropRestorePreservesConfig() {
 	newWorkspace
 	createRepo config-repo 1
 	git -C config-repo remote add a https://example.com/a.git
 	git -C config-repo remote add b https://example.com/b.git
-	git -C config-repo config workset.mirror false
 	git -C config-repo config custom.key custom-value
 
 	workset drop config-repo
 	workset restore config-repo
 
-	[ "$(git -C config-repo config workset.mirror)" = "false" ]
 	[ "$(git -C config-repo config custom.key)" = "custom-value" ]
 	[ "$(git -C config-repo remote get-url a)" = "https://example.com/a.git" ]
 	[ "$(git -C config-repo remote get-url b)" = "https://example.com/b.git" ]

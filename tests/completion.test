@@ -26,7 +26,7 @@ fishComplete() {
 
 ## The subcommands offered inside a workspace
 subcommands() {
-	printf 'clone\nrestore\ndrop\nlist\nls\nstatus\nmirror\n'
+	printf 'clone\nrestore\ndrop\nlist\nls\nstatus\n'
 }
 
 ## The same subcommands with the descriptions fish expects
@@ -37,7 +37,6 @@ subcommandsWithDescriptions() {
 	printf 'list\tList all repositories with their status\n'
 	printf 'ls\tList all repositories with their status\n'
 	printf 'status\tShow workspace summary and statistics\n'
-	printf 'mirror\tMirror pushed commits to a repo'"'"'s other remotes\n'
 }
 
 ## The repos created by setupWorkspace, in completion order
@@ -159,13 +158,6 @@ testBashCompleteCompPointBeyondLine() {
 	diff <(bashComplete "workset drop " 999) <(repos)
 }
 
-## After `mirror`, repos are completed
-testBashCompleteMirrorRepoPaths() {
-	setupWorkspace
-
-	diff <(bashComplete "workset mirror ") <(repos)
-}
-
 ## Fish gets the same suggestion outside a workspace, with a description
 testFishCompleteWithoutWorkspace() {
 	leaveWorkspace
@@ -218,13 +210,6 @@ testFishCompletePartialRepoToken() {
 	setupWorkspace
 
 	diff <(fishComplete "workset drop re" | cut -f1) <(repos)
-}
-
-## After `mirror`, fish completes repos
-testFishCompleteMirrorRepoPaths() {
-	setupWorkspace
-
-	diff <(fishComplete "workset mirror " | cut -f1) <(repos)
 }
 
 ## An unrecognized shell is an error

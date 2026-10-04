@@ -24,9 +24,8 @@
 ## Quickstart
 
 `workset init` and a bare `workset drop` act on the current directory. `clone`
-and `restore` place a repo at its full path under the workspace root, and
-`list`, `status` and `mirror` always cover the whole workspace, wherever you
-run them from.
+and `restore` place a repo at its full path under the workspace root, and `list`
+and `status` always cover the whole workspace, wherever you run them from.
 
 ```sh
 # Initialize a new workspace in the current directory
@@ -66,8 +65,8 @@ it, so `workset` composes with other commands:
 1
 ```
 
-Two read-only commands report on the whole workspace, no matter which
-directory you run them from:
+Two read-only commands report on the whole workspace, no matter which directory
+you run them from:
 
 ```sh
 # Every repo in the workspace, with its status
@@ -93,10 +92,10 @@ Running `workset` with no subcommand opens the TUI, where `?` shows the
 keybindings.
 
 Shell completion fills in the repo paths for you: `restore` suggests everything
-in the library, while `drop` and `mirror` suggest the repos currently in your
-working set. Candidates are always workspace-relative paths, so they work from
-any directory inside the workspace. Under fish, each workspace repo is
-annotated with its status and how long ago it changed.
+in the library, while `drop` suggests the repos currently in your working set.
+Candidates are always workspace-relative paths, so they work from any directory
+inside the workspace. Under fish, each workspace repo is annotated with its
+status and how long ago it changed.
 
 ## Keep your working set small
 
@@ -114,40 +113,6 @@ saved.
 `workset` makes these mechanics _fast_ and _easy_. When repositories are dropped
 from your workspace, they are just saved locally in a library so restoring them
 later can be done in an instant.
-
-## Control your repos
-
-Don't let Github be the only place you store your repos!
-
-**Workset** makes it easy to keep local copies of all of your repos without
-having to sift through them to find the ones you're currently working on.
-
-**Workset** mirrors your pushed commits to the other remotes of a repo — on
-by default, no setup needed. All of a repo's remotes are mirrors for all of
-its branches and tags. Push to any remote (from anywhere — inside or outside
-workset) and the TUI notices in the background: it fetches the repo's remotes
-and shows how many refs each mirror is waiting on. Nothing is pushed until
-you press `s`, which propagates the branches and tags to the mirrors that are
-behind. Commits you haven't pushed anywhere are never touched, and diverged
-refs show an error instead of being force-pushed.
-
-To opt a repo out, press `m` on it in the TUI, or set the config key
-directly:
-
-```sh
-git config workset.mirror false
-```
-
-Opted-out repos are left alone entirely.
-
-`workset mirror` pushes from the command line, `workset mirror --dryrun`
-shows what would be pushed without pushing anything, and
-`workset mirror --watch` re-runs the sync every five minutes. An optional
-pattern limits the run to the repos whose workspace-relative path contains it,
-so `workset mirror github.com/jqlang` covers just that one user's repos.
-
-Background pushes never prompt for credentials (SSH runs in batch mode), so
-use an SSH agent or credential helper for remotes that need authentication.
 
 ## Installation
 

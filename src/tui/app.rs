@@ -66,14 +66,14 @@ pub struct App {
     pub clone_repo_state: TreeState,
     pub suggestions_loading: bool,
     pending_clones: Vec<PendingClone>,
-    /// Sync status per repo display name (Syncing or SyncFailed), overlaid on
+    /// Sync status per repo display name (Fetching or SyncFailed), overlaid on
     /// the repo rows so it survives background data refreshes
     sync_statuses: std::collections::HashMap<String, RepoOperationStatus>,
     /// Full result of each repo's last sync, keyed by path, for the info
-    /// panel's per-mirror status rows
+    /// panel's per-remote status rows
     pub sync_outcomes: std::collections::HashMap<PathBuf, crate::sync::SyncOutcome>,
-    /// Phase of each repo's currently running sync, keyed by path
-    pub sync_phases: std::collections::HashMap<PathBuf, super::details::SyncPhase>,
+    /// Repos with a fetch currently running, keyed by path
+    pub fetching: std::collections::HashSet<PathBuf>,
     /// Info-panel details computed in the background, keyed by repo path
     pub details: std::collections::HashMap<PathBuf, super::details::RepoDetails>,
     /// Whether the current selection was made automatically (not by the user).
@@ -114,7 +114,7 @@ impl App {
             pending_clones: Vec::new(),
             sync_statuses: std::collections::HashMap::new(),
             sync_outcomes: std::collections::HashMap::new(),
-            sync_phases: std::collections::HashMap::new(),
+            fetching: std::collections::HashSet::new(),
             details: std::collections::HashMap::new(),
             selection_is_auto: true,
         };
@@ -447,7 +447,7 @@ impl App {
         }
     }
 
-    /// Overlay a sync status (Syncing or SyncFailed) on the given repo
+    /// Overlay a sync status (Fetching or SyncFailed) on the given repo
     pub fn set_sync_status(&mut self, display_name: &str, status: RepoOperationStatus) {
         self.sync_statuses.insert(display_name.to_string(), status);
         self.rebuild_after_pending_change();
@@ -594,23 +594,23 @@ mod tests {
             Vec::new(),
         );
 
-        app.set_sync_status("github.com/foo/app", RepoOperationStatus::Syncing);
+        app.set_sync_status("github.com/foo/app", RepoOperationStatus::Fetching);
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
-        assert_eq!(info.operation_status, RepoOperationStatus::Syncing);
+        assert_eq!(info.operation_status, RepoOperationStatus::Fetching);
 
         // A background rescan rebuilds the rows; the overlay must persist
         app.update_repos(vec![repo("github.com/foo/app")], Vec::new());
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
-        assert_eq!(info.operation_status, RepoOperationStatus::Syncing);
+        assert_eq!(info.operation_status, RepoOperationStatus::Fetching);
 
         app.set_sync_status(
             "github.com/foo/app",
-            RepoOperationStatus::SyncFailed("diverged".to_string()),
+            RepoOperationStatus::SyncFailed("unreachable".to_string()),
         );
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
         assert_eq!(
             info.operation_status,
-            RepoOperationStatus::SyncFailed("diverged".to_string())
+            RepoOperationStatus::SyncFailed("unreachable".to_string())
         );
 
         app.clear_sync_status("github.com/foo/app");

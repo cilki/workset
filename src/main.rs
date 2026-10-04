@@ -2,13 +2,9 @@ use anyhow::Result;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::Duration;
 use tracing::debug;
 use tracing::level_filters::LevelFilter;
 use workset::Workspace;
-
-/// How often `mirror --watch` re-runs; matches the TUI's SYNC_INTERVAL
-const WATCH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// ANSI color codes
 mod colors {
@@ -300,7 +296,6 @@ fn main() -> Result<ExitCode> {
   {cmd}workset{reset} drop [repo pattern] [--delete] [--force]
   {cmd}workset{reset} list
   {cmd}workset{reset} status
-  {cmd}workset{reset} mirror [repo pattern] [--dryrun] [--watch]
 {dim}
   Without a subcommand, the interactive TUI opens; '?' shows its keybindings.{reset}
 
@@ -314,12 +309,6 @@ fn main() -> Result<ExitCode> {
                                        With --force: drop even with uncommitted changes{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
   {subcmd}status{reset}                               Show workspace summary and statistics
-  {subcmd}mirror{reset} {arg}[pattern]{reset} {arg}[--dryrun]{reset} {arg}[--watch]{reset}
-{dim}                                       Mirror pushed commits between each repo's remotes
-                                       On by default; opt a repo out with
-                                       'git config workset.mirror false'
-                                       With --dryrun: show what would be pushed without pushing
-                                       With --watch: keep syncing every 5 minutes{reset}
 
 {examples_header}
   {cmd}workset init{reset}                              Initialize workspace here
@@ -330,7 +319,6 @@ fn main() -> Result<ExitCode> {
   {cmd}workset drop{reset}                              Drop all repos in current dir
   {cmd}workset drop --delete ./old_repo{reset}          Permanently delete a repo
   {cmd}workset drop --force ./dirty_repo{reset}         Force drop repo and lose any changes
-  {cmd}workset mirror --watch{reset}                    Keep mirroring pushed commits
 "#,
             workset = paint(colors::BOLD, "workset"),
             version = paint(colors::CYAN, env!("CARGO_PKG_VERSION")),
@@ -440,24 +428,6 @@ fn main() -> Result<ExitCode> {
                 show_workspace_summary(&workspace)?;
                 true
             }
-            "mirror" => {
-                let workspace = require_workspace!(maybe_workspace);
-                let dry_run = args.contains("--dryrun");
-                let watch = args.contains("--watch");
-                let pattern = args.opt_free_from_str::<String>()?;
-                loop {
-                    mirror_repos(&workspace, pattern.as_deref(), dry_run)?;
-                    if !watch {
-                        break;
-                    }
-                    println!(
-                        "  next sync in {}s (Ctrl+C to stop)",
-                        WATCH_INTERVAL.as_secs()
-                    );
-                    std::thread::sleep(WATCH_INTERVAL);
-                }
-                true
-            }
             _ => {
                 eprintln!("Unknown command: {}", command);
                 eprintln!("Run 'workset --help' for usage information");
@@ -549,85 +519,6 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
         println!("  {} - {}", repo_name, status_str);
     }
 
-    Ok(())
-}
-
-/// Mirror pushed commits to the remotes of mirror-enabled repos, printing
-/// per-ref results
-fn mirror_repos(workspace: &Workspace, pattern: Option<&str>, dry_run: bool) -> Result<()> {
-    let repos = workset::find_git_repositories(Path::new(&workspace.path))?;
-    let interrupt = std::sync::atomic::AtomicBool::new(false);
-    let short = workset::sync::short_ref;
-
-    let mut matched = false;
-    for repo in repos {
-        let repo_name = workspace.relative_name(&repo);
-        if pattern.is_some_and(|p| !repo_name.contains(p)) {
-            continue;
-        }
-        matched = true;
-
-        match workset::sync::sync_repo(&repo, &interrupt, dry_run, &|| {}) {
-            Ok(outcome) => {
-                if outcome.skipped {
-                    println!("  {} - skipped (mirroring disabled)", repo_name);
-                    continue;
-                }
-                for (remote, refname) in &outcome.pushed {
-                    println!(
-                        "  {} - ✓ pushed {} to {}",
-                        repo_name,
-                        short(refname),
-                        remote
-                    );
-                }
-                for (remote, refname) in &outcome.would_push {
-                    println!(
-                        "  {} - would push {} to {}",
-                        repo_name,
-                        short(refname),
-                        remote
-                    );
-                }
-                for (remote, refname, reason) in &outcome.conflicts {
-                    println!(
-                        "  {} - ⚠ {} on {}: {}",
-                        repo_name,
-                        short(refname),
-                        remote,
-                        reason
-                    );
-                }
-                for (remote, refname, error) in &outcome.push_errors {
-                    println!(
-                        "  {} - ✗ push {} to {} failed: {}",
-                        repo_name,
-                        short(refname),
-                        remote,
-                        error
-                    );
-                }
-                for (remote, error) in &outcome.fetch_errors {
-                    println!("  {} - ✗ fetch {} failed: {}", repo_name, remote, error);
-                }
-                if outcome.offline {
-                    println!("  {} - ⚠ remotes unreachable", repo_name);
-                } else if outcome.pushed.is_empty()
-                    && outcome.would_push.is_empty()
-                    && outcome.conflicts.is_empty()
-                    && outcome.push_errors.is_empty()
-                    && outcome.fetch_errors.is_empty()
-                {
-                    println!("  {} - ✓ in sync", repo_name);
-                }
-            }
-            Err(e) => println!("  {} - ✗ mirror failed: {}", repo_name, e),
-        }
-    }
-
-    if !matched {
-        println!("No repositories matched");
-    }
     Ok(())
 }
 
@@ -784,7 +675,7 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
     if word_index <= 1 {
         // Complete subcommands
         let subcommands: &[&str] = if maybe_workspace.is_some() {
-            &["clone", "restore", "drop", "list", "ls", "status", "mirror"]
+            &["clone", "restore", "drop", "list", "ls", "status"]
         } else {
             &["init"]
         };
@@ -833,7 +724,6 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
             println!("list\tList all repositories with their status");
             println!("ls\tList all repositories with their status");
             println!("status\tShow workspace summary and statistics");
-            println!("mirror\tMirror pushed commits to a repo's other remotes");
         } else {
             println!("init\tInitialize a workspace in current directory");
         }

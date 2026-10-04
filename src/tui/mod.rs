@@ -5,7 +5,7 @@ mod tree;
 mod watcher;
 
 use app::{App, AppMode, Section};
-use details::{DetailsLoader, MirrorState, RemoteInfo, RemotesDetail, SyncPhase, mirror_rows};
+use details::{DetailsLoader, RemoteInfo, RemoteSyncState, RemotesDetail, remote_rows};
 use crate::get_repo_modification_time;
 use metadata::{format_size, format_time_ago_verbose, get_repo_size};
 use tree::{RepoInfo, RepoOperationStatus, TreeNode};
@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// How many repos may sync (fetch/push) concurrently
+/// How many repos may fetch concurrently
 const MAX_CONCURRENT_SYNCS: usize = 4;
 /// How often all repos are re-checked against their remotes
 const SYNC_INTERVAL: Duration = Duration::from_secs(300);
@@ -190,37 +190,24 @@ fn merge_discovered(pending: &mut Vec<RepoInfo>, discovered: Vec<RepoInfo>) {
     }
 }
 
-/// What a sync job is allowed to do
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SyncMode {
-    /// Fetch remotes and report what would be pushed, without pushing
-    Check,
-    /// Fetch remotes and actually push (triggered by 's')
-    Push,
-}
-
 /// Result of a background sync job for one repo
 enum SyncEvent {
     Started,
-    /// The job moved from fetching to actually pushing commits
-    Pushing,
-    /// The repo has mirroring disabled; nothing was done
-    Skipped,
     Finished(crate::sync::SyncOutcome),
     Failed(String),
 }
 
-/// Schedules background jobs that mirror each repo's commits across its
-/// remotes. Jobs run on their own threads (up to `MAX_CONCURRENT_SYNCS`) and
+/// Schedules background jobs that fetch each repo's remotes and refresh its
+/// status. Jobs run on their own threads (up to `MAX_CONCURRENT_SYNCS`) and
 /// report back through a channel drained by the event loop.
 struct SyncManager {
     tx: mpsc::Sender<(PathBuf, SyncEvent)>,
     rx: mpsc::Receiver<(PathBuf, SyncEvent)>,
-    queue: VecDeque<(PathBuf, SyncMode)>,
+    queue: VecDeque<PathBuf>,
     in_flight: HashSet<PathBuf>,
     /// Repos that were requested again while already syncing; re-queued once
     /// the running job finishes
-    rerun_after: HashMap<PathBuf, SyncMode>,
+    rerun_after: HashSet<PathBuf>,
     recently_synced: HashMap<PathBuf, Instant>,
     last_periodic: Instant,
     /// Sync every repo once the initial scan completes. Because the outer TUI
@@ -239,7 +226,7 @@ impl SyncManager {
             rx,
             queue: VecDeque::new(),
             in_flight: HashSet::new(),
-            rerun_after: HashMap::new(),
+            rerun_after: HashSet::new(),
             recently_synced: HashMap::new(),
             last_periodic: Instant::now(),
             startup_pending: true,
@@ -249,9 +236,8 @@ impl SyncManager {
     }
 
     /// Queue a repo for syncing, deduplicating against queued and running
-    /// jobs. A Push request upgrades a queued or deferred Check; a Check
-    /// never downgrades a Push.
-    fn request_sync(&mut self, repo: PathBuf, mode: SyncMode, from_watcher: bool) {
+    /// jobs
+    fn request_sync(&mut self, repo: PathBuf, from_watcher: bool) {
         if from_watcher
             && self
                 .recently_synced
@@ -261,26 +247,18 @@ impl SyncManager {
             return;
         }
         if self.in_flight.contains(&repo) {
-            let deferred = self.rerun_after.entry(repo).or_insert(mode);
-            if mode == SyncMode::Push {
-                *deferred = SyncMode::Push;
-            }
+            self.rerun_after.insert(repo);
             return;
         }
-        match self.queue.iter_mut().find(|(r, _)| *r == repo) {
-            Some((_, queued)) => {
-                if mode == SyncMode::Push {
-                    *queued = SyncMode::Push;
-                }
-            }
-            None => self.queue.push_back((repo, mode)),
+        if !self.queue.contains(&repo) {
+            self.queue.push_back(repo);
         }
     }
 
-    /// Queue a mirror check for every syncable workspace repo
+    /// Queue a fetch for every syncable workspace repo
     fn request_sync_all(&mut self, app: &App) {
         for repo in app.syncable_repo_paths() {
-            self.request_sync(repo, SyncMode::Check, false);
+            self.request_sync(repo, false);
         }
     }
 
@@ -297,40 +275,15 @@ impl SyncManager {
     /// Spawn queued jobs up to the concurrency cap
     fn pump(&mut self) {
         while self.in_flight.len() < MAX_CONCURRENT_SYNCS {
-            let Some((repo, mode)) = self.queue.pop_front() else {
+            let Some(repo) = self.queue.pop_front() else {
                 break;
             };
             self.in_flight.insert(repo.clone());
             let tx = self.tx.clone();
             let interrupt = self.interrupt.clone();
             std::thread::spawn(move || {
-                // Check the mirror config before reporting Started so disabled
-                // repos never flash a "fetching" status
-                match crate::sync::mirroring_enabled(&repo, &interrupt) {
-                    Ok(false) => {
-                        let _ = tx.send((repo, SyncEvent::Skipped));
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = tx.send((repo, SyncEvent::Failed(e.to_string())));
-                        return;
-                    }
-                    Ok(true) => {}
-                }
                 let _ = tx.send((repo.clone(), SyncEvent::Started));
-                let on_push = {
-                    let tx = tx.clone();
-                    let repo = repo.clone();
-                    move || {
-                        let _ = tx.send((repo.clone(), SyncEvent::Pushing));
-                    }
-                };
-                let event = match crate::sync::sync_repo(
-                    &repo,
-                    &interrupt,
-                    mode == SyncMode::Check,
-                    &on_push,
-                ) {
+                let event = match crate::sync::sync_repo(&repo, &interrupt) {
                     Ok(outcome) => SyncEvent::Finished(outcome),
                     Err(e) => SyncEvent::Failed(e.to_string()),
                 };
@@ -345,21 +298,8 @@ impl SyncManager {
             let display_name = workspace_display_name(&self.workspace_path, &repo);
             match event {
                 SyncEvent::Started => {
-                    app.sync_phases.insert(repo, SyncPhase::Fetching);
+                    app.fetching.insert(repo);
                     app.set_sync_status(&display_name, RepoOperationStatus::Fetching);
-                }
-                SyncEvent::Pushing => {
-                    app.sync_phases.insert(repo, SyncPhase::Pushing);
-                    app.set_sync_status(&display_name, RepoOperationStatus::Syncing);
-                }
-                SyncEvent::Skipped => {
-                    self.finish(&repo);
-                    // Clears a stale SyncFailed overlay if the user just
-                    // disabled mirroring for the repo
-                    app.clear_sync_status(&display_name);
-                    app.sync_phases.remove(&repo);
-                    app.sync_outcomes.remove(&repo);
-                    app.details.remove(&repo);
                 }
                 SyncEvent::Finished(outcome) => {
                     self.finish(&repo);
@@ -368,26 +308,19 @@ impl SyncManager {
                     }
                     if let Some(err) = outcome.error_summary() {
                         app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err));
-                    } else if !outcome.would_push.is_empty() {
-                        // A check found refs to push; surface it on the row
-                        // until the user syncs with 's'
-                        app.set_sync_status(
-                            &display_name,
-                            RepoOperationStatus::PushPending(outcome.would_push.len()),
-                        );
                     } else {
                         app.clear_sync_status(&display_name);
                     }
-                    app.sync_phases.remove(&repo);
+                    app.fetching.remove(&repo);
                     // The fetch may have changed what the info panel shows
                     app.details.remove(&repo);
-                    // Keep the full outcome for the panel's per-mirror rows
+                    // Keep the full outcome for the panel's per-remote rows
                     app.sync_outcomes.insert(repo, outcome);
                 }
                 SyncEvent::Failed(err) => {
                     self.finish(&repo);
                     app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err));
-                    app.sync_phases.remove(&repo);
+                    app.fetching.remove(&repo);
                 }
             }
         }
@@ -396,8 +329,8 @@ impl SyncManager {
     fn finish(&mut self, repo: &PathBuf) {
         self.in_flight.remove(repo);
         self.recently_synced.insert(repo.clone(), Instant::now());
-        if let Some(mode) = self.rerun_after.remove(repo) {
-            self.queue.push_back((repo.clone(), mode));
+        if self.rerun_after.remove(repo) {
+            self.queue.push_back(repo.clone());
         }
     }
 }
@@ -412,7 +345,7 @@ struct BackgroundTasks {
     /// Delivers the file watcher once its (potentially slow) recursive
     /// registration of the workspace tree completes
     watcher: Option<mpsc::Receiver<Result<FileWatcher, notify::Error>>>,
-    /// Mirrors commits across each repo's remotes
+    /// Fetches each repo's remotes and refreshes its status
     sync: SyncManager,
     /// Computes info-panel details for the selected repo
     details: DetailsLoader,
@@ -761,7 +694,7 @@ fn run_app<B: ratatui::backend::Backend>(
         if let Some(watcher) = file_watcher.as_mut() {
             let signals = watcher.poll();
             for repo in signals.refs_changed {
-                background.sync.request_sync(repo, SyncMode::Check, true);
+                background.sync.request_sync(repo, true);
             }
             if signals.refresh && background.loader.is_none() {
                 return Ok(Action::RefreshData);
@@ -801,41 +734,6 @@ fn run_app<B: ratatui::backend::Backend>(
                             let repo_paths = node.collect_repo_paths();
                             if !repo_paths.is_empty() {
                                 return Ok(Action::DropToLibrary(repo_paths));
-                            }
-                        }
-                    }
-                    KeyCode::Char('m') => {
-                        // Toggle mirroring for the selected repo
-                        if app.active_section == Section::Workspace
-                            && let Some(repo_path) = app
-                                .selected_node()
-                                .and_then(|node| node.repo_info.as_ref())
-                                .filter(|repo| !repo.is_submodule)
-                                .map(|repo| repo.path.clone())
-                        {
-                            let interrupt = AtomicBool::new(false);
-                            if let Ok(enabled) =
-                                crate::sync::mirroring_enabled(&repo_path, &interrupt)
-                                && crate::sync::set_mirroring(&repo_path, !enabled).is_ok()
-                            {
-                                // Re-read the info panel's mirror status
-                                app.details.remove(&repo_path);
-                                // Check against the new config right away; a
-                                // Skipped event also clears any stale
-                                // sync-failed overlay
-                                background
-                                    .sync
-                                    .request_sync(repo_path, SyncMode::Check, false);
-                            }
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        // Push pending commits to the selected node's mirrors
-                        if app.active_section == Section::Workspace
-                            && let Some(node) = app.selected_node()
-                        {
-                            for repo in node.collect_syncable_paths() {
-                                background.sync.request_sync(repo, SyncMode::Push, false);
                             }
                         }
                     }
@@ -1117,8 +1015,6 @@ fn help_bindings(app: &App) -> Vec<(&'static str, Color, &'static str)> {
     ];
     if app.active_section == Section::Workspace {
         bindings.push(("d", Color::Yellow, "drop"));
-        bindings.push(("m", Color::Cyan, "mirror on/off"));
-        bindings.push(("s", Color::Green, "sync (push)"));
     }
     bindings.push(("c", Color::Magenta, "clone"));
     bindings.push(("/", Color::Yellow, "search"));
@@ -1195,7 +1091,7 @@ fn render_help_dialog(f: &mut Frame, app: &mut App) {
 
 /// Detail rows rendered under the selected repo: size, worktree line changes
 /// (workspace only — library repos are always clean), and one row per remote
-/// with its mirror state. Fields still being computed by the details loader
+/// with its sync state. Fields still being computed by the details loader
 /// show an ellipsis.
 fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
@@ -1247,43 +1143,17 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
                 Span::styled("none", dim),
             ]));
         }
-        Some(RemotesDetail {
-            mirroring: false,
-            remotes,
-        }) => {
-            // Mirroring can only be toggled on workspace repos
-            let hint = if section == Section::Workspace && !repo.is_submodule {
-                "mirroring off (m to enable)"
-            } else {
-                "mirroring off"
-            };
-            lines.push(Line::from(vec![
-                Span::raw(indent.clone()),
-                Span::styled("Remotes: ", dim),
-                Span::styled(hint, dim),
-            ]));
-            for remote in remotes {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.clone()),
-                    Span::raw("  "),
-                    Span::raw(remote.name.clone()),
-                ]));
-            }
-        }
-        Some(RemotesDetail {
-            mirroring: true,
-            remotes,
-        }) => {
+        Some(RemotesDetail { remotes }) => {
             lines.push(Line::from(vec![
                 Span::raw(indent.clone()),
                 Span::styled("Remotes:", dim),
             ]));
             let outcome = app.sync_outcomes.get(&repo.path);
-            let phase = app.sync_phases.get(&repo.path).copied();
+            let fetching = app.fetching.contains(&repo.path);
             let names: Vec<String> = remotes.iter().map(|r| r.name.clone()).collect();
-            let states = mirror_rows(&names, outcome, phase);
+            let states = remote_rows(&names, outcome, fetching);
             for (remote, (_, state)) in remotes.iter().zip(states) {
-                let mut line = mirror_status_line(remote, state);
+                let mut line = remote_status_line(remote, state);
                 line.spans.insert(0, Span::raw(indent.clone()));
                 lines.push(line);
             }
@@ -1292,52 +1162,39 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
     lines
 }
 
-/// One detail row showing a mirror remote, its sync state, and how many
-/// commits it is behind (when it is)
-fn mirror_status_line(remote: &RemoteInfo, state: MirrorState) -> Line<'static> {
-    // The behind count expresses the same lag a running or pending sync is
-    // already reporting
-    let show_behind = remote.behind > 0
-        && !matches!(
-            state,
-            MirrorState::Fetching | MirrorState::Syncing | MirrorState::PendingPush(_)
-        );
+/// One detail row showing a remote, its sync state, and how many commits it
+/// is behind (when it is)
+fn remote_status_line(remote: &RemoteInfo, state: RemoteSyncState) -> Line<'static> {
+    // While fetching, the behind count is about to be superseded
+    let show_behind = remote.behind > 0 && state != RemoteSyncState::Fetching;
     let status = match state {
-        MirrorState::Fetching => Span::styled("fetching…", Style::default().fg(Color::DarkGray)),
-        MirrorState::Syncing => Span::styled("syncing…", Style::default().fg(Color::Cyan)),
-        MirrorState::InSync => Span::styled("✓ in sync", Style::default().fg(Color::Green)),
-        MirrorState::Pushed(count) => Span::styled(
-            format!(
-                "↑ pushed {} ref{}",
-                count,
-                if count == 1 { "" } else { "s" }
-            ),
+        RemoteSyncState::Fetching => Some(Span::styled(
+            "fetching…",
+            Style::default().fg(Color::DarkGray),
+        )),
+        // A behind remote isn't "in sync"; the behind span below says it all
+        RemoteSyncState::InSync if show_behind => None,
+        RemoteSyncState::InSync => Some(Span::styled(
+            "✓ in sync",
             Style::default().fg(Color::Green),
-        ),
-        MirrorState::PendingPush(count) => Span::styled(
-            format!(
-                "↑ {} ref{} to push (s to sync)",
-                count,
-                if count == 1 { "" } else { "s" }
-            ),
-            Style::default().fg(Color::Yellow),
-        ),
-        MirrorState::Conflict(msg) | MirrorState::PushError(msg) | MirrorState::FetchError(msg) => {
-            Span::styled(format!("⚠ {}", msg), Style::default().fg(Color::Red))
-        }
-        MirrorState::Pending => {
-            Span::styled("not synced yet", Style::default().fg(Color::DarkGray))
-        }
+        )),
+        RemoteSyncState::FetchError(msg) => Some(Span::styled(
+            format!("⚠ {}", msg),
+            Style::default().fg(Color::Red),
+        )),
+        RemoteSyncState::Pending => Some(Span::styled(
+            "not synced yet",
+            Style::default().fg(Color::DarkGray),
+        )),
     };
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::raw(remote.name.clone()),
-        Span::raw(" "),
-        status,
-    ];
+    let mut spans = vec![Span::raw("  "), Span::raw(remote.name.clone())];
+    if let Some(status) = status {
+        spans.push(Span::raw(" "));
+        spans.push(status);
+    }
     if show_behind {
         spans.push(Span::styled(
-            format!("  ↓ {} behind", remote.behind),
+            format!(" ↓ {} behind", remote.behind),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -1571,10 +1428,6 @@ fn tree_list_item<'a>(
             RepoOperationStatus::None => (idle_metadata(repo), Color::DarkGray),
             RepoOperationStatus::Scanning => ("scanning".to_string(), Color::DarkGray),
             RepoOperationStatus::Fetching => ("fetching".to_string(), Color::DarkGray),
-            RepoOperationStatus::Syncing => ("syncing".to_string(), Color::Cyan),
-            RepoOperationStatus::PushPending(count) => {
-                (format!("↑ {} to push", count), Color::Yellow)
-            }
             RepoOperationStatus::SyncFailed(err) => (format!("sync failed: {}", err), Color::Red),
             RepoOperationStatus::Cloning => ("cloning...".to_string(), Color::Magenta),
             RepoOperationStatus::Dropping => ("dropping...".to_string(), Color::Yellow),
@@ -2018,7 +1871,6 @@ mod tests {
                 size_bytes: Some(1024),
                 line_changes: Some((531, 95)),
                 remotes: Some(RemotesDetail {
-                    mirroring: false,
                     remotes: vec![RemoteInfo {
                         name: "origin".to_string(),
                         behind: 0,
@@ -2038,14 +1890,12 @@ mod tests {
         let workspace = render(Section::Workspace);
         assert!(workspace.contains("Size:"));
         assert!(workspace.contains("Changes: +531 -95"));
-        assert!(workspace.contains("Remotes: mirroring off (m to enable)"));
         assert!(workspace.contains("origin"));
 
         let library = render(Section::Library);
         assert!(library.contains("Size:"));
         assert!(!library.contains("Changes:"));
-        assert!(library.contains("Remotes: mirroring off"));
-        assert!(!library.contains("to enable"));
+        assert!(library.contains("origin"));
     }
 
     #[test]
@@ -2062,14 +1912,13 @@ mod tests {
                 size_bytes: Some(1024),
                 line_changes: Some((0, 0)),
                 remotes: Some(RemotesDetail {
-                    mirroring: true,
                     remotes: vec![
                         RemoteInfo {
                             name: "origin".to_string(),
                             behind: 0,
                         },
                         RemoteInfo {
-                            name: "mirror".to_string(),
+                            name: "backup".to_string(),
                             behind: 3,
                         },
                     ],
@@ -2085,7 +1934,7 @@ mod tests {
         assert!(text.contains("Changes: clean"));
         assert!(text.contains("Remotes:"));
         assert!(text.contains("origin not synced yet"));
-        assert!(text.contains("mirror not synced yet"));
+        assert!(text.contains("backup not synced yet"));
         assert!(text.contains("↓ 3 behind"));
         assert!(!text.contains("↓ 0"));
         assert!(!text.contains("branches:"));
@@ -2096,8 +1945,8 @@ mod tests {
         let mut mgr = SyncManager::new("ws".to_string());
         let repo = PathBuf::from("ws/repo");
 
-        mgr.request_sync(repo.clone(), SyncMode::Check, false);
-        mgr.request_sync(repo.clone(), SyncMode::Check, false);
+        mgr.request_sync(repo.clone(), false);
+        mgr.request_sync(repo.clone(), false);
         assert_eq!(mgr.queue.len(), 1);
 
         // Simulate the job being picked up
@@ -2105,9 +1954,9 @@ mod tests {
         mgr.in_flight.insert(repo.clone());
 
         // Requests during a running sync are deferred, not duplicated
-        mgr.request_sync(repo.clone(), SyncMode::Check, false);
+        mgr.request_sync(repo.clone(), false);
         assert!(mgr.queue.is_empty());
-        assert!(mgr.rerun_after.contains_key(&repo));
+        assert!(mgr.rerun_after.contains(&repo));
 
         // Finishing re-queues the deferred request and stamps the cooldown
         mgr.finish(&repo);
@@ -2116,38 +1965,11 @@ mod tests {
 
         // Watcher-triggered requests inside the cooldown are dropped
         mgr.queue.clear();
-        mgr.request_sync(repo.clone(), SyncMode::Check, true);
+        mgr.request_sync(repo.clone(), true);
         assert!(mgr.queue.is_empty());
 
         // Explicit (non-watcher) requests ignore the cooldown
-        mgr.request_sync(repo.clone(), SyncMode::Check, false);
+        mgr.request_sync(repo.clone(), false);
         assert_eq!(mgr.queue.len(), 1);
-    }
-
-    #[test]
-    fn sync_manager_push_upgrades_but_never_downgrades() {
-        let mut mgr = SyncManager::new("ws".to_string());
-        let repo = PathBuf::from("ws/repo");
-
-        // A push request upgrades a queued check
-        mgr.request_sync(repo.clone(), SyncMode::Check, false);
-        mgr.request_sync(repo.clone(), SyncMode::Push, false);
-        assert_eq!(mgr.queue.front(), Some(&(repo.clone(), SyncMode::Push)));
-
-        // A later check leaves the queued push alone
-        mgr.request_sync(repo.clone(), SyncMode::Check, false);
-        assert_eq!(mgr.queue.front(), Some(&(repo.clone(), SyncMode::Push)));
-        assert_eq!(mgr.queue.len(), 1);
-
-        // The same upgrade applies to requests deferred behind a running job
-        mgr.queue.clear();
-        mgr.in_flight.insert(repo.clone());
-        mgr.request_sync(repo.clone(), SyncMode::Check, false);
-        mgr.request_sync(repo.clone(), SyncMode::Push, false);
-        mgr.request_sync(repo.clone(), SyncMode::Check, false);
-        assert_eq!(mgr.rerun_after.get(&repo), Some(&SyncMode::Push));
-
-        mgr.finish(&repo);
-        assert_eq!(mgr.queue.front(), Some(&(repo, SyncMode::Push)));
     }
 }
