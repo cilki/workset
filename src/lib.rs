@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -599,13 +600,34 @@ impl Workspace {
         Ok(())
     }
 
+    /// The path a pattern names inside the workspace, or an error when the
+    /// pattern doesn't name anything the workspace contains.
+    ///
+    /// Patterns are workspace-relative by definition, so an absolute one, or
+    /// one with a `..` component, points outside the workspace. Joining those
+    /// onto the root anyway escaped it: `workset drop ../repo` matched a repo
+    /// the workspace never contained and consumed it, deleting the worktree
+    /// and moving the git directory somewhere `restore` could never find it.
+    pub fn repo_path(&self, pattern: &RepoPattern) -> Result<PathBuf> {
+        let relative = PathBuf::from(pattern.full_path());
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            bail!("'{}' is outside the workspace", pattern.full_path());
+        }
+        Ok(Path::new(&self.path).join(relative))
+    }
+
     /// Search the workspace for local repos matching the given pattern.
     ///
     /// Patterns are always interpreted relative to the workspace root; see
     /// [`resolve_pattern`](Self::resolve_pattern) for turning a pattern the
     /// user typed relative to their current directory into one of these.
     pub fn search(&self, pattern: &RepoPattern) -> Result<Vec<PathBuf>> {
-        find_git_repositories(&Path::new(&self.path).join(pattern.full_path()))
+        find_git_repositories(&self.repo_path(pattern)?)
     }
 
     /// Rewrite a pattern that names a path under `cwd` into a workspace-relative
@@ -690,9 +712,19 @@ impl Workspace {
         force: bool,
         report: &mut DropReport,
     ) -> Result<()> {
-        let relative_path = repo
-            .strip_prefix(&self.path)
-            .unwrap_or(repo)
+        // Everything below moves or deletes the directory, so a path that
+        // isn't under the workspace root must never get this far: the library
+        // can only hold repos the workspace contains, and workset has no
+        // business removing anything else.
+        let relative = repo.strip_prefix(&self.path).ok().filter(|relative| {
+            !relative
+                .components()
+                .any(|component| component == Component::ParentDir)
+        });
+        let Some(relative) = relative else {
+            bail!("{} is outside the workspace", repo.display());
+        };
+        let relative_path = relative
             .to_string_lossy()
             .trim_start_matches('/')
             .to_string();
@@ -728,7 +760,7 @@ impl Workspace {
         if let Some((provider, repo_path)) = pattern.provider_and_path() {
             // Has provider like github.com/user/repo
             let clone_url = format!("https://{}/{}", provider, repo_path);
-            let dest_path = Path::new(&self.path).join(pattern.full_path());
+            let dest_path = self.repo_path(pattern)?;
 
             gix_clone(&clone_url, &dest_path)?;
             return Ok(dest_path);
@@ -1032,6 +1064,89 @@ mod tests {
 
         // Nor the workspace root itself, which names no repo
         assert_eq!(workspace.resolve_pattern(&root, "."), ".");
+    }
+
+    #[test]
+    fn search_refuses_patterns_that_point_outside_the_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(temp_dir.path().join("ws/github.com/user/project/.git")).unwrap();
+        let outside = temp_dir.path().join("outside/repo");
+        fs::create_dir_all(outside.join(".git")).unwrap();
+
+        // A pattern naming a repo the workspace contains still resolves
+        let inside = "github.com/user/project".parse::<RepoPattern>().unwrap();
+        assert_eq!(workspace.search(&inside).unwrap().len(), 1);
+
+        // Everything that leaves the workspace is refused, however it gets out
+        let escaping = [
+            "../outside/repo".to_string(),
+            "github.com/../../outside/repo".to_string(),
+            outside.to_string_lossy().to_string(),
+        ];
+        for pattern in escaping {
+            let error = workspace
+                .search(&pattern.parse::<RepoPattern>().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("outside the workspace"),
+                "pattern {pattern}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_leaves_repos_outside_the_workspace_alone() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let outside = temp_dir.path().join("outside/repo");
+        fs::create_dir_all(&outside).unwrap();
+        gix::init(&outside).unwrap();
+        fs::write(outside.join("file.txt"), "important").unwrap();
+
+        let pattern = "../outside/repo".parse::<RepoPattern>().unwrap();
+        // Deleting and storing in the library are both destructive, and the
+        // repo belongs to neither the workspace nor its library
+        for delete in [false, true] {
+            assert!(workspace.drop(&pattern, delete, true).is_err());
+            assert!(outside.join("file.txt").exists());
+            assert!(outside.join(".git").exists());
+        }
+
+        // Nor was the repo smuggled into the workspace on the way out
+        assert!(
+            find_git_repositories(Path::new(&workspace.path))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn drop_repo_refuses_a_path_outside_the_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let outside = temp_dir.path().join("outside/repo");
+        fs::create_dir_all(&outside).unwrap();
+        gix::init(&outside).unwrap();
+
+        // The last gate before a directory is moved or deleted holds on its
+        // own, for a path that never went through a pattern
+        let mut report = DropReport::default();
+        let through_the_root = PathBuf::from(&workspace.path).join("../outside/repo");
+        for repo in [outside.clone(), through_the_root] {
+            assert!(workspace.drop_repo(&repo, true, true, &mut report).is_err());
+        }
+        assert!(outside.join(".git").exists());
+        assert!(report.is_empty());
     }
 
     #[test]

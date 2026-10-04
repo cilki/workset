@@ -287,6 +287,27 @@ testDropBareNameFromSubdirectory() {
 	[ -d ../../.workset/github.com/user/project ]
 }
 
+## A pattern that leaves the workspace names nothing workset manages, so the
+## drop fails instead of consuming a repo the workspace never contained
+testDropOutsideWorkspaceFails() {
+	newWorkspace
+	createRepo ../outside/repo
+
+	for pattern in ../outside/repo "$(cd ../outside/repo && pwd)"; do
+		output=$(workset drop "$pattern" 2>&1) && exit 1
+		echo "$output" | grep "outside the workspace"
+
+		output=$(workset drop --delete --force "$pattern" 2>&1) && exit 1
+		echo "$output" | grep "outside the workspace"
+	done
+
+	# Worktree, git directory and all, exactly as it was
+	[ -f ../outside/repo/file0.txt ]
+	[ -d ../outside/repo/.git ]
+	[ ! -e outside ]
+	[ ! -e .workset/outside ]
+}
+
 ## --delete says so instead of claiming the repo was dropped to the library
 testDropWithDeleteReportsDeletion() {
 	newWorkspace

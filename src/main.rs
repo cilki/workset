@@ -19,7 +19,6 @@ mod colors {
 /// Clone repositories matching the pattern. Returns false when nothing was
 /// cloned, so the caller can exit non-zero.
 fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
-    use std::path::PathBuf;
     use std::process::Command;
 
     // Check if pattern is for mass cloning from github.com or gitlab.com
@@ -94,8 +93,10 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
                     format!("{}/{}", provider, repo).parse::<workset::RepoPattern>();
 
                 // Check if repo already exists in workspace
-                let repo_path = PathBuf::from(&workspace.path).join(repo_pattern.full_path());
-                if repo_path.exists() {
+                if workspace
+                    .repo_path(&repo_pattern)
+                    .is_ok_and(|repo_path| repo_path.exists())
+                {
                     skipped += 1;
                     continue;
                 }
@@ -126,9 +127,7 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
 /// Clone a single repository. Returns false when the repo was not cloned
 /// because it is already in the workspace or the library.
 fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
-    use std::path::PathBuf;
-
-    let repo_path = PathBuf::from(&workspace.path).join(pattern.full_path());
+    let repo_path = workspace.repo_path(pattern)?;
 
     // Check if repo already exists in workspace
     if repo_path.exists() {
