@@ -23,11 +23,11 @@ then-selected row. Repo rows show "fetching" while a sync runs, and a fetch
 that fails reads `sync failed: fetch <remote>: ...`; when *every* remote
 is unreachable the row says nothing at all — the outcome is marked offline
 instead, which clears the row's sync status and surfaces per remote in the
-info panel as "unreachable". The info panel lists each remote with the
-short id its tracking ref holds for the checked-out branch (omitted when
-HEAD is detached or the remote doesn't track the branch) and how many
-commits it is behind the newest id published to any remote, summed over the
-repo's branches ("↓ N behind").
+info panel as "⚠ unreachable". The info panel lists each remote with its
+state ("✓ in sync", "not synced yet"), the short id its tracking ref holds
+for the checked-out branch (omitted when HEAD is detached or the remote
+doesn't track the branch) and how many commits it is behind the newest id
+published to any remote, summed over the repo's branches ("↓ N behind").
 
 workset never pushes. It does write refs, though, so don't describe a sync
 as leaving the repo untouched: the fetch refreshes

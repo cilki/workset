@@ -1082,7 +1082,7 @@ fn help_bindings(app: &App) -> Vec<(&'static str, Color, &'static str)> {
     bindings
 }
 
-/// Render the keybindings overlay, shown while '?' is held
+/// Render the keybindings overlay, toggled with '?' and also closed by Esc
 fn render_help_dialog(f: &mut Frame, app: &mut App) {
     let bindings = help_bindings(app);
     let image_rows: u16 = if app.help_image.is_some() { 7 } else { 0 };
