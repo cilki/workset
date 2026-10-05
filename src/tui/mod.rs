@@ -623,6 +623,34 @@ fn run_repo_operation<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// What the event loop should do with a key before any mode looks at it
+#[derive(Debug, PartialEq, Eq)]
+enum KeyBinding {
+    /// Ctrl+C, which quits from every mode
+    Quit,
+    /// A character pressed with Ctrl/Alt/Super. The TUI binds bare characters
+    /// only, so these have no binding and must not be mistaken for the
+    /// unmodified key: Ctrl+D is not the 'd' that drops the selected repos,
+    /// and terminals do send it (it's what a terminal delivers for EOF).
+    Ignored,
+    /// Dispatch to the current mode
+    Key(KeyCode),
+}
+
+fn classify_key(key: &event::KeyEvent) -> KeyBinding {
+    // Shift is how a terminal reports '?' and other shifted characters, so it
+    // doesn't make a character modified
+    const MODIFIED: KeyModifiers = KeyModifiers::CONTROL
+        .union(KeyModifiers::ALT)
+        .union(KeyModifiers::SUPER);
+
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyBinding::Quit,
+        KeyCode::Char(_) if key.modifiers.intersects(MODIFIED) => KeyBinding::Ignored,
+        code => KeyBinding::Key(code),
+    }
+}
+
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -708,13 +736,20 @@ fn run_app<B: ratatui::backend::Backend>(
                 continue;
             };
 
+            let code = match classify_key(&key) {
+                // Ctrl+C quits from any mode, including the help overlay and
+                // the search and clone prompts
+                KeyBinding::Quit => return Ok(Action::None),
+                // Every other binding is the bare character, so a modified one
+                // is not it: Ctrl+D is not 'd' and must not drop the selection
+                KeyBinding::Ignored => continue,
+                KeyBinding::Key(code) => code,
+            };
+
             // While the help overlay is open, it swallows all input except
-            // '?'/Esc to close and Ctrl+C to quit
+            // '?'/Esc to close
             if app.help_visible {
-                match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(Action::None);
-                    }
+                match code {
                     KeyCode::Char('?') | KeyCode::Esc => app.help_visible = false,
                     _ => {}
                 }
@@ -722,10 +757,7 @@ fn run_app<B: ratatui::backend::Backend>(
             }
 
             match app.mode {
-                AppMode::Normal => match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(Action::None);
-                    }
+                AppMode::Normal => match code {
                     KeyCode::Char('d') => {
                         // Drop workspace repo(s) to library
                         if app.active_section == Section::Workspace
@@ -805,10 +837,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 },
-                AppMode::Search => match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(Action::None);
-                    }
+                AppMode::Search => match code {
                     KeyCode::Esc => {
                         app.mode = AppMode::Normal;
                         app.clear_search();
@@ -829,7 +858,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 },
-                AppMode::CloneRepo => match key.code {
+                AppMode::CloneRepo => match code {
                     KeyCode::Esc => {
                         app.mode = AppMode::Normal;
                         app.clone_repo_input.clear();
@@ -1855,7 +1884,76 @@ fn get_gitlab_suggestions() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
     use details::RepoDetails;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_mode() {
+        assert_eq!(
+            classify_key(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            KeyBinding::Quit
+        );
+    }
+
+    #[test]
+    fn modified_characters_have_no_binding() {
+        // Ctrl+D is what a terminal sends for EOF; taken for a bare 'd' it
+        // used to drop the selected repos to the library
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for code in [KeyCode::Char('d'), KeyCode::Char('/'), KeyCode::Char('?')] {
+                assert_eq!(
+                    classify_key(&key(code, modifiers)),
+                    KeyBinding::Ignored,
+                    "{code:?} with {modifiers:?}"
+                );
+            }
+        }
+
+        // Only Ctrl+C quits; Alt+c is as unbound as the rest
+        assert_eq!(
+            classify_key(&key(KeyCode::Char('c'), KeyModifiers::ALT)),
+            KeyBinding::Ignored
+        );
+    }
+
+    #[test]
+    fn bare_characters_reach_their_binding() {
+        for (code, modifiers) in [
+            (KeyCode::Char('d'), KeyModifiers::NONE),
+            (KeyCode::Char('c'), KeyModifiers::NONE),
+            // Shift is how a terminal reports a shifted character
+            (KeyCode::Char('?'), KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(classify_key(&key(code, modifiers)), KeyBinding::Key(code));
+        }
+    }
+
+    #[test]
+    fn non_character_keys_keep_their_modifiers_binding() {
+        // Ctrl+Enter still reaches the mode that handles Enter
+        assert_eq!(
+            classify_key(&key(KeyCode::Enter, KeyModifiers::CONTROL)),
+            KeyBinding::Key(KeyCode::Enter)
+        );
+        assert_eq!(
+            classify_key(&key(KeyCode::Esc, KeyModifiers::NONE)),
+            KeyBinding::Key(KeyCode::Esc)
+        );
+    }
 
     #[test]
     fn detail_lines_omit_changes_for_library() {
