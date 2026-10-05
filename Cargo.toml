@@ -3,6 +3,7 @@ name = "workset"
 description = "Manage git repos with worksets"
 version = "0.3.1"
 edition = "2024"
+rust-version = "1.90.0"
 authors = ["cilki"]
 repository = "https://github.com/fossable/workset/"
 readme = "README.md"
