@@ -81,14 +81,22 @@ pub fn find_git_repositories(path: &Path) -> Result<Vec<PathBuf>> {
         for entry in entries.filter_map(|e| e.ok()) {
             let entry_path = entry.path();
 
-            // Only traverse directories
-            if entry_path.is_dir() {
-                match find_git_repositories(&entry_path) {
-                    Ok(mut repos) => found.append(&mut repos),
-                    Err(e) => {
-                        // Log but don't fail on permission errors
-                        debug!(path = %entry_path.display(), error = %e, "Skipping directory");
-                    }
+            // Only traverse real directories. `file_type` doesn't follow
+            // symlinks, so a symlinked directory is skipped: whatever it
+            // points at lives somewhere else, and a repo found through one
+            // would be reported under a workspace-relative path that doesn't
+            // name where it actually is. Acting on that path — dropping it
+            // into the library, deleting it — reaches back out through the
+            // link and touches a repo the workspace never contained.
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+
+            match find_git_repositories(&entry_path) {
+                Ok(mut repos) => found.append(&mut repos),
+                Err(e) => {
+                    // Log but don't fail on permission errors
+                    debug!(path = %entry_path.display(), error = %e, "Skipping directory");
                 }
             }
         }
@@ -716,18 +724,23 @@ impl Workspace {
         // isn't under the workspace root must never get this far: the library
         // can only hold repos the workspace contains, and workset has no
         // business removing anything else.
-        let relative = repo.strip_prefix(&self.path).ok().filter(|relative| {
-            !relative
-                .components()
-                .any(|component| component == Component::ParentDir)
-        });
+        //
+        // Containment is decided on canonical paths. A path that merely spells
+        // out as workspace-relative proves nothing: `..` walks straight out,
+        // and a symlink anywhere along the way points wherever it likes while
+        // still reading as a path under the root. Resolving both ends settles
+        // where the directory about to be moved or deleted really is.
+        let root = std::fs::canonicalize(&self.path).unwrap_or_else(|_| PathBuf::from(&self.path));
+        let relative = std::fs::canonicalize(repo)
+            .ok()
+            .and_then(|resolved| Some(resolved.strip_prefix(&root).ok()?.to_path_buf()))
+            // An empty relative path is the workspace root itself, which is
+            // not a repo to drop even when it happens to contain a `.git`
+            .filter(|relative| !relative.as_os_str().is_empty());
         let Some(relative) = relative else {
             bail!("{} is outside the workspace", repo.display());
         };
-        let relative_path = relative
-            .to_string_lossy()
-            .trim_start_matches('/')
-            .to_string();
+        let relative_path = relative.to_string_lossy().to_string();
 
         // Check for uncommitted or unpushed changes unless --force is given
         if !force {
@@ -1146,6 +1159,83 @@ mod tests {
             assert!(workspace.drop_repo(&repo, true, true, &mut report).is_err());
         }
         assert!(outside.join(".git").exists());
+        assert!(report.is_empty());
+    }
+
+    /// A symlinked directory in the workspace is a path that reads as
+    /// workspace-relative while pointing anywhere at all. Reporting what is
+    /// behind it as a repo of this workspace is what lets `drop` move its git
+    /// directory into the library and delete a worktree that was never here.
+    #[cfg(unix)]
+    #[test]
+    fn find_git_repositories_does_not_follow_symlinks() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("ws");
+        fs::create_dir_all(root.join("inside/.git")).unwrap();
+
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir_all(outside.join("repo/.git")).unwrap();
+
+        // Both a link to a directory holding repos and a link straight at one
+        std::os::unix::fs::symlink(&outside, root.join("linked-dir")).unwrap();
+        std::os::unix::fs::symlink(outside.join("repo"), root.join("linked-repo")).unwrap();
+
+        let repos = find_git_repositories(&root).unwrap();
+        assert_eq!(repos, vec![root.join("inside")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_repo_refuses_a_repo_reached_through_a_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        let outside = temp_dir.path().join("outside/repo");
+        fs::create_dir_all(&outside).unwrap();
+        gix::init(&outside).unwrap();
+        fs::write(outside.join("file.txt"), "important").unwrap();
+
+        std::os::unix::fs::symlink(
+            temp_dir.path().join("outside"),
+            Path::new(&workspace.path).join("linked"),
+        )
+        .unwrap();
+
+        // The path spells out as workspace-relative, but the repo behind it
+        // belongs to neither the workspace nor its library
+        let through_the_link = Path::new(&workspace.path).join("linked/repo");
+        let mut report = DropReport::default();
+        for delete in [false, true] {
+            assert!(
+                workspace
+                    .drop_repo(&through_the_link, delete, true, &mut report)
+                    .is_err()
+            );
+            assert!(outside.join("file.txt").exists());
+            assert!(outside.join(".git").exists());
+        }
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn drop_repo_refuses_the_workspace_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let root = PathBuf::from(&workspace.path);
+        gix::init(&root).unwrap();
+
+        // A workspace that is itself a git repo is still not a repo the
+        // workspace holds; deleting it would take the library with it
+        let mut report = DropReport::default();
+        assert!(workspace.drop_repo(&root, true, true, &mut report).is_err());
+        assert!(root.exists());
+        assert!(Path::new(&workspace.library_path()).exists());
         assert!(report.is_empty());
     }
 
