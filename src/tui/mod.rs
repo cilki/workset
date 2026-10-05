@@ -5,7 +5,7 @@ mod tree;
 mod watcher;
 
 use app::{App, AppMode, Section};
-use details::{DetailsLoader, RemoteInfo, RemoteSyncState, RemotesDetail, remote_rows};
+use details::{DetailsLoader, RemoteInfo, RemoteSyncState, remote_sync_state};
 use crate::get_repo_modification_time;
 use metadata::{format_size, format_time_ago_verbose, get_repo_size};
 use tree::{RepoInfo, RepoOperationStatus, TreeNode};
@@ -1136,23 +1136,22 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
             Span::styled("Remotes: ", dim),
             Span::styled("…", dim),
         ])),
-        Some(detail) if detail.remotes.is_empty() => {
+        Some(remotes) if remotes.is_empty() => {
             lines.push(Line::from(vec![
                 Span::raw(indent.clone()),
                 Span::styled("Remotes: ", dim),
                 Span::styled("none", dim),
             ]));
         }
-        Some(RemotesDetail { remotes }) => {
+        Some(remotes) => {
             lines.push(Line::from(vec![
                 Span::raw(indent.clone()),
                 Span::styled("Remotes:", dim),
             ]));
             let outcome = app.sync_outcomes.get(&repo.path);
             let fetching = app.fetching.contains(&repo.path);
-            let names: Vec<String> = remotes.iter().map(|r| r.name.clone()).collect();
-            let states = remote_rows(&names, outcome, fetching);
-            for (remote, (_, state)) in remotes.iter().zip(states) {
+            for remote in remotes {
+                let state = remote_sync_state(&remote.name, outcome, fetching);
                 let mut line = remote_status_line(remote, state);
                 line.spans.insert(0, Span::raw(indent.clone()));
                 lines.push(line);
@@ -1870,12 +1869,10 @@ mod tests {
             RepoDetails {
                 size_bytes: Some(1024),
                 line_changes: Some((531, 95)),
-                remotes: Some(RemotesDetail {
-                    remotes: vec![RemoteInfo {
-                        name: "origin".to_string(),
-                        behind: 0,
-                    }],
-                }),
+                remotes: Some(vec![RemoteInfo {
+                    name: "origin".to_string(),
+                    behind: 0,
+                }]),
             },
         );
 
@@ -1911,18 +1908,16 @@ mod tests {
             RepoDetails {
                 size_bytes: Some(1024),
                 line_changes: Some((0, 0)),
-                remotes: Some(RemotesDetail {
-                    remotes: vec![
-                        RemoteInfo {
-                            name: "origin".to_string(),
-                            behind: 0,
-                        },
-                        RemoteInfo {
-                            name: "backup".to_string(),
-                            behind: 3,
-                        },
-                    ],
-                }),
+                remotes: Some(vec![
+                    RemoteInfo {
+                        name: "origin".to_string(),
+                        behind: 0,
+                    },
+                    RemoteInfo {
+                        name: "backup".to_string(),
+                        behind: 3,
+                    },
+                ]),
             },
         );
 

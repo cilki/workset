@@ -20,33 +20,14 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for purely local git commands
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefKind {
-    Branch,
-    Tag,
-}
-
-/// Local and per-remote state of one ref, input to the behind-count
+/// Local and per-remote state of one branch, input to the behind-count
 /// computation
 #[derive(Debug, Clone)]
 pub struct RefState {
-    /// Short name, e.g. "main" or "v1.0"
-    pub name: String,
-    pub kind: RefKind,
-    /// Local commit (or tag object) id, if the ref exists locally
+    /// Local commit id, if the branch exists locally
     pub local: Option<String>,
-    /// (remote name, id of this ref on that remote, if it exists there)
+    /// (remote name, id of this branch on that remote, if it exists there)
     pub remotes: Vec<(String, Option<String>)>,
-}
-
-impl RefState {
-    /// Full refname, e.g. "refs/heads/main" or "refs/tags/v1.0"
-    pub fn refname(&self) -> String {
-        match self.kind {
-            RefKind::Branch => format!("refs/heads/{}", self.name),
-            RefKind::Tag => format!("refs/tags/{}", self.name),
-        }
-    }
 }
 
 /// Relationship between the local id and a remote's id for the same ref
@@ -117,9 +98,6 @@ pub fn plan_behind_counts(
 ) -> BTreeMap<String, usize> {
     let mut behind: BTreeMap<String, usize> = BTreeMap::new();
     for state in states {
-        if state.kind != RefKind::Branch {
-            continue;
-        }
         let Some(candidate) = newest_published(state, ancestry) else {
             continue;
         };
@@ -227,7 +205,6 @@ fn collect_ref_states(
     }
 
     let mut branches: BTreeMap<String, String> = BTreeMap::new();
-    let mut tags: BTreeMap<String, String> = BTreeMap::new();
     let mut tracking: BTreeMap<(String, String), String> = BTreeMap::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let Some((id, refname)) = line.split_once(' ') else {
@@ -235,8 +212,6 @@ fn collect_ref_states(
         };
         if let Some(name) = refname.strip_prefix("refs/heads/") {
             branches.insert(name.to_string(), id.to_string());
-        } else if let Some(name) = refname.strip_prefix("refs/tags/") {
-            tags.insert(name.to_string(), id.to_string());
         } else if let Some(rest) = refname.strip_prefix("refs/remotes/") {
             // Remote names are matched against the known list because branch
             // names may themselves contain slashes
@@ -260,15 +235,12 @@ fn collect_ref_states(
 
     let mut states = Vec::new();
     for name in branch_names {
-        let remote_ids = remotes
-            .iter()
-            .map(|r| (r.clone(), tracking.get(&(r.clone(), name.clone())).cloned()))
-            .collect();
         states.push(RefState {
             local: branches.get(&name).cloned(),
-            name,
-            kind: RefKind::Branch,
-            remotes: remote_ids,
+            remotes: remotes
+                .iter()
+                .map(|r| (r.clone(), tracking.get(&(r.clone(), name.clone())).cloned()))
+                .collect(),
         });
     }
 
@@ -441,21 +413,11 @@ mod tests {
 
     fn branch(local: Option<&str>, remotes: &[(&str, Option<&str>)]) -> RefState {
         RefState {
-            name: "main".to_string(),
-            kind: RefKind::Branch,
             local: local.map(|s| s.to_string()),
             remotes: remotes
                 .iter()
                 .map(|(r, id)| (r.to_string(), id.map(|s| s.to_string())))
                 .collect(),
-        }
-    }
-
-    fn tag(local: Option<&str>, remotes: &[(&str, Option<&str>)]) -> RefState {
-        RefState {
-            name: "v1".to_string(),
-            kind: RefKind::Tag,
-            ..branch(local, remotes)
         }
     }
 
@@ -504,12 +466,62 @@ mod tests {
             branch(Some("x"), &[("a", Some("x")), ("backup", Some("y"))]),
             // Never-published ref: no published id to lag behind
             branch(Some("z"), &[("a", None), ("backup", None)]),
-            // Tags are identity-only and carry no commit distance
-            tag(Some("t"), &[("a", Some("t")), ("backup", Some("s"))]),
         ];
         let mut ancestry = stub_ancestry(&[]);
         let mut count = |_: &str, _: &str| -> usize { panic!("no range should be counted") };
         assert!(plan_behind_counts(&states, &mut ancestry, &mut count).is_empty());
+    }
+
+    /// End-to-end over a real repository: `collect_ref_states` reads the
+    /// branch heads and tracking refs, and `behind_counts` turns them into a
+    /// per-remote commit distance.
+    #[test]
+    fn behind_counts_read_from_real_tracking_refs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("work");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        git(&repo, &["init", "--quiet", "--initial-branch=main"]);
+        git(&repo, &["config", "user.name", "workset"]);
+        git(&repo, &["config", "user.email", "workset@example.com"]);
+        git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "one"]);
+        let first = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "two"]);
+
+        // "current" has both commits, "stale" only the first, so it is one
+        // commit behind the newest published id of main
+        for (name, tip) in [("current", "HEAD"), ("stale", first.as_str())] {
+            let remote = temp.path().join(name);
+            git(temp.path(), &["init", "--quiet", "--bare", name]);
+            git(&repo, &["remote", "add", name, &remote.to_string_lossy()]);
+            git(
+                &repo,
+                &["push", "--quiet", name, &format!("{}:refs/heads/main", tip)],
+            );
+        }
+        git(&repo, &["fetch", "--quiet", "--all"]);
+
+        let interrupt = AtomicBool::new(false);
+        let remotes = list_remotes(&repo, &interrupt).unwrap();
+        assert_eq!(remotes, vec!["current".to_string(), "stale".to_string()]);
+        assert_eq!(
+            behind_counts(&repo, &remotes, &interrupt).unwrap(),
+            BTreeMap::from([("stale".to_string(), 1)]),
+        );
     }
 
     #[test]
