@@ -93,6 +93,35 @@ testDropRefusesDirtyRepo() {
 	[ ! -e .workset/dirty-repo ]
 }
 
+## A repo with no commits yet still holds whatever is in its worktree, and
+## that work exists nowhere else, so the drop refuses it too
+testDropRefusesCommitlessRepoWithWork() {
+	newWorkspace
+	createRepo fresh-repo 0
+	echo "unfinished work" >fresh-repo/notes.txt
+	git -C fresh-repo add notes.txt
+	echo "scratch" >fresh-repo/untracked.txt
+
+	output=$(workset drop fresh-repo 2>&1) && exit 1
+	echo "$output" | grep -- "fresh-repo - ⚠ kept (uncommitted changes"
+
+	[ -f fresh-repo/notes.txt ]
+	[ -f fresh-repo/untracked.txt ]
+	[ ! -e .workset/fresh-repo ]
+
+	workset list | grep -- "fresh-repo - ⚠ modified"
+}
+
+## A repo with no commits and nothing in its worktree has no work to lose
+testDropCommitlessEmptyRepo() {
+	newWorkspace
+	createRepo empty-repo 0
+
+	workset drop empty-repo | grep -- "empty-repo - ✓ dropped"
+	[ ! -e empty-repo ]
+	[ -d .workset/empty-repo ]
+}
+
 ## A repo holding commits that aren't on any remote is left where it is
 testDropRefusesUnpushedRepo() {
 	newWorkspace
