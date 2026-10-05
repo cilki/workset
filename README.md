@@ -3,7 +3,7 @@
 </p>
 
 ![License](https://img.shields.io/github/license/fossable/workset)
-![Build](https://github.com/fossable/workset/actions/workflows/test.yml/badge.svg)
+![Build](https://github.com/fossable/workset/actions/workflows/ci.yml/badge.svg)
 ![GitHub repo size](https://img.shields.io/github/repo-size/fossable/workset)
 ![Stars](https://img.shields.io/github/stars/fossable/workset?style=social)
 
@@ -198,14 +198,62 @@ Active repositories: 2
   ⚠ 1 with uncommitted changes
 ```
 
-Running `workset` with no subcommand opens the TUI, where `?` shows the
-keybindings.
+Running `workset` with no subcommand opens the [TUI](#the-tui).
 
 Shell completion fills in the repo paths for you: `restore` suggests everything
 in the library, while `drop` suggests the repos currently in your working set.
 Candidates are always workspace-relative paths, so they work from any directory
 inside the workspace. Under fish, each workspace repo is annotated with its
 status and how long ago it changed.
+
+## The TUI
+
+`workset` with no subcommand opens the interactive view: your working set on the
+left, the library on the right, both as a collapsible tree of the repos' remote
+paths. `?` toggles an overlay listing the keybindings for the panel you're in.
+
+| Key     | Action                                                                  |
+| ------- | ----------------------------------------------------------------------- |
+| `Tab`   | switch section (swap panels when the terminal is too narrow for both)   |
+| `↑`/`↓` | navigate                                                                |
+| `←`/`→` | expand or collapse the selected directory                               |
+| `Enter` | workspace: open a shell in the repo — library: restore it                |
+| `d`     | drop the selected repo, or every repo under the selected directory      |
+| `c`     | clone, with suggestions from `gh` and `glab` when they're installed     |
+| `/`     | fuzzy-filter both trees                                                 |
+| `Esc`   | quit                                                                    |
+
+`Enter` on a workspace repo hands the terminal to `$SHELL` in that repo's
+directory; leaving the shell comes back to the TUI. `d` is held to the same rule
+as `workset drop`, so a repo with uncommitted changes or unpushed commits stays
+where it is and its row says which.
+
+### Remote status
+
+While the TUI is open, workset fetches remotes in the background: for the
+workspace repo your selection comes to rest on — so moving down a long list
+doesn't fetch everything you pass over, and coming back to a row you just
+visited doesn't fetch it again — and for any repo whose remote-tracking refs a
+push from another terminal updates. A repo's row reads `fetching` while that
+runs, and `sync failed: ...` if a fetch comes back with an error. Selecting a
+repo expands it with what the fetch learned:
+
+```
+  ✓ demo                                                           2m ago
+      Size: 8B
+      Changes: clean
+      Remotes:
+        backup ↓ 1 behind
+        origin ✓ in sync
+```
+
+The count is how many commits that remote is behind the newest commit published
+to any of the repo's remotes, added up over its branches; a remote missing a
+branch altogether, or one that has diverged, isn't counted. So a push you made
+from another machine shows up here as the remotes that didn't get it.
+
+workset only ever fetches. It never pushes and never modifies a ref, local or
+remote — bringing a lagging remote up to date is left to you.
 
 ## Keep your working set small
 

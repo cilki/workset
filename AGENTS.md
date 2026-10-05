@@ -19,13 +19,16 @@ selection, with a per-repo cooldown so returning to a row doesn't
 immediately refetch — and for any repo whose `.git/refs/remotes` a push
 from another terminal updates. There is no whole-workspace sync: startup
 and returning from the interactive shell are covered by the fetch of the
-then-selected row. Repo rows show "fetching" while a sync runs, and fetch
-failures surface on the row; when every remote is unreachable the repo is
-reported as offline instead. The info panel lists each remote with the
-short id its tracking ref holds for the checked-out branch (omitted when
-HEAD is detached or the remote doesn't track the branch) and how many
-commits it is behind the newest id published to any remote for each branch
-("↓ N behind"). workset never pushes or modifies refs — local or remote.
+then-selected row. Repo rows show "fetching" while a sync runs, and a
+failed fetch surfaces on the row as "sync failed: ..."; when *every*
+remote fails the repo is assumed offline rather than broken, so the row is
+left unmarked and the info panel marks each remote "⚠ unreachable"
+instead. That panel lists each remote with its state ("✓ in sync", "not
+synced yet"), the short id its tracking ref holds for the checked-out
+branch (omitted when HEAD is detached or the remote doesn't track the
+branch), and how many commits it is behind the newest id published to any
+remote for each branch ("↓ N behind"). workset never pushes or modifies
+refs — local or remote.
 
 The core logic lives in `src/sync.rs`; the TUI scheduling in `SyncManager`
 (`src/tui/mod.rs`).
