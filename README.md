@@ -42,14 +42,29 @@ and `status` always cover the whole workspace, wherever you run them from.
 ❯ cd ..
 ❯ workset drop ./jq
 
-# Or, you can drop all repositories in the current directory (any that have
-# uncommitted or unpushed changes will not be touched).
+# Or, you can drop every repository at or below the current directory (any that
+# have uncommitted or unpushed changes will not be touched). Run from the
+# workspace root, this empties the whole working set.
 ❯ workset drop
 
 # If you don't want a repo to remain in the library, use --delete
 ❯ workset drop --delete ./delete_this_repo
 
 # When you need to work on a repository again, it's restored from the local library
+❯ workset restore jq
+```
+
+A pattern isn't limited to a single repo. `drop` reads its pattern as a path in
+the workspace, so naming a directory takes everything under it, while `restore`
+matches library paths by substring — which is why the bare `jq` above finds
+`github.com/jqlang/jq`, and why a short pattern can pull back more than you
+meant:
+
+```sh
+# Drops github.com/jqlang/jq, github.com/fossable/workset, and so on
+❯ workset drop github.com
+
+# Restores every repo in the library whose path contains 'jq'
 ❯ workset restore jq
 ```
 

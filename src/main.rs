@@ -303,7 +303,8 @@ fn main() -> Result<ExitCode> {
   {subcmd}clone{reset} {arg}<pattern>{reset}                      Clone new repository(ies) to workspace
   {subcmd}restore{reset} {arg}<pattern>{reset}                    Restore repository(ies) from library
   {subcmd}drop{reset} {arg}[pattern]{reset} {arg}[--delete]{reset} {arg}[--force]{reset}  Drop repository(ies) from workspace
-{dim}                                       Without pattern: drops all in current directory
+{dim}                                       A directory pattern drops every repo in it
+                                       Without pattern: drops every repo under the cwd
                                        With --delete: permanently delete (don't store)
                                        With --force: drop even with uncommitted changes{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
@@ -313,9 +314,10 @@ fn main() -> Result<ExitCode> {
   {cmd}workset init{reset}                              Initialize workspace here
   {cmd}workset clone github.com/user/repo{reset}        Clone a new repository
   {cmd}workset clone github.com/user{reset}             Clone all repos from github.com/user
-  {cmd}workset restore repo{reset}                      Restore 'repo' from library
+  {cmd}workset restore repo{reset}                      Restore every library repo matching 'repo'
   {cmd}workset drop ./repo{reset}                       Drop repo (save to library)
-  {cmd}workset drop{reset}                              Drop all repos in current dir
+  {cmd}workset drop github.com{reset}                   Drop every repo under github.com
+  {cmd}workset drop{reset}                              Drop every repo under the current dir
   {cmd}workset drop --delete ./old_repo{reset}          Permanently delete a repo
   {cmd}workset drop --force ./dirty_repo{reset}         Force drop repo and lose any changes
 "#,
