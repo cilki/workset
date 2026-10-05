@@ -240,14 +240,74 @@ Repositories in workspace (/home/user/workspace):
 Library (/home/user/workspace/.workset): 12 repository(ies)
 ```
 
-Running `workset` with no subcommand opens the TUI, where `?` shows the
-keybindings.
+Running `workset` with no subcommand opens the [TUI](#the-tui).
 
 Shell completion fills in the repo paths for you: `restore` suggests everything
 in the library, while `drop` suggests the repos currently in your working set.
 Candidates are always workspace-relative paths, so they work from any directory
 inside the workspace. Under fish, each workspace repo is annotated with its
 status and how long ago it changed.
+
+## The TUI
+
+`workset` with no subcommand opens the interactive view: your working set on the
+left, the library on the right, both as a collapsible tree of the repos' remote
+paths. `?` toggles an overlay listing the keybindings for the panel you're in.
+
+| Key     | Action                                                                  |
+| ------- | ----------------------------------------------------------------------- |
+| `Tab`   | switch section (swap panels when the terminal is too narrow for both)   |
+| `↑`/`↓` | navigate                                                                |
+| `←`/`→` | expand or collapse the selected directory                               |
+| `Enter` | workspace: open a shell in the repo — library: restore it                |
+| `d`     | drop the selected repo, or every repo under the selected directory      |
+| `/`     | fuzzy-filter both trees                                                 |
+| `?`     | show this list                                                          |
+| `Esc`   | quit (`Ctrl+C` too)                                                     |
+
+`d` is offered in the workspace panel only, since there is nothing in the
+library to drop; the overlay leaves the row out while the library has focus.
+
+`Enter` on a workspace repo hands the terminal to `$SHELL` in that repo's
+directory; leaving the shell comes back to the TUI. `d` is held to the same rule
+as `workset drop`, so a repo with uncommitted changes or unpushed commits stays
+where it is and its row says which. Cloning is `workset clone` and has no key of
+its own.
+
+### Remote status
+
+While the TUI is open, workset fetches remotes in the background: for the
+workspace repo your selection comes to rest on — so moving down a long list
+doesn't fetch everything you pass over, and coming back to a row you just
+visited doesn't fetch it again — and for any repo whose remote-tracking refs a
+push from another terminal updates. A repo's row reads `fetching` while that
+runs, and `sync failed: ...` if a fetch comes back with an error. Selecting a
+repo expands it with what the fetch learned:
+
+```
+  ✓ demo                                                           1m ago
+      Size: 11B
+      Changes: clean
+      Remotes:
+        backup 852616d ↓ 1 behind
+        origin f6d98dc ✓ in sync
+```
+
+Each remote is followed by the id its tracking ref holds for the checked-out
+branch — omitted when `HEAD` is detached, or when that remote doesn't have the
+branch — and then by its state: `✓ in sync`, `not synced yet` before the first
+fetch lands, `fetching…` while one is running, or `⚠ unreachable` when it
+couldn't be reached at all.
+
+The count is how many commits that remote is behind the newest commit published
+to any of the repo's remotes, added up over its branches; a remote missing a
+branch altogether, or one that has diverged, isn't counted. So a push you made
+from another machine shows up here as the remotes that didn't get it.
+
+workset only ever fetches — bringing a lagging remote up to date is left to you.
+Nothing is pushed, and your branches and working tree are not touched; what a
+fetch does rewrite is the repo's remote-tracking refs, dropping the ones whose
+branches are gone from the remote and picking up any tags it reaches.
 
 ## Keep your working set small
 
