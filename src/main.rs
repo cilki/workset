@@ -265,7 +265,10 @@ fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    if args.contains("--help") {
+    // Print the usage text and exit. `-h` is handled alongside `--help` so the
+    // conventional short form reaches the help instead of falling through to
+    // the TUI, and before loading the workspace so it works anywhere.
+    if args.contains(["-h", "--help"]) {
         let is_tty = std::io::stdout().is_terminal();
 
         // Wrap text in a color code (and reset) only when writing to a
@@ -288,7 +291,7 @@ fn main() -> Result<ExitCode> {
   Manage git repos with working sets.
 
 {usage_header}
-  {cmd}workset{reset} [--help] [--version]
+  {cmd}workset{reset} [-h|--help] [-V|--version]
   {cmd}workset{reset} init
   {cmd}workset{reset} clone <repo pattern>
   {cmd}workset{reset} restore <repo pattern>
@@ -435,19 +438,30 @@ fn main() -> Result<ExitCode> {
                 false
             }
         },
-        None => {
-            #[cfg(feature = "tui")]
-            {
-                let workspace = require_workspace!(maybe_workspace);
-                // Open TUI for interactive workspace management
-                workset::tui::run_tui(&workspace)?;
-                true
+        // No subcommand: the TUI, unless what we were given was a flag nobody
+        // recognized. Opening the interactive view in answer to `workset -x`
+        // (or a typo like `--helpp`) hides the mistake, and with no terminal
+        // to open it on the user gets an IO error naming nothing they typed.
+        None => match args.finish().first() {
+            Some(unexpected) => {
+                eprintln!("Unrecognized argument: {}", unexpected.to_string_lossy());
+                eprintln!("Run 'workset --help' for usage information");
+                false
             }
-            #[cfg(not(feature = "tui"))]
-            {
-                anyhow::bail!("No command provided. TUI feature is disabled.")
+            None => {
+                #[cfg(feature = "tui")]
+                {
+                    let workspace = require_workspace!(maybe_workspace);
+                    // Open TUI for interactive workspace management
+                    workset::tui::run_tui(&workspace)?;
+                    true
+                }
+                #[cfg(not(feature = "tui"))]
+                {
+                    anyhow::bail!("No command provided. TUI feature is disabled.")
+                }
             }
-        }
+        },
     };
 
     Ok(if succeeded {

@@ -490,6 +490,39 @@ testStatusFromSubdirectory() {
 	workset status | grep "Active repositories: 3"
 }
 
+## --help prints the usage text and works outside any workspace
+testHelpFlag() {
+	output=$(workset --help)
+
+	echo "$output" | grep -E '^USAGE:'
+	echo "$output" | grep -E '^  workset init'
+}
+
+## -h is a short alias for --help, not something that falls through to the TUI
+testHelpShortFlag() {
+	[ "$(workset -h)" = "$(workset --help)" ]
+}
+
+## --help reports usage from inside a workspace too, where a fall-through
+## would have opened the TUI instead
+testHelpFlagInWorkspace() {
+	newWorkspace
+
+	workset --help | grep -E '^USAGE:'
+	workset -h | grep -E '^USAGE:'
+}
+
+## A flag nobody recognizes is reported instead of opening the TUI
+testUnknownFlagFails() {
+	newWorkspace
+
+	output=$(workset --frobnicate 2>&1) && exit 1
+	echo "$output" | grep "Unrecognized argument: --frobnicate"
+
+	output=$(workset -x 2>&1) && exit 1
+	echo "$output" | grep "Unrecognized argument: -x"
+}
+
 ## --version prints the version and works outside any workspace
 testVersionFlag() {
 	workset --version | grep -E '^workset [0-9]+\.[0-9]+\.[0-9]+'
