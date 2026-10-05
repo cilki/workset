@@ -255,7 +255,10 @@ pub enum RepoStatus {
     Clean,
     /// Repository has uncommitted changes or untracked files
     Dirty,
-    /// Repository has no commits yet
+    /// Repository has no commits yet, and nothing uncommitted either: there is
+    /// no work in it that only exists here. A commit-less repo that does hold
+    /// uncommitted work is [`Dirty`](Self::Dirty), because that is the fact
+    /// that matters to anything destructive.
     NoCommits,
     /// Repository has unpushed commits (but is otherwise clean)
     Unpushed,
@@ -284,12 +287,17 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
     let Some(repo) = open_repo(repo_path) else {
         return Ok(RepoStatus::NoCommits);
     };
-    let Some(head_ref) = head_referent(&repo) else {
-        return Ok(RepoStatus::NoCommits);
-    };
+    // Dirtiness is checked before the first commit is looked for, because a
+    // repo without commits still holds whatever is staged or untracked in its
+    // worktree, and that work exists nowhere but here: no commit, no remote,
+    // nothing the library would keep. Reporting it as NoCommits told `drop` it
+    // was safe to move the git directory away and delete the worktree.
     if worktree_is_dirty(&repo, repo_path) {
         return Ok(RepoStatus::Dirty);
     }
+    let Some(head_ref) = head_referent(&repo) else {
+        return Ok(RepoStatus::NoCommits);
+    };
     Ok(check_unpushed_status(&repo, head_ref))
 }
 
@@ -304,18 +312,18 @@ pub fn check_repo_status_and_modification_time(
 
     let dirty_time = dirty_files_time(&repo, repo_path);
 
-    let Some(head_ref) = head_referent(&repo) else {
-        // With no commits, the only timestamp available is from dirty files;
-        // a clean worktree has none, so callers don't render a spurious
-        // "56y ago" from the UNIX epoch.
-        return Ok((RepoStatus::NoCommits, dirty_time));
-    };
-
     if let Some(dirty_time) = dirty_time {
-        // For dirty repos, use the max of last commit time and dirty file times
+        // For dirty repos, use the max of last commit time and dirty file
+        // times. A repo without commits has no commit time, only the files'.
         let commit_time = get_last_commit_time(&repo).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         return Ok((RepoStatus::Dirty, Some(commit_time.max(dirty_time))));
     }
+
+    let Some(head_ref) = head_referent(&repo) else {
+        // No commits and a clean worktree: no timestamp to report at all, so
+        // callers don't render a spurious "56y ago" from the UNIX epoch.
+        return Ok((RepoStatus::NoCommits, None));
+    };
 
     let status = check_unpushed_status(&repo, head_ref);
     Ok((status, get_last_commit_time(&repo).ok()))
@@ -1128,6 +1136,62 @@ mod tests {
     }
 
     #[test]
+    fn commit_less_repo_holding_work_is_dirty_not_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        gix::init(repo_path).unwrap();
+
+        // Freshly initialized and genuinely empty
+        assert_eq!(
+            check_repo_status(repo_path).unwrap(),
+            RepoStatus::NoCommits,
+            "an empty repo has no work to lose"
+        );
+
+        // A file in the worktree is work that exists nowhere else yet, which
+        // the commit-less case used to hide behind NoCommits
+        fs::write(repo_path.join("notes.txt"), "unfinished").unwrap();
+        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+    }
+
+    #[test]
+    fn drop_refuses_a_commit_less_repo_holding_uncommitted_work() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("fresh");
+        fs::create_dir_all(&repo).unwrap();
+        gix::init(&repo).unwrap();
+        fs::write(repo.join("notes.txt"), "unfinished").unwrap();
+
+        let pattern = "fresh".parse::<RepoPattern>().unwrap();
+        let report = workspace.drop(&pattern, false, false).unwrap();
+
+        // Nothing but the worktree holds this file, so the drop leaves it be
+        assert!(report.dropped.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![("fresh".to_string(), RepoStatus::Dirty)]
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "unfinished"
+        );
+
+        // An empty one has nothing to lose and still drops
+        let empty = PathBuf::from(&workspace.path).join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        gix::init(&empty).unwrap();
+        let report = workspace
+            .drop(&"empty".parse::<RepoPattern>().unwrap(), false, false)
+            .unwrap();
+        assert_eq!(report.dropped, vec!["empty".to_string()]);
+        assert!(!empty.exists());
+    }
+
+    #[test]
     fn drop_repo_refuses_a_path_outside_the_workspace() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
@@ -1203,7 +1267,9 @@ mod tests {
         fs::write(repo_path.join("untracked.txt"), "hello").unwrap();
 
         let (status, mod_time) = check_repo_status_and_modification_time(repo_path).unwrap();
-        assert_eq!(status, RepoStatus::NoCommits);
+        // The missing first commit is beside the point: the untracked file is
+        // work that exists nowhere else, which is what Dirty means.
+        assert_eq!(status, RepoStatus::Dirty);
         // With an untracked file present there is a real time to report,
         // and it must not be the UNIX_EPOCH sentinel.
         let time = mod_time.expect("expected a modification time from the untracked file");
