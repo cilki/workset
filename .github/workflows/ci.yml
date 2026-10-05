@@ -1,0 +1,27 @@
+name: CI
+on:
+  pull_request:
+    branches:
+    - main
+    - master
+  push:
+    branches:
+    - main
+    - master
+jobs:
+  rust-test:
+    runs-on: ubuntu-latest
+    container: rust:latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        key: rust-cache
+        path: |-
+          target/
+          .cargo/
+    - name: Run tests
+      run: cargo test --all-features
+    timeout-minutes: 30

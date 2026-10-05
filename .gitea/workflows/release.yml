@@ -1,0 +1,17 @@
+name: Release
+on:
+  push:
+    tags:
+    - v*
+jobs:
+  rust-release:
+    runs-on: ubuntu-latest
+    container: rust:latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Publish to crates.io
+      run: cargo publish
+    timeout-minutes: 15
