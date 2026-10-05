@@ -411,14 +411,17 @@ fn main() -> Result<ExitCode> {
 {commands_header}
   {subcmd}init{reset}                                 Initialize a workspace in current directory
   {subcmd}clone{reset} {arg}<pattern>...{reset}                   Clone new repository(ies) to workspace
-{dim}                                       A clone URL, with or without '.git', works too{reset}
+{dim}                                       A clone URL, with or without '.git', works too
+                                       A provider/user pattern clones every repo that user
+                                       owns, which needs 'gh' or 'glab' logged in{reset}
   {subcmd}restore{reset} {arg}<pattern>...{reset}                 Restore repository(ies) from library
   {subcmd}drop{reset} {arg}[pattern]{reset} {arg}[--delete]{reset} {arg}[--force]{reset}  Drop repository(ies) from workspace
 {dim}                                       Several patterns can be given at once
                                        A directory pattern drops every repo in it
                                        Without pattern: drops every repo under the cwd
                                        With --delete: permanently delete (don't store)
-                                       With --force: drop even with uncommitted changes{reset}
+                                       With --force: drop despite uncommitted changes or
+                                       unpushed commits{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
   {subcmd}status{reset}                               Show workspace summary and statistics
 

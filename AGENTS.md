@@ -7,7 +7,7 @@ between the two should be quick and easy.
 | **Workspace**   | Local directory where you clone Git repositories. Initialized with `workset init`.                                                                                                  |
 | **Library**     | The workspace's own `.workset/` directory, created by `workset init`, where **workset** keeps your repos when they're not in your workspace.                                        |
 | **Working Set** | Set of repos in your workspace at any given time.                                                                                                                                   |
-| **Drop**        | Move a repo from your workspace to the library. The repo disappears from your workspace, but remains in the library. Only "clean" repos without uncommitted changes can be dropped. |
+| **Drop**        | Move a repo from your workspace to the library. The repo disappears from your workspace, but remains in the library. A repo holding uncommitted changes or unpushed commits is left alone unless you pass `--force`. |
 | **Restore**     | Bringing a repos from the library back into your workspace.                                                                                                                         |
 
 ## Remote status

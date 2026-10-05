@@ -16,7 +16,7 @@
 | **Workspace**   | Local directory where you clone Git repositories. Initialized with `workset init`.                                                                                                  |
 | **Library**     | The workspace's own `.workset/` directory, created by `workset init`, where **workset** keeps your repos when they're not in your workspace.                                        |
 | **Working Set** | Set of repos in your workspace at any given time.                                                                                                                                   |
-| **Drop**        | Move a repo from your workspace to the library. The repo disappears from your workspace, but remains in the library. Only "clean" repos without uncommitted changes can be dropped. |
+| **Drop**        | Move a repo from your workspace to the library. The repo disappears from your workspace, but remains in the library. A repo holding uncommitted changes or unpushed commits is left alone unless you pass `--force`. |
 | **Restore**     | Bringing a repos from the library back into your workspace.                                                                                                                         |
 
 ![](./.github/assets/main.gif)
@@ -25,7 +25,8 @@
 
 `workset init` and a bare `workset drop` act on the current directory. `clone`
 and `restore` place a repo at its full path under the workspace root, and `list`
-and `status` always cover the whole workspace, wherever you run them from.
+(aliased `ls`) and `status` always cover the whole workspace, wherever you run
+them from.
 
 ```sh
 # Initialize a new workspace in the current directory
@@ -39,6 +40,11 @@ and `status` always cover the whole workspace, wherever you run them from.
 # every spelling below names that same github.com/jqlang/jq
 ❯ workset clone https://github.com/jqlang/jq.git
 ❯ workset clone git@github.com:jqlang/jq.git
+
+# Naming a user or org instead of a single repo clones everything they own.
+# The repo list comes from the provider's own CLI, so this needs `gh` (for
+# github.com) or `glab` (for gitlab.com) installed and logged in.
+❯ workset clone github.com/jqlang
 
 # The repository's local path always reflects the remote path
 ❯ cd ./github.com/jqlang/jq
