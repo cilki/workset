@@ -18,14 +18,8 @@ pub struct RepoDetails {
     /// Lines (added, removed) across uncommitted changes and untracked files;
     /// (0, 0) = clean
     pub line_changes: Option<(usize, usize)>,
-    /// The repo's remotes and their sync state
-    pub remotes: Option<RemotesDetail>,
-}
-
-/// The repo's remotes as shown in the detail rows
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RemotesDetail {
-    pub remotes: Vec<RemoteInfo>,
+    /// The repo's remotes, as shown in the detail rows
+    pub remotes: Option<Vec<RemoteInfo>>,
 }
 
 /// One remote as shown in the repo detail
@@ -53,30 +47,19 @@ pub enum RemoteSyncState {
     Pending,
 }
 
-/// Merge the remotes with the last sync outcome and whether a fetch is
-/// currently running into one display row per remote
-pub fn remote_rows(
-    remotes: &[String],
+/// What to show for one remote, given the last sync outcome for its repo and
+/// whether a fetch is running right now
+pub fn remote_sync_state(
+    remote: &str,
     outcome: Option<&SyncOutcome>,
     fetching: bool,
-) -> Vec<(String, RemoteSyncState)> {
-    remotes
-        .iter()
-        .map(|name| {
-            let state = if fetching {
-                RemoteSyncState::Fetching
-            } else {
-                match outcome {
-                    None => RemoteSyncState::Pending,
-                    Some(o) => remote_state_from_outcome(name, o),
-                }
-            };
-            (name.clone(), state)
-        })
-        .collect()
-}
-
-fn remote_state_from_outcome(remote: &str, outcome: &SyncOutcome) -> RemoteSyncState {
+) -> RemoteSyncState {
+    if fetching {
+        return RemoteSyncState::Fetching;
+    }
+    let Some(outcome) = outcome else {
+        return RemoteSyncState::Pending;
+    };
     if let Some((_, error)) = outcome.fetch_errors.iter().find(|(r, _)| r == remote) {
         return RemoteSyncState::FetchError(error.clone());
     }
@@ -92,7 +75,7 @@ fn remote_state_from_outcome(remote: &str, outcome: &SyncOutcome) -> RemoteSyncS
 enum DetailsEvent {
     Size(PathBuf, u64),
     Changes(PathBuf, (usize, usize)),
-    Remotes(PathBuf, RemotesDetail),
+    Remotes(PathBuf, Vec<RemoteInfo>),
     /// The job for the given repo finished
     Done(PathBuf),
 }
@@ -220,45 +203,37 @@ impl DetailsLoader {
 }
 
 /// List the repo's remotes, annotating each with how far behind it is
-fn load_remotes(path: &Path, interrupt: &AtomicBool) -> RemotesDetail {
+fn load_remotes(path: &Path, interrupt: &AtomicBool) -> Vec<RemoteInfo> {
     let names = crate::sync::list_remotes(path, interrupt).unwrap_or_default();
     let behind = crate::sync::behind_counts(path, &names, interrupt).unwrap_or_default();
-    RemotesDetail {
-        remotes: names
-            .into_iter()
-            .map(|name| RemoteInfo {
-                behind: behind.get(&name).copied().unwrap_or(0),
-                name,
-            })
-            .collect(),
-    }
+    names
+        .into_iter()
+        .map(|name| RemoteInfo {
+            behind: behind.get(&name).copied().unwrap_or(0),
+            name,
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn remotes(names: &[&str]) -> Vec<String> {
-        names.iter().map(|n| n.to_string()).collect()
-    }
-
     #[test]
     fn no_outcome_reports_pending() {
-        let rows = remote_rows(&remotes(&["a", "b"]), None, false);
         assert_eq!(
-            rows,
-            vec![
-                ("a".to_string(), RemoteSyncState::Pending),
-                ("b".to_string(), RemoteSyncState::Pending),
-            ]
+            remote_sync_state("a", None, false),
+            RemoteSyncState::Pending
         );
     }
 
     #[test]
     fn fetching_overrides_outcome() {
         let outcome = SyncOutcome::default();
-        let rows = remote_rows(&remotes(&["a"]), Some(&outcome), true);
-        assert_eq!(rows, vec![("a".to_string(), RemoteSyncState::Fetching)]);
+        assert_eq!(
+            remote_sync_state("a", Some(&outcome), true),
+            RemoteSyncState::Fetching
+        );
     }
 
     #[test]
@@ -267,19 +242,9 @@ mod tests {
             offline: true,
             ..Default::default()
         };
-        let rows = remote_rows(&remotes(&["a", "b"]), Some(&outcome), false);
         assert_eq!(
-            rows,
-            vec![
-                (
-                    "a".to_string(),
-                    RemoteSyncState::FetchError("unreachable".to_string())
-                ),
-                (
-                    "b".to_string(),
-                    RemoteSyncState::FetchError("unreachable".to_string())
-                ),
-            ]
+            remote_sync_state("a", Some(&outcome), false),
+            RemoteSyncState::FetchError("unreachable".to_string())
         );
     }
 
@@ -289,23 +254,22 @@ mod tests {
             fetch_errors: vec![("b".to_string(), "could not resolve host".to_string())],
             ..Default::default()
         };
-        let rows = remote_rows(&remotes(&["a", "b"]), Some(&outcome), false);
         assert_eq!(
-            rows,
-            vec![
-                ("a".to_string(), RemoteSyncState::InSync),
-                (
-                    "b".to_string(),
-                    RemoteSyncState::FetchError("could not resolve host".to_string())
-                ),
-            ]
+            remote_sync_state("a", Some(&outcome), false),
+            RemoteSyncState::InSync
+        );
+        assert_eq!(
+            remote_sync_state("b", Some(&outcome), false),
+            RemoteSyncState::FetchError("could not resolve host".to_string())
         );
     }
 
     #[test]
     fn clean_outcome_reports_in_sync() {
         let outcome = SyncOutcome::default();
-        let rows = remote_rows(&remotes(&["a"]), Some(&outcome), false);
-        assert_eq!(rows, vec![("a".to_string(), RemoteSyncState::InSync)]);
+        assert_eq!(
+            remote_sync_state("a", Some(&outcome), false),
+            RemoteSyncState::InSync
+        );
     }
 }
