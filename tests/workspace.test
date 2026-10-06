@@ -142,6 +142,106 @@ testDropRefusesUnpushedRepo() {
 	[ ! -e .workset/unpushed-repo ]
 }
 
+## Every pattern on the command line is dropped, not just the first
+testDropSeveralPatterns() {
+	newWorkspace
+	createRepo repo1
+	createRepo repo2
+	createRepo repo3
+
+	output=$(workset drop repo1 repo3)
+	echo "$output" | grep -- "repo1 - ✓ dropped"
+	echo "$output" | grep -- "repo3 - ✓ dropped"
+
+	[ ! -e repo1 ]
+	[ ! -e repo3 ]
+	[ -d repo2/.git ]
+}
+
+## Several patterns can be restored in one request too
+testRestoreSeveralPatterns() {
+	newWorkspace
+	createRepo repo1
+	createRepo repo2
+	workset drop repo1 repo2
+
+	workset restore repo1 repo2
+
+	[ -f repo1/file0.txt ]
+	[ -f repo2/file0.txt ]
+}
+
+## Among several patterns, the one that matches nothing is named and fails the
+## request, while the others are still dropped
+testDropNamesEachUnmatchedPattern() {
+	newWorkspace
+	createRepo repo1
+
+	output=$(workset drop repo1 no-such-repo 2>&1) && exit 1
+	echo "$output" | grep -- "repo1 - ✓ dropped"
+	echo "$output" | grep "No repository in the workspace matches 'no-such-repo'"
+
+	[ ! -e repo1 ]
+}
+
+## A pattern left in place by its outstanding changes fails the request even
+## when another pattern was dropped
+testDropSeveralPatternsReportsPartialSuccess() {
+	newWorkspace
+	createRepo clean-repo
+	createRepo dirty-repo
+	echo "uncommitted changes" >dirty-repo/dirty.txt
+
+	output=$(workset drop clean-repo dirty-repo 2>&1) && exit 1
+	echo "$output" | grep -- "clean-repo - ✓ dropped"
+	echo "$output" | grep -- "dirty-repo - ⚠ kept (uncommitted changes"
+
+	[ ! -e clean-repo ]
+	[ -d dirty-repo/.git ]
+}
+
+## A mistyped flag is reported as the unrecognized argument it is, instead of
+## being taken for a repo pattern (which, for --force, would have dropped a
+## repo nobody asked about)
+testDropRejectsMistypedFlag() {
+	newWorkspace
+	createRepo repo1
+
+	for flag in --delet --forc; do
+		output=$(workset drop $flag repo1 2>&1) && exit 1
+		echo "$output" | grep "Unrecognized argument: $flag"
+
+		[ -d repo1/.git ]
+		[ ! -e .workset/repo1 ]
+	done
+}
+
+## Clone and restore reject a mistyped flag the same way
+testCloneAndRestoreRejectMistypedFlag() {
+	newWorkspace
+
+	output=$(workset clone --oops github.com/user/repo 2>&1) && exit 1
+	echo "$output" | grep "Unrecognized argument: --oops"
+	[ ! -e github.com ]
+
+	output=$(workset restore --oops anything 2>&1) && exit 1
+	echo "$output" | grep "Unrecognized argument: --oops"
+}
+
+## The commands that take no pattern say so instead of ignoring one
+testArgumentlessCommandsRejectExtraArguments() {
+	newWorkspace
+	createRepo repo1
+
+	for command in init list ls status; do
+		output=$(workset $command extra 2>&1) && exit 1
+		echo "$output" | grep "Unrecognized argument: extra"
+	done
+
+	output=$(workset status --oops 2>&1) && exit 1
+	echo "$output" | grep "Unrecognized argument: --oops"
+}
+
 ## A pattern that matches nothing is reported as a failure
 testDropUnmatchedPatternFails() {
 	newWorkspace

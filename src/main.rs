@@ -161,6 +161,51 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
     }
 }
 
+/// The free arguments a subcommand was given, or the first flag-like argument
+/// nobody recognized.
+///
+/// pico-args leaves whatever it didn't parse on the command line, so without
+/// looking at the leftovers a mistyped `--delet` is silently taken as a repo
+/// pattern and reported as a repo that doesn't exist, and every pattern after
+/// the first is thrown away without a word.
+fn free_args(args: pico_args::Arguments) -> std::result::Result<Vec<String>, String> {
+    args.finish()
+        .into_iter()
+        .map(|arg| {
+            let arg = arg.to_string_lossy().into_owned();
+            if arg.starts_with('-') {
+                Err(arg)
+            } else {
+                Ok(arg)
+            }
+        })
+        .collect()
+}
+
+/// Run `action` over every pattern the user named, reporting a pattern that
+/// couldn't be handled at all rather than abandoning the rest of the request.
+/// Returns whether every pattern did what was asked of it, so the caller can
+/// exit non-zero.
+fn for_each_pattern(
+    patterns: &[String],
+    verb: &str,
+    mut action: impl FnMut(&str) -> Result<bool>,
+) -> bool {
+    let mut succeeded = true;
+
+    for requested in patterns {
+        match action(requested) {
+            Ok(done) => succeeded &= done,
+            Err(e) => {
+                eprintln!("Failed to {} '{}': {:#}", verb, requested, e);
+                succeeded = false;
+            }
+        }
+    }
+
+    succeeded
+}
+
 /// Workspace-relative paths of the checked-out repos whose path contains
 /// `pattern`, matching how the library is searched.
 fn workspace_matches(workspace: &Workspace, pattern: &str) -> Result<Vec<String>> {
@@ -293,9 +338,9 @@ fn main() -> Result<ExitCode> {
 {usage_header}
   {cmd}workset{reset} [-h|--help] [-V|--version]
   {cmd}workset{reset} init
-  {cmd}workset{reset} clone <repo pattern>
-  {cmd}workset{reset} restore <repo pattern>
-  {cmd}workset{reset} drop [repo pattern] [--delete] [--force]
+  {cmd}workset{reset} clone <repo pattern>...
+  {cmd}workset{reset} restore <repo pattern>...
+  {cmd}workset{reset} drop [repo pattern]... [--delete] [--force]
   {cmd}workset{reset} list
   {cmd}workset{reset} status
 {dim}
@@ -303,10 +348,11 @@ fn main() -> Result<ExitCode> {
 
 {commands_header}
   {subcmd}init{reset}                                 Initialize a workspace in current directory
-  {subcmd}clone{reset} {arg}<pattern>{reset}                      Clone new repository(ies) to workspace
-  {subcmd}restore{reset} {arg}<pattern>{reset}                    Restore repository(ies) from library
+  {subcmd}clone{reset} {arg}<pattern>...{reset}                   Clone new repository(ies) to workspace
+  {subcmd}restore{reset} {arg}<pattern>...{reset}                 Restore repository(ies) from library
   {subcmd}drop{reset} {arg}[pattern]{reset} {arg}[--delete]{reset} {arg}[--force]{reset}  Drop repository(ies) from workspace
-{dim}                                       A directory pattern drops every repo in it
+{dim}                                       Several patterns can be given at once
+                                       A directory pattern drops every repo in it
                                        Without pattern: drops every repo under the cwd
                                        With --delete: permanently delete (don't store)
                                        With --force: drop even with uncommitted changes{reset}
@@ -320,6 +366,7 @@ fn main() -> Result<ExitCode> {
   {cmd}workset restore repo{reset}                      Restore every library repo matching 'repo'
   {cmd}workset drop ./repo{reset}                       Drop repo (save to library)
   {cmd}workset drop github.com{reset}                   Drop every repo under github.com
+  {cmd}workset drop repo1 repo2{reset}                  Drop both repos in one request
   {cmd}workset drop{reset}                              Drop every repo under the current dir
   {cmd}workset drop --delete ./old_repo{reset}          Permanently delete a repo
   {cmd}workset drop --force ./dirty_repo{reset}         Force drop repo and lose any changes
@@ -358,6 +405,35 @@ fn main() -> Result<ExitCode> {
         };
     }
 
+    // Take the repo patterns a subcommand was given, or report the first
+    // argument nobody recognized and give up: an unrecognized flag taken as a
+    // pattern would be reported as a repo that doesn't exist, and for `drop` it
+    // could name a repo to consume that the user never asked for.
+    macro_rules! patterns {
+        ($args:expr) => {
+            match free_args($args) {
+                Ok(patterns) => patterns,
+                Err(unexpected) => {
+                    eprintln!("Unrecognized argument: {}", unexpected);
+                    eprintln!("Run 'workset --help' for usage information");
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+        };
+    }
+
+    // Same, for the subcommands that take no arguments at all: a stray one is
+    // a mistake, and silently ignoring it hides it.
+    macro_rules! no_patterns {
+        ($args:expr) => {
+            if let Some(unexpected) = patterns!($args).first() {
+                eprintln!("Unrecognized argument: {}", unexpected);
+                eprintln!("Run 'workset --help' for usage information");
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+    }
+
     // Whether the subcommand did what it was asked to do. Anything the user
     // requested but didn't get (a repo that couldn't be dropped, a pattern that
     // matched nothing, a missing argument) clears this so the process exits
@@ -365,6 +441,7 @@ fn main() -> Result<ExitCode> {
     let succeeded = match args.subcommand()? {
         Some(command) => match command.as_str() {
             "init" => {
+                no_patterns!(args);
                 let workspace_path = std::env::current_dir()?;
                 let library_path = workspace_path.join(".workset");
 
@@ -381,24 +458,30 @@ fn main() -> Result<ExitCode> {
             }
             "clone" => {
                 let workspace = require_workspace!(maybe_workspace);
-                if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
-                    let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
-                    clone_repos(&workspace, &pattern)?
-                } else {
+                let patterns = patterns!(args);
+                if patterns.is_empty() {
                     eprintln!("Missing repository pattern");
-                    eprintln!("Usage: workset clone <pattern>");
+                    eprintln!("Usage: workset clone <pattern>...");
                     false
+                } else {
+                    for_each_pattern(&patterns, "clone", |requested| {
+                        let Ok(pattern) = requested.parse::<workset::RepoPattern>();
+                        clone_repos(&workspace, &pattern)
+                    })
                 }
             }
             "restore" => {
                 let workspace = require_workspace!(maybe_workspace);
-                if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
-                    let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
-                    restore_repos(&workspace, &pattern)?
-                } else {
+                let patterns = patterns!(args);
+                if patterns.is_empty() {
                     eprintln!("Missing repository pattern");
-                    eprintln!("Usage: workset restore <pattern>");
+                    eprintln!("Usage: workset restore <pattern>...");
                     false
+                } else {
+                    for_each_pattern(&patterns, "restore", |requested| {
+                        let Ok(pattern) = requested.parse::<workset::RepoPattern>();
+                        restore_repos(&workspace, &pattern)
+                    })
                 }
             }
             "drop" => {
@@ -406,29 +489,17 @@ fn main() -> Result<ExitCode> {
                 let delete = args.contains("--delete");
                 let force = args.contains("--force");
 
-                let requested = args.opt_free_from_str::<String>()?;
-                let report = match &requested {
-                    Some(path) => {
-                        // Patterns are relative to the current directory first,
-                        // so 'workset drop ./repo' works from the repo's parent
-                        let cwd = std::env::current_dir()?;
-                        let Ok(pattern) = workspace
-                            .resolve_pattern(&cwd, path)
-                            .parse::<workset::RepoPattern>();
-                        workspace.drop(&pattern, delete, force)?
-                    }
-                    // Drop all repos in current directory
-                    None => workspace.drop_all(delete, force)?,
-                };
-                report_drop(&report, delete, requested.as_deref())
+                drop_repos(&workspace, &patterns!(args), delete, force)?
             }
             "list" | "ls" => {
                 let workspace = require_workspace!(maybe_workspace);
+                no_patterns!(args);
                 list_workspace_status(&workspace)?;
                 true
             }
             "status" => {
                 let workspace = require_workspace!(maybe_workspace);
+                no_patterns!(args);
                 show_workspace_summary(&workspace)?;
                 true
             }
@@ -471,10 +542,52 @@ fn main() -> Result<ExitCode> {
     })
 }
 
-/// Report what a drop request did and whether it did everything asked. A repo
-/// left in place because of outstanding changes, or a pattern that matched
-/// nothing, counts as a failure, so the caller can exit non-zero.
-fn report_drop(report: &workset::DropReport, delete: bool, pattern: Option<&str>) -> bool {
+/// Drop every repo named by `patterns`, or every repo under the current
+/// directory when no pattern was given. Returns whether the whole request went
+/// through: a repo left in place because of outstanding changes, a pattern that
+/// matched nothing, and a pattern that couldn't be dropped at all each count as
+/// a failure, so the caller can exit non-zero.
+fn drop_repos(
+    workspace: &Workspace,
+    patterns: &[String],
+    delete: bool,
+    force: bool,
+) -> Result<bool> {
+    if patterns.is_empty() {
+        let report = workspace.drop_all(delete, force)?;
+        report_drop(&report, delete);
+
+        if report.is_empty() {
+            eprintln!("No repositories found in the current directory");
+            return Ok(false);
+        }
+        return Ok(report.skipped.is_empty());
+    }
+
+    // Every pattern is dropped and reported on its own, so one that names
+    // nothing (or names something workset doesn't manage) is called out by name
+    // instead of vanishing into a combined total, and the ones that do match
+    // are still dropped. Patterns are relative to the current directory first,
+    // so 'workset drop ./repo' works from the repo's parent.
+    let cwd = std::env::current_dir()?;
+
+    Ok(for_each_pattern(patterns, "drop", |requested| {
+        let Ok(pattern) = workspace
+            .resolve_pattern(&cwd, requested)
+            .parse::<workset::RepoPattern>();
+
+        let report = workspace.drop(&pattern, delete, force)?;
+        report_drop(&report, delete);
+        if report.is_empty() {
+            eprintln!("No repository in the workspace matches '{}'", requested);
+        }
+        Ok(!report.is_empty() && report.skipped.is_empty())
+    }))
+}
+
+/// Print what dropping one pattern did: the repos that moved, and the ones left
+/// where they are with the status that blocked them.
+fn report_drop(report: &workset::DropReport, delete: bool) {
     let verb = if delete { "deleted" } else { "dropped" };
 
     for repo in &report.dropped {
@@ -496,16 +609,6 @@ fn report_drop(report: &workset::DropReport, delete: bool, pattern: Option<&str>
             repo, reason
         );
     }
-
-    if report.is_empty() {
-        match pattern {
-            Some(pattern) => eprintln!("No repository in the workspace matches '{}'", pattern),
-            None => eprintln!("No repositories found in the current directory"),
-        }
-        return false;
-    }
-
-    report.skipped.is_empty()
 }
 
 /// List all repositories in the workspace with their status
