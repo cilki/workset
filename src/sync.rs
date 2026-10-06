@@ -30,17 +30,6 @@ pub struct RefState {
     pub remotes: Vec<(String, Option<String>)>,
 }
 
-/// Relationship between the local id and a remote's id for the same ref
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ancestry {
-    Equal,
-    /// The remote id is an ancestor of the local id
-    LocalAhead,
-    /// The local id is an ancestor of the remote id
-    LocalBehind,
-    Diverged,
-}
-
 /// Result of syncing one repository
 #[derive(Debug, Default)]
 pub struct SyncOutcome {
@@ -67,7 +56,7 @@ impl SyncOutcome {
 /// was never pushed anywhere.
 fn newest_published(
     state: &RefState,
-    ancestry: &mut dyn FnMut(&str, &str) -> Ancestry,
+    is_ancestor: &mut dyn FnMut(&str, &str) -> bool,
 ) -> Option<String> {
     let first_published = state.remotes.iter().find_map(|(_, id)| id.as_deref())?;
     let local_published = state.local.as_deref().filter(|local| {
@@ -80,7 +69,7 @@ fn newest_published(
     for (_, id) in &state.remotes {
         if let Some(id) = id.as_deref()
             && id != candidate
-            && ancestry(candidate, id) == Ancestry::LocalBehind
+            && is_ancestor(candidate, id)
         {
             candidate = id;
         }
@@ -91,20 +80,25 @@ fn newest_published(
 /// Sum how many commits each remote is behind the newest published id of the
 /// given branch states. Remotes missing a ref or diverged contribute nothing
 /// — only plain fast-forward distance is counted.
+///
+/// `is_ancestor(a, b)` answers whether `a` is reachable from `b`, which is
+/// the only question the plan asks about history: ids that differ are
+/// distinct commits, so one being an ancestor of the other already rules out
+/// the reverse, and a pair related in neither direction has diverged.
 pub fn plan_behind_counts(
     states: &[RefState],
-    ancestry: &mut dyn FnMut(&str, &str) -> Ancestry,
+    is_ancestor: &mut dyn FnMut(&str, &str) -> bool,
     count_range: &mut dyn FnMut(&str, &str) -> usize,
 ) -> BTreeMap<String, usize> {
     let mut behind: BTreeMap<String, usize> = BTreeMap::new();
     for state in states {
-        let Some(candidate) = newest_published(state, ancestry) else {
+        let Some(candidate) = newest_published(state, is_ancestor) else {
             continue;
         };
         for (remote, id) in &state.remotes {
             if let Some(id) = id.as_deref()
                 && id != candidate
-                && ancestry(&candidate, id) == Ancestry::LocalAhead
+                && is_ancestor(id, &candidate)
             {
                 let count = count_range(id, &candidate);
                 if count > 0 {
@@ -125,8 +119,8 @@ pub fn behind_counts(
     interrupt: &AtomicBool,
 ) -> Result<BTreeMap<String, usize>> {
     let states = collect_ref_states(repo_path, remotes, interrupt)?;
-    let mut ancestry =
-        |local: &str, other: &str| compare_ancestry(repo_path, local, other, interrupt);
+    let mut is_ancestor =
+        |ancestor: &str, descendant: &str| is_ancestor(repo_path, ancestor, descendant, interrupt);
     let mut count_range = |behind_id: &str, candidate: &str| {
         let range = format!("{}..{}", behind_id, candidate);
         run_git(
@@ -140,7 +134,7 @@ pub fn behind_counts(
         .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
         .unwrap_or(0)
     };
-    Ok(plan_behind_counts(&states, &mut ancestry, &mut count_range))
+    Ok(plan_behind_counts(&states, &mut is_ancestor, &mut count_range))
 }
 
 /// Fetch all remotes to refresh tracking refs, then recompute the repo's
@@ -247,32 +241,24 @@ fn collect_ref_states(
     Ok(states)
 }
 
-/// Compare two ids that both exist locally (tracking refs after a fetch)
-fn compare_ancestry(
+/// Whether `ancestor` is reachable from `descendant`. Both ids must exist
+/// locally, which tracking refs do after a fetch. A git call that fails or is
+/// interrupted reads as "not an ancestor", so an unanswerable comparison
+/// leaves the remote out of the behind counts rather than inventing one.
+fn is_ancestor(
     repo_path: &Path,
-    local: &str,
-    other: &str,
+    ancestor: &str,
+    descendant: &str,
     interrupt: &AtomicBool,
-) -> Ancestry {
-    if local == other {
-        return Ancestry::Equal;
-    }
-    let is_ancestor = |a: &str, b: &str| {
-        run_git(
-            repo_path,
-            &["merge-base", "--is-ancestor", a, b],
-            interrupt,
-            LOCAL_TIMEOUT,
-        )
-        .map(|out| out.status.success())
-        .unwrap_or(false)
-    };
-    match (is_ancestor(other, local), is_ancestor(local, other)) {
-        (true, true) => Ancestry::Equal,
-        (true, false) => Ancestry::LocalAhead,
-        (false, true) => Ancestry::LocalBehind,
-        (false, false) => Ancestry::Diverged,
-    }
+) -> bool {
+    run_git(
+        repo_path,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        interrupt,
+        LOCAL_TIMEOUT,
+    )
+    .map(|out| out.status.success())
+    .unwrap_or(false)
 }
 
 /// List the repository's configured remotes
@@ -421,22 +407,10 @@ mod tests {
         }
     }
 
-    /// Ancestry stub: ids are single letters, and "ab" means a precedes b in
-    /// history (b is a descendant of a); anything unlisted diverged
-    fn stub_ancestry(order: &'static [&'static str]) -> impl FnMut(&str, &str) -> Ancestry {
-        move |local, other| {
-            let ahead = format!("{}{}", other, local);
-            let behind = format!("{}{}", local, other);
-            if local == other {
-                Ancestry::Equal
-            } else if order.iter().any(|s| *s == ahead) {
-                Ancestry::LocalAhead
-            } else if order.iter().any(|s| *s == behind) {
-                Ancestry::LocalBehind
-            } else {
-                Ancestry::Diverged
-            }
-        }
+    /// Ancestor stub: ids are single letters, and "ab" means a precedes b in
+    /// history, so a is an ancestor of b; anything unlisted has diverged
+    fn stub_is_ancestor(order: &'static [&'static str]) -> impl FnMut(&str, &str) -> bool {
+        move |ancestor, descendant| order.contains(&format!("{}{}", ancestor, descendant).as_str())
     }
 
     #[test]
@@ -445,7 +419,7 @@ mod tests {
             branch(Some("b"), &[("a", Some("b")), ("backup", Some("a"))]),
             branch(Some("d"), &[("a", Some("d")), ("backup", Some("c"))]),
         ];
-        let mut ancestry = stub_ancestry(&["ab", "cd"]);
+        let mut is_ancestor = stub_is_ancestor(&["ab", "cd"]);
         let mut count = |behind: &str, candidate: &str| -> usize {
             match (behind, candidate) {
                 ("a", "b") => 3,
@@ -453,23 +427,24 @@ mod tests {
                 other => panic!("unexpected range {:?}", other),
             }
         };
-        let counts = plan_behind_counts(&states, &mut ancestry, &mut count);
+        let counts = plan_behind_counts(&states, &mut is_ancestor, &mut count);
         assert_eq!(counts, BTreeMap::from([("backup".to_string(), 5)]));
     }
 
     #[test]
     fn missing_diverged_and_unpublished_refs_not_counted() {
         let states = [
-            // Remote missing the ref: sync reports it as a push, not "behind"
+            // Remote missing the ref: nothing published there to lag behind
             branch(Some("b"), &[("a", Some("b")), ("backup", None)]),
-            // Diverged remote: reported as a conflict, not "behind"
+            // Diverged remote: neither id is reachable from the other, so
+            // there is no fast-forward distance to report
             branch(Some("x"), &[("a", Some("x")), ("backup", Some("y"))]),
             // Never-published ref: no published id to lag behind
             branch(Some("z"), &[("a", None), ("backup", None)]),
         ];
-        let mut ancestry = stub_ancestry(&[]);
+        let mut is_ancestor = stub_is_ancestor(&[]);
         let mut count = |_: &str, _: &str| -> usize { panic!("no range should be counted") };
-        assert!(plan_behind_counts(&states, &mut ancestry, &mut count).is_empty());
+        assert!(plan_behind_counts(&states, &mut is_ancestor, &mut count).is_empty());
     }
 
     /// End-to-end over a real repository: `collect_ref_states` reads the
