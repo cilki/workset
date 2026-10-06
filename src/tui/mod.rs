@@ -1646,7 +1646,6 @@ fn render_highlighted_name<'a>(
     spans
 }
 
-/// Scan a single workspace repository, returning it and any submodules
 /// Workspace-relative display name for a repo path
 fn workspace_display_name(workspace_path: &str, path: &Path) -> String {
     path.strip_prefix(workspace_path)
@@ -1657,59 +1656,49 @@ fn workspace_display_name(workspace_path: &str, path: &Path) -> String {
         .to_string()
 }
 
-fn scan_workspace_repo(workspace_path: &str, path: PathBuf) -> Vec<RepoInfo> {
-    let display_name = workspace_display_name(workspace_path, &path);
-
+/// Fill in a discovered workspace repo's status and modification time, and
+/// return it followed by a row for each of its submodules
+fn scan_workspace_repo(mut repo: RepoInfo) -> Vec<RepoInfo> {
     // Check repo status and get modification time in a single repo open for performance
-    let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
+    let (status, modification_time) = crate::check_repo_status_and_modification_time(&repo.path)
         .unwrap_or((crate::RepoStatus::NoCommits, None));
+    repo.status = Some(status);
+    repo.modification_time = modification_time;
+    repo.operation_status = RepoOperationStatus::None;
+    // Size not computed for workspace repos to save time
 
-    let mut infos = vec![RepoInfo {
-        path: path.clone(),
-        display_name: display_name.clone(),
-        tree_path: crate::remote_tree_path(&path),
-        status: Some(status),
-        modification_time,
-        // Size not computed for workspace repos to save time
-        ..Default::default()
-    }];
+    let path = repo.path.clone();
+    let display_name = repo.display_name.clone();
+    let mut infos = vec![repo];
 
     // Find and add submodules
-    if let Ok(submodules) = crate::find_submodules_in_repo(&path) {
-        for submodule in submodules {
-            let submodule_display_name = if display_name.is_empty() {
-                submodule.path.display().to_string()
-            } else {
-                format!("{}/{}", display_name, submodule.path.display())
-            };
+    for submodule in crate::find_submodules_in_repo(&path).unwrap_or_default() {
+        let submodule_display_name = if display_name.is_empty() {
+            submodule.path.display().to_string()
+        } else {
+            format!("{}/{}", display_name, submodule.path.display())
+        };
 
-            infos.push(RepoInfo {
-                path: path.join(&submodule.path),
-                display_name: submodule_display_name,
-                status: Some(crate::RepoStatus::Clean), // Submodule status computed separately
-                is_submodule: true,
-                submodule_initialized: submodule.initialized,
-                parent_repo_path: Some(path.clone()),
-                ..Default::default()
-            });
-        }
+        infos.push(RepoInfo {
+            path: path.join(&submodule.path),
+            display_name: submodule_display_name,
+            status: Some(crate::RepoStatus::Clean), // Submodule status computed separately
+            is_submodule: true,
+            submodule_initialized: submodule.initialized,
+            parent_repo_path: Some(path.clone()),
+            ..Default::default()
+        });
     }
 
     infos
 }
 
-/// Scan a single library repository for its metadata
-fn scan_library_repo(library_path: &str, repo_path: String) -> RepoInfo {
-    let full_path = PathBuf::from(library_path).join(&repo_path);
-    RepoInfo {
-        modification_time: get_repo_modification_time(&full_path).ok(),
-        size_bytes: get_repo_size(&full_path).ok(),
-        tree_path: crate::remote_tree_path(&full_path),
-        path: full_path,
-        display_name: repo_path,
-        status: Some(crate::RepoStatus::Clean), // Library repos are always clean
-        ..Default::default()
-    }
+/// Fill in a discovered library repo's metadata
+fn scan_library_repo(mut repo: RepoInfo) -> RepoInfo {
+    repo.modification_time = get_repo_modification_time(&repo.path).ok();
+    repo.size_bytes = get_repo_size(&repo.path).ok();
+    repo.operation_status = RepoOperationStatus::None;
+    repo
 }
 
 /// Enumerate and scan all workspace and library repositories on worker
@@ -1717,35 +1706,38 @@ fn scan_library_repo(library_path: &str, repo_path: String) -> RepoInfo {
 /// exits early if the receiver is dropped.
 fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     enum ScanTask {
-        Workspace(PathBuf),
-        Library(String),
+        Workspace(RepoInfo),
+        Library(RepoInfo),
     }
 
-    let workspace_paths = find_git_repositories(Path::new(&workspace.path)).unwrap_or_default();
-    let library_paths = workspace.list_library().unwrap_or_default();
     let library_path = workspace.library_path();
 
-    // Announce the full repo set before any git work so every row can render
-    // with a "scanning" status right away
-    let discovered_workspace = workspace_paths
-        .iter()
+    // Enumerate the repo set — and derive each row's tree path, which needs a
+    // repo open — before any status work, so every row can render with a
+    // "scanning" status right away. These rows are also the scan's task list,
+    // so each repo is placed in the tree exactly once.
+    let discovered_workspace: Vec<RepoInfo> = find_git_repositories(Path::new(&workspace.path))
+        .unwrap_or_default()
+        .into_iter()
         .map(|path| RepoInfo {
-            path: path.clone(),
-            display_name: workspace_display_name(&workspace.path, path),
-            tree_path: crate::remote_tree_path(path),
+            display_name: workspace_display_name(&workspace.path, &path),
+            tree_path: crate::remote_tree_path(&path),
+            path,
             operation_status: RepoOperationStatus::Scanning,
             ..Default::default()
         })
         .collect();
-    let discovered_library = library_paths
-        .iter()
+    let discovered_library: Vec<RepoInfo> = workspace
+        .list_library()
+        .unwrap_or_default()
+        .into_iter()
         .map(|repo_path| {
-            let path = PathBuf::from(&library_path).join(repo_path);
+            let path = PathBuf::from(&library_path).join(&repo_path);
             RepoInfo {
                 tree_path: crate::remote_tree_path(&path),
                 path,
-                display_name: repo_path.clone(),
-                status: Some(crate::RepoStatus::Clean),
+                display_name: repo_path,
+                status: Some(crate::RepoStatus::Clean), // Library repos are always clean
                 operation_status: RepoOperationStatus::Scanning,
                 ..Default::default()
             }
@@ -1753,8 +1745,8 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
         .collect();
     if tx
         .send(LoadEvent::Discovered {
-            workspace: discovered_workspace,
-            library: discovered_library,
+            workspace: discovered_workspace.clone(),
+            library: discovered_library.clone(),
         })
         .is_err()
     {
@@ -1762,10 +1754,10 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     }
 
     let tasks: Mutex<Vec<ScanTask>> = Mutex::new(
-        workspace_paths
+        discovered_workspace
             .into_iter()
             .map(ScanTask::Workspace)
-            .chain(library_paths.into_iter().map(ScanTask::Library))
+            .chain(discovered_library.into_iter().map(ScanTask::Library))
             .collect(),
     );
 
@@ -1778,8 +1770,6 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
         for _ in 0..workers {
             let tx = tx.clone();
             let tasks = &tasks;
-            let workspace_path = workspace.path.as_str();
-            let library_path = library_path.as_str();
             scope.spawn(move || {
                 loop {
                     let task = tasks.lock().unwrap().pop();
@@ -1787,12 +1777,10 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
                         break;
                     };
                     let event = match task {
-                        ScanTask::Workspace(path) => {
-                            LoadEvent::Workspace(scan_workspace_repo(workspace_path, path))
+                        ScanTask::Workspace(repo) => {
+                            LoadEvent::Workspace(scan_workspace_repo(repo))
                         }
-                        ScanTask::Library(repo_path) => {
-                            LoadEvent::Library(scan_library_repo(library_path, repo_path))
-                        }
+                        ScanTask::Library(repo) => LoadEvent::Library(scan_library_repo(repo)),
                     };
                     if tx.send(event).is_err() {
                         break;
@@ -1893,6 +1881,109 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    /// The rows discovery announces are the scan's input, so everything
+    /// discovery derived — notably the tree path the repo is grouped under,
+    /// which costs a repo open — has to survive the scan, and the
+    /// placeholder "scanning" marker must not.
+    #[test]
+    fn scanning_a_workspace_repo_builds_on_its_discovered_row() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo_path = temp.path().join("work/app");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        gix::init(&repo_path).unwrap();
+        std::fs::write(repo_path.join("notes.txt"), "unfinished").unwrap();
+        std::fs::write(
+            repo_path.join(".gitmodules"),
+            "[submodule \"dep\"]\n\tpath = vendor/dep\n\turl = https://example.com/dep.git\n",
+        )
+        .unwrap();
+
+        let scanned = scan_workspace_repo(RepoInfo {
+            path: repo_path.clone(),
+            display_name: "work/app".to_string(),
+            tree_path: Some("github.com/fossable/app".to_string()),
+            operation_status: RepoOperationStatus::Scanning,
+            ..Default::default()
+        });
+
+        let repo = &scanned[0];
+        assert_eq!(repo.display_name, "work/app");
+        assert_eq!(repo.tree_path.as_deref(), Some("github.com/fossable/app"));
+        assert_eq!(repo.status, Some(crate::RepoStatus::Dirty));
+        assert_eq!(repo.operation_status, RepoOperationStatus::None);
+
+        // Submodules ride along with their parent's scan
+        let submodule = &scanned[1];
+        assert_eq!(submodule.display_name, "work/app/vendor/dep");
+        assert!(submodule.is_submodule);
+        assert_eq!(submodule.parent_repo_path.as_deref(), Some(&*repo_path));
+    }
+
+    /// Every repo discovery announces comes back scanned exactly once, from
+    /// both the workspace and the library.
+    #[test]
+    fn scan_all_repos_scans_every_discovered_row_once() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp.path().to_string_lossy().to_string(),
+        };
+
+        let in_workspace = temp.path().join("github.com/fossable/alpha");
+        std::fs::create_dir_all(&in_workspace).unwrap();
+        gix::init(&in_workspace).unwrap();
+
+        let in_library = PathBuf::from(workspace.library_path()).join("github.com/fossable/beta");
+        std::fs::create_dir_all(&in_library).unwrap();
+        gix::init_bare(&in_library).unwrap();
+
+        // Blocks until every worker is done, then drops the sender
+        let (tx, rx) = mpsc::channel();
+        scan_all_repos(&workspace, tx);
+
+        let mut discovered = Vec::new();
+        let mut scanned_workspace = Vec::new();
+        let mut scanned_library = Vec::new();
+        for event in rx {
+            match event {
+                LoadEvent::Discovered { workspace, library } => {
+                    discovered = workspace.into_iter().chain(library).collect()
+                }
+                LoadEvent::Workspace(infos) => scanned_workspace.extend(infos),
+                LoadEvent::Library(info) => scanned_library.push(info),
+            }
+        }
+
+        let mut names: Vec<&str> = discovered.iter().map(|r| &*r.display_name).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["github.com/fossable/alpha", "github.com/fossable/beta"]
+        );
+        assert!(
+            discovered
+                .iter()
+                .all(|r| r.operation_status == RepoOperationStatus::Scanning)
+        );
+
+        assert_eq!(scanned_workspace.len(), 1);
+        assert_eq!(
+            scanned_workspace[0].display_name,
+            "github.com/fossable/alpha"
+        );
+        assert_eq!(
+            scanned_workspace[0].operation_status,
+            RepoOperationStatus::None
+        );
+
+        assert_eq!(scanned_library.len(), 1);
+        assert_eq!(scanned_library[0].display_name, "github.com/fossable/beta");
+        assert_eq!(
+            scanned_library[0].operation_status,
+            RepoOperationStatus::None
+        );
+        assert!(scanned_library[0].size_bytes.is_some());
     }
 
     #[test]
