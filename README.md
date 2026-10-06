@@ -68,6 +68,45 @@ meant:
 ❯ workset restore jq
 ```
 
+### What a drop keeps
+
+A drop stores the repository, not the directory: the repo's `.git` directory is
+moved into the library and the working tree is deleted, and `restore` checks the
+working tree back out of the library. So a round trip keeps everything git has —
+every branch, tag and stash — but nothing it doesn't.
+
+Untracked files are safe, because they make the repo "modified" and a drop
+refuses to touch it. **Ignored** files are not: git doesn't report them, so the
+repo counts as clean and they are deleted without warning and don't come back.
+
+```sh
+❯ cat github.com/jqlang/jq/.gitignore
+target/
+.env
+
+# Ignored files don't make a repo modified
+❯ workset list
+Repositories in workspace (/home/user/workspace):
+
+  github.com/jqlang/jq - ✓ clean
+
+❯ workset drop ./github.com/jqlang/jq
+  github.com/jqlang/jq - ✓ dropped
+❯ workset restore jq
+Restored github.com/jqlang/jq
+
+# target/ and .env are gone for good
+❯ ls -A github.com/jqlang/jq
+.git
+.gitignore
+Makefile.am
+src
+```
+
+Losing `target/` is usually the point — it's what makes a dropped repo cheap to
+keep. Losing an untracked-but-ignored `.env` is not, so keep anything you can't
+regenerate either committed or outside the repo.
+
 Every command reports what it did and exits non-zero when it couldn't do all of
 it, so `workset` composes with other commands:
 
