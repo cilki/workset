@@ -68,6 +68,18 @@ meant:
 ❯ workset restore jq
 ```
 
+`clone`, `restore` and `drop` take as many patterns as you want to name, and
+each one is reported on its own:
+
+```sh
+❯ workset drop github.com/jqlang/jq github.com/fossable/workset no-such-repo
+  github.com/jqlang/jq - ✓ dropped
+  github.com/fossable/workset - ✓ dropped
+No repository in the workspace matches 'no-such-repo'
+❯ echo $?
+1
+```
+
 ### What a drop keeps
 
 A drop stores the repository, not the directory: the repo's `.git` directory is
