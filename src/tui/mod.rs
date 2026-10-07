@@ -71,15 +71,15 @@ enum LoadEvent {
 /// A repo scan running on background threads. Results are drained into the
 /// `App` from the event loop via `poll`, so the UI stays responsive.
 ///
-/// Rows the scan hasn't reached yet are shown with a "scanning" status:
-/// seeded from the app's previous data on a refresh (keeping their last known
-/// status), or as bare placeholders on the initial load.
+/// `workspace` and `library` each hold one row per repo for the whole scan.
+/// A row starts out as a placeholder carrying the "scanning" status — seeded
+/// from the app's previous data on a refresh, so it keeps its last known
+/// status, or bare on the initial load — and is replaced by the scanned row
+/// once a worker gets to that repo.
 struct RepoLoader {
     rx: mpsc::Receiver<LoadEvent>,
-    scanned_workspace: Vec<RepoInfo>,
-    scanned_library: Vec<RepoInfo>,
-    pending_workspace: Vec<RepoInfo>,
-    pending_library: Vec<RepoInfo>,
+    workspace: Vec<RepoInfo>,
+    library: Vec<RepoInfo>,
     done: usize,
     total: usize,
     /// Show a spinner with scan progress in the title (initial load)
@@ -104,10 +104,8 @@ impl RepoLoader {
         };
         Self {
             rx,
-            scanned_workspace: Vec::new(),
-            scanned_library: Vec::new(),
-            pending_workspace: mark_scanning(seed_workspace),
-            pending_library: mark_scanning(seed_library),
+            workspace: mark_scanning(seed_workspace),
+            library: mark_scanning(seed_library),
             done: 0,
             total: 0,
             progressive,
@@ -122,21 +120,17 @@ impl RepoLoader {
             match self.rx.try_recv() {
                 Ok(LoadEvent::Discovered { workspace, library }) => {
                     self.total = workspace.len() + library.len();
-                    merge_discovered(&mut self.pending_workspace, workspace);
-                    merge_discovered(&mut self.pending_library, library);
+                    merge_discovered(&mut self.workspace, workspace);
+                    merge_discovered(&mut self.library, library);
                     received = true;
                 }
                 Ok(LoadEvent::Workspace(infos)) => {
-                    self.pending_workspace
-                        .retain(|p| !infos.iter().any(|i| i.display_name == p.display_name));
-                    self.scanned_workspace.extend(infos);
+                    replace_scanned(&mut self.workspace, infos);
                     self.done += 1;
                     received = true;
                 }
                 Ok(LoadEvent::Library(info)) => {
-                    self.pending_library
-                        .retain(|p| p.display_name != info.display_name);
-                    self.scanned_library.push(info);
+                    replace_scanned(&mut self.library, vec![info]);
                     self.done += 1;
                     received = true;
                 }
@@ -146,27 +140,22 @@ impl RepoLoader {
         };
 
         if finished {
+            // Every worker is done, so a row still marked "scanning" names a
+            // repo nothing scanned: it was seeded from the app's previous data
+            // and is no longer there. Dropping it is how a repo that left the
+            // workspace leaves the list.
+            let scanned = |repo: &RepoInfo| repo.operation_status != RepoOperationStatus::Scanning;
+            self.workspace.retain(scanned);
+            self.library.retain(scanned);
             app.update_repos(
-                std::mem::take(&mut self.scanned_workspace),
-                std::mem::take(&mut self.scanned_library),
+                std::mem::take(&mut self.workspace),
+                std::mem::take(&mut self.library),
             );
             if self.progressive {
                 app.loading_progress = None;
             }
         } else if received {
-            let workspace = self
-                .scanned_workspace
-                .iter()
-                .chain(&self.pending_workspace)
-                .cloned()
-                .collect();
-            let library = self
-                .scanned_library
-                .iter()
-                .chain(&self.pending_library)
-                .cloned()
-                .collect();
-            app.update_repos(workspace, library);
+            app.update_repos(self.workspace.clone(), self.library.clone());
             if self.progressive {
                 let spinner = SPINNER_FRAMES[self.done % SPINNER_FRAMES.len()];
                 app.loading_progress = Some(format!("{} {}/{}", spinner, self.done, self.total));
@@ -177,17 +166,33 @@ impl RepoLoader {
     }
 }
 
-/// Reconcile seeded pending rows with the freshly enumerated repo set: rows
-/// that no longer exist are dropped, newly appeared repos get a placeholder.
-/// Submodule rows are kept as-is; they ride along with their parent's scan.
-fn merge_discovered(pending: &mut Vec<RepoInfo>, discovered: Vec<RepoInfo>) {
-    pending
-        .retain(|p| p.is_submodule || discovered.iter().any(|d| d.display_name == p.display_name));
+/// Reconcile seeded placeholder rows with the freshly enumerated repo set:
+/// rows that no longer exist are dropped, newly appeared repos get a
+/// placeholder. Submodule rows are kept as-is; they ride along with their
+/// parent's scan.
+fn merge_discovered(rows: &mut Vec<RepoInfo>, discovered: Vec<RepoInfo>) {
+    rows.retain(|row| {
+        row.is_submodule || display_names(&discovered).any(|name| name == row.display_name)
+    });
     for repo in discovered {
-        if !pending.iter().any(|p| p.display_name == repo.display_name) {
-            pending.push(repo);
+        if !display_names(rows).any(|name| name == repo.display_name) {
+            rows.push(repo);
         }
     }
+}
+
+/// Replace the rows a worker just produced, so each repo stays listed exactly
+/// once: the placeholder it had goes, the scanned row takes its place. A
+/// workspace repo's scan also yields a row per submodule, each replacing any
+/// seeded row for that submodule.
+fn replace_scanned(rows: &mut Vec<RepoInfo>, scanned: Vec<RepoInfo>) {
+    rows.retain(|row| !display_names(&scanned).any(|name| name == row.display_name));
+    rows.extend(scanned);
+}
+
+/// The display names of the given rows, which are what identifies a repo
+fn display_names(repos: &[RepoInfo]) -> impl Iterator<Item = &str> {
+    repos.iter().map(|repo| repo.display_name.as_str())
 }
 
 /// Result of a background sync job for one repo
@@ -2008,6 +2013,56 @@ mod tests {
             RepoOperationStatus::None
         );
         assert!(scanned_library[0].size_bytes.is_some());
+    }
+
+    /// A refresh seeds the loader with the rows the app already shows, so they
+    /// keep their data while being rescanned. Each repo must end up listed
+    /// exactly once — placeholder replaced by the scanned row — and a repo
+    /// that left the workspace since the last scan must drop out of the list.
+    #[test]
+    fn loader_replaces_seeded_rows_and_drops_vanished_ones() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp.path().to_string_lossy().to_string(),
+        };
+        std::fs::create_dir_all(workspace.library_path()).unwrap();
+
+        let still_here = temp.path().join("github.com/fossable/alpha");
+        std::fs::create_dir_all(&still_here).unwrap();
+        gix::init(&still_here).unwrap();
+
+        let seed = |display_name: &str, path: PathBuf| RepoInfo {
+            path,
+            display_name: display_name.to_string(),
+            status: Some(crate::RepoStatus::Clean),
+            ..Default::default()
+        };
+        let mut app = App::new(workspace.path.clone(), Vec::new(), Vec::new());
+        let mut loader = RepoLoader::start(
+            &workspace,
+            vec![
+                seed("github.com/fossable/alpha", still_here),
+                // Dropped from the workspace since the rows were built
+                seed(
+                    "github.com/fossable/gone",
+                    temp.path().join("github.com/fossable/gone"),
+                ),
+            ],
+            Vec::new(),
+            false,
+        );
+
+        while loader.poll(&mut app) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let rows: Vec<String> = app
+            .get_flattened_workspace()
+            .iter()
+            .filter(|(node, _, _, _)| node.repo_info.is_some())
+            .map(|(_, _, _, path)| path.clone())
+            .collect();
+        assert_eq!(rows, vec!["github.com/fossable/alpha".to_string()]);
     }
 
     #[test]
