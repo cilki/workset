@@ -152,9 +152,15 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool) -> Result<SyncOutcome
             if interrupt.load(Ordering::Relaxed) {
                 bail!("interrupted");
             }
+            // The remote name comes out of the repository's own config, which
+            // is part of whatever the repo was when it arrived. `--` keeps a
+            // name that happens to begin with a dash from being read as an
+            // option: `git fetch --upload-pack=<cmd>` runs <cmd>, so without
+            // the separator a hand-written `[remote "--upload-pack=..."]`
+            // section turns a background fetch into arbitrary code execution.
             match run_git(
                 repo_path,
-                &["fetch", "--prune", "--quiet", remote],
+                &["fetch", "--prune", "--quiet", "--", remote],
                 interrupt,
                 NETWORK_TIMEOUT,
             ) {
@@ -528,6 +534,75 @@ mod tests {
         assert!(outcome.offline);
         assert!(outcome.fetch_errors.is_empty());
         assert!(outcome.error_summary().is_none());
+    }
+
+    /// A remote name is config the repository carries with it, and a repo can
+    /// arrive from anywhere (a tarball, a shared directory, a copy someone
+    /// handed over). `git remote add` refuses a name beginning with a dash,
+    /// but a hand-written config can hold one, and the TUI fetches every
+    /// remote of every repo in the workspace on its own. Passed as a bare
+    /// argument, `--upload-pack=<cmd>` makes git run <cmd>.
+    #[cfg(unix)]
+    #[test]
+    fn dashed_remote_name_is_not_read_as_a_fetch_option() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("work");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(&repo, &["init", "--quiet", "--initial-branch=main"]);
+        git(&repo, &["config", "user.name", "workset"]);
+        git(&repo, &["config", "user.email", "workset@example.com"]);
+        git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "one"]);
+        git(temp.path(), &["init", "--quiet", "--bare", "upstream"]);
+        let upstream = temp.path().join("upstream");
+        let upstream = upstream.to_string_lossy().to_string();
+        git(&repo, &["remote", "add", "origin", &upstream]);
+        git(&repo, &["push", "--quiet", "origin", "main"]);
+
+        // Written straight into the config, the way an untrusted repo would
+        // carry it, because git won't create a remote with this name itself
+        let marker = temp.path().join("pwned");
+        let name = format!("--upload-pack=touch {}", marker.display());
+        let mut config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+        config.push_str(&format!(
+            "[remote \"{}\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/evil/*\n",
+            name, upstream
+        ));
+        std::fs::write(repo.join(".git/config"), config).unwrap();
+        assert!(
+            list_remotes(&repo, &AtomicBool::new(false))
+                .unwrap()
+                .contains(&name)
+        );
+
+        let outcome = sync_repo(&repo, &AtomicBool::new(false)).unwrap();
+
+        assert!(
+            !marker.exists(),
+            "fetching the repo ran the remote name's embedded command"
+        );
+        // Behind the separator the name is still just a remote name, so the
+        // fetch resolves the section's url and succeeds like any other
+        assert!(
+            outcome.fetch_errors.is_empty(),
+            "{:?}",
+            outcome.fetch_errors
+        );
+        assert!(!outcome.offline);
+        assert!(repo.join(".git/refs/remotes/evil/main").exists());
     }
 
     #[test]
