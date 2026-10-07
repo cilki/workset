@@ -451,6 +451,21 @@ testListShowsRepoStatus() {
 	echo "$output" | grep "dirty-repo - ⚠ modified"
 }
 
+## A repo whose HEAD is detached — mid-bisect, mid-rebase, or just checked
+## out by commit — still has all its history, so it isn't "no commits"
+testListDetachedHeadRepo() {
+	newWorkspace
+	createRepo detached-repo 2
+	git -C detached-repo checkout -q --detach HEAD
+
+	workset list | grep -- "detached-repo - ✓ clean"
+	workset status | grep "✓ 1 clean"
+
+	workset drop detached-repo | grep -- "detached-repo - ✓ dropped"
+	workset restore detached-repo
+	[ -f detached-repo/file1.txt ]
+}
+
 ## Listing covers the whole workspace, not just the current directory
 testListFromSubdirectory() {
 	newWorkspace

@@ -303,10 +303,11 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
     if worktree_is_dirty(&repo, repo_path) {
         return Ok(RepoStatus::Dirty);
     }
-    let Some(head_ref) = head_referent(&repo) else {
-        return Ok(RepoStatus::NoCommits);
-    };
-    Ok(check_unpushed_status(&repo, head_ref))
+    Ok(match head_state(&repo) {
+        HeadState::Unborn => RepoStatus::NoCommits,
+        HeadState::Detached => RepoStatus::Clean,
+        HeadState::Branch(head_ref) => check_unpushed_status(&repo, head_ref),
+    })
 }
 
 /// Check repository status and get modification time in a single repo open
@@ -327,13 +328,15 @@ pub fn check_repo_status_and_modification_time(
         return Ok((RepoStatus::Dirty, Some(commit_time.max(dirty_time))));
     }
 
-    let Some(head_ref) = head_referent(&repo) else {
-        // No commits and a clean worktree: no timestamp to report at all, so
-        // callers don't render a spurious "56y ago" from the UNIX epoch.
-        return Ok((RepoStatus::NoCommits, None));
+    let status = match head_state(&repo) {
+        HeadState::Unborn => {
+            // No commits and a clean worktree: no timestamp to report at all,
+            // so callers don't render a spurious "56y ago" from the UNIX epoch.
+            return Ok((RepoStatus::NoCommits, None));
+        }
+        HeadState::Detached => RepoStatus::Clean,
+        HeadState::Branch(head_ref) => check_unpushed_status(&repo, head_ref),
     };
-
-    let status = check_unpushed_status(&repo, head_ref);
     Ok((status, get_last_commit_time(&repo).ok()))
 }
 
@@ -352,9 +355,33 @@ fn open_repo(repo_path: &Path) -> Option<gix::Repository> {
     }
 }
 
-/// Get the HEAD reference, or None if the repository has no commits
-fn head_referent(repo: &gix::Repository) -> Option<gix::Reference<'_>> {
-    repo.head().ok()?.try_into_referent()
+/// Where a repository's HEAD points
+enum HeadState<'repo> {
+    /// At a branch, which may have an upstream to compare against
+    Branch(gix::Reference<'repo>),
+    /// Straight at a commit, as during a bisect, a rebase or after an
+    /// explicit `git checkout --detach`. There is history, but no branch and
+    /// therefore no upstream.
+    Detached,
+    /// At a branch that doesn't exist yet, because the repo has no commits
+    Unborn,
+}
+
+/// Classify what HEAD points at. Detached is kept apart from Unborn because
+/// the two look alike through `try_into_referent` — it yields no reference
+/// either way — and calling a repo full of history "no commits" is a lie the
+/// status line, the summary counts and the TUI all repeat.
+fn head_state(repo: &gix::Repository) -> HeadState<'_> {
+    let Ok(head) = repo.head() else {
+        return HeadState::Unborn;
+    };
+    if head.is_unborn() {
+        return HeadState::Unborn;
+    }
+    match head.try_into_referent() {
+        Some(head_ref) => HeadState::Branch(head_ref),
+        None => HeadState::Detached,
+    }
 }
 
 /// Classify a repository with no uncommitted changes as Clean or Unpushed
@@ -453,11 +480,13 @@ pub fn get_repo_modification_time(repo_path: &Path) -> Result<std::time::SystemT
 
 /// Get the last commit time using gix
 fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime> {
-    let Some(head_ref) = head_referent(repo) else {
+    if matches!(head_state(repo), HeadState::Unborn) {
         bail!("Repository has no commits");
-    };
+    }
 
-    let commit = head_ref.id().object()?.try_into_commit()?;
+    // head_commit resolves a detached HEAD too, so a repo mid-bisect or
+    // mid-rebase still reports when it last changed
+    let commit = repo.head_commit()?;
     let timestamp = commit.time()?.seconds;
 
     Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
@@ -1364,6 +1393,70 @@ mod tests {
         // and it must not be the UNIX_EPOCH sentinel.
         let time = mod_time.expect("expected a modification time from the untracked file");
         assert!(time > std::time::SystemTime::UNIX_EPOCH);
+    }
+
+    /// Run git in `dir`, asserting it succeeded, and return its stdout
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repo with one commit on `main` and nothing uncommitted
+    fn repo_with_a_commit(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        git(path, &["init", "--quiet", "--initial-branch=main"]);
+        git(path, &["config", "user.name", "workset"]);
+        git(path, &["config", "user.email", "workset@example.com"]);
+        git(path, &["commit", "--quiet", "--allow-empty", "-m", "one"]);
+    }
+
+    #[test]
+    fn detached_head_repo_is_clean_not_commit_less() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        repo_with_a_commit(repo_path);
+
+        // A bisect, a rebase or a plain `git checkout --detach` all leave HEAD
+        // pointing straight at a commit rather than at a branch
+        git(repo_path, &["checkout", "--quiet", "--detach", "HEAD"]);
+        git(
+            repo_path,
+            &["commit", "--quiet", "--allow-empty", "-m", "detached"],
+        );
+
+        // The history is right there, so calling it "no commits" is wrong
+        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Clean);
+
+        let (status, mod_time) = check_repo_status_and_modification_time(repo_path).unwrap();
+        assert_eq!(status, RepoStatus::Clean);
+        // And the detached commit is a real time to report, not the absence
+        // of one that a commit-less repo yields
+        let time = mod_time.expect("expected the detached commit's time");
+        assert!(time > std::time::SystemTime::UNIX_EPOCH);
+        assert_eq!(get_repo_modification_time(repo_path).unwrap(), time);
+    }
+
+    #[test]
+    fn detached_head_repo_with_work_is_still_dirty() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        repo_with_a_commit(repo_path);
+        git(repo_path, &["checkout", "--quiet", "--detach", "HEAD"]);
+        fs::write(repo_path.join("notes.txt"), "unfinished").unwrap();
+
+        // Uncommitted work outranks where HEAD happens to point, so a drop
+        // still refuses the repo
+        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
     }
 
     #[test]
