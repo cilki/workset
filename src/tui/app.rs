@@ -38,12 +38,13 @@ struct PendingClone {
 }
 
 pub struct App {
-    workspace_tree: Vec<TreeNode>,
-    library_tree: Vec<TreeNode>,
     workspace_repos_list: Vec<RepoInfo>,
     library_repos_list: Vec<RepoInfo>,
-    pub filtered_workspace: Vec<TreeNode>,
-    pub filtered_library: Vec<TreeNode>,
+    /// What each panel renders: the repo lists grouped into a tree, with the
+    /// transient status overlays and the search query already applied. Rebuilt
+    /// from the lists whenever any of those change.
+    workspace_tree: Vec<TreeNode>,
+    library_tree: Vec<TreeNode>,
     pub workspace_state: TreeState,
     pub library_state: TreeState,
     pub search_query: String,
@@ -89,12 +90,10 @@ impl App {
         library_repos: Vec<RepoInfo>,
     ) -> Self {
         let mut app = Self {
-            workspace_tree: Vec::new(),
-            library_tree: Vec::new(),
             workspace_repos_list: Vec::new(),
             library_repos_list: Vec::new(),
-            filtered_workspace: Vec::new(),
-            filtered_library: Vec::new(),
+            workspace_tree: Vec::new(),
+            library_tree: Vec::new(),
             workspace_state: TreeState::new(),
             library_state: TreeState::new(),
             search_query: String::new(),
@@ -123,7 +122,7 @@ impl App {
     }
 
     pub fn filter_repos(&mut self) {
-        self.rebuild_filtered();
+        self.rebuild_trees();
         self.select_first_available();
     }
 
@@ -132,32 +131,35 @@ impl App {
         self.filter_repos();
     }
 
-    /// Rebuild the filtered trees from the repo lists and the current search query
-    fn rebuild_filtered(&mut self) {
-        if self.search_query.is_empty() {
-            self.filtered_workspace = self.workspace_tree.clone();
-            self.filtered_library = self.library_tree.clone();
-        } else {
-            // Filter repos by fuzzy-matching the search query
-            let workspace_repos = self.workspace_repos_with_overlays();
-            // Match against the path shown in the tree
-            let matches = |r: &&RepoInfo| {
-                let shown = r.tree_path.as_deref().unwrap_or(&r.display_name);
-                self.matcher
-                    .fuzzy_match(shown, &self.search_query)
+    /// Rebuild both section trees from the repo lists, applying the transient
+    /// status overlays and the current search query
+    fn rebuild_trees(&mut self) {
+        // Repos are matched against the path shown in the tree; an empty
+        // query matches everything
+        let matches = |repo: &RepoInfo| {
+            self.search_query.is_empty()
+                || self
+                    .matcher
+                    .fuzzy_match(
+                        repo.tree_path.as_deref().unwrap_or(&repo.display_name),
+                        &self.search_query,
+                    )
                     .is_some()
-            };
-            self.filtered_workspace =
-                build_tree(workspace_repos.iter().filter(matches).cloned().collect());
-            self.filtered_library = build_library_tree(
-                self.library_repos_list
-                    .iter()
-                    .filter(matches)
-                    .cloned()
-                    .collect(),
-                &self.workspace_repos_list,
-            );
-        }
+        };
+        self.workspace_tree = build_tree(
+            self.workspace_repos_with_overlays()
+                .into_iter()
+                .filter(|repo| matches(repo))
+                .collect(),
+        );
+        self.library_tree = build_library_tree(
+            self.library_repos_list
+                .iter()
+                .filter(|repo| matches(repo))
+                .cloned()
+                .collect(),
+            &self.workspace_repos_list,
+        );
     }
 
     /// The workspace repos with transient statuses applied: pending clones get
@@ -197,17 +199,17 @@ impl App {
         repos
     }
 
-    /// Rebuild the workspace tree (and filtered views) after the pending
-    /// clones changed, preserving a user-made selection
-    fn rebuild_after_pending_change(&mut self) {
+    /// Rebuild both trees after the repo lists or their overlays changed. A
+    /// selection made by the user follows its item; automatic selections are
+    /// redone so the workspace is preferred once it has repos.
+    fn rebuild_preserving_selection(&mut self) {
         let previous = if self.selection_is_auto {
             None
         } else {
             self.selected_position()
         };
 
-        self.workspace_tree = build_tree(self.workspace_repos_with_overlays());
-        self.rebuild_filtered();
+        self.rebuild_trees();
 
         match previous {
             Some((section, index, path)) => self.restore_selection(section, index, &path),
@@ -224,7 +226,7 @@ impl App {
             status: RepoOperationStatus::Cloning,
             failed_at: None,
         });
-        self.rebuild_after_pending_change();
+        self.rebuild_preserving_selection();
     }
 
     /// Resolve a pending clone: drop the row on success (the refresh brings in
@@ -245,7 +247,7 @@ impl App {
                 }
             }
         }
-        self.rebuild_after_pending_change();
+        self.rebuild_preserving_selection();
     }
 
     /// Remove failed clone rows older than `ttl` so they don't linger forever
@@ -254,16 +256,16 @@ impl App {
         self.pending_clones
             .retain(|p| p.failed_at.is_none_or(|at| at.elapsed() < ttl));
         if self.pending_clones.len() != before {
-            self.rebuild_after_pending_change();
+            self.rebuild_preserving_selection();
         }
     }
 
     /// Select the first item in the first section that has any, preferring the
     /// workspace. Marks the selection as automatic.
     fn select_first_available(&mut self) {
-        if !self.filtered_workspace.is_empty() {
+        if !self.workspace_tree.is_empty() {
             self.select(Section::Workspace, 0);
-        } else if !self.filtered_library.is_empty() {
+        } else if !self.library_tree.is_empty() {
             self.select(Section::Library, 0);
         } else {
             self.workspace_state.select(None);
@@ -273,19 +275,35 @@ impl App {
     }
 
     pub fn get_flattened_workspace(&self) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
-        flatten_trees(&self.filtered_workspace)
+        flatten_trees(self.trees(Section::Workspace))
     }
 
     pub fn get_flattened_library(&self) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
-        flatten_trees(&self.filtered_library)
+        flatten_trees(self.trees(Section::Library))
     }
 
     pub fn count_workspace_repos(&self) -> usize {
-        count_repos_in_trees(&self.filtered_workspace)
+        count_repos_in_trees(self.trees(Section::Workspace))
     }
 
     pub fn count_library_repos(&self) -> usize {
-        count_repos_in_trees(&self.filtered_library)
+        count_repos_in_trees(self.trees(Section::Library))
+    }
+
+    /// The rendered trees of the given section
+    fn trees(&self, section: Section) -> &[TreeNode] {
+        match section {
+            Section::Workspace => &self.workspace_tree,
+            Section::Library => &self.library_tree,
+        }
+    }
+
+    /// The selection state of the given section
+    fn state(&self, section: Section) -> &TreeState {
+        match section {
+            Section::Workspace => &self.workspace_state,
+            Section::Library => &self.library_state,
+        }
     }
 
     /// Select the given index in the given section, clearing the other section
@@ -301,10 +319,7 @@ impl App {
 
     /// Number of visible (flattened) items in the given section
     fn section_len(&self, section: Section) -> usize {
-        match section {
-            Section::Workspace => flatten_trees(&self.filtered_workspace).len(),
-            Section::Library => flatten_trees(&self.filtered_library).len(),
-        }
+        flatten_trees(self.trees(section)).len()
     }
 
     /// Switch to the other section if it has any items. In single-panel mode
@@ -340,11 +355,7 @@ impl App {
         }
         self.selection_is_auto = false;
 
-        let selected = match section {
-            Section::Workspace => self.workspace_state.selected(),
-            Section::Library => self.library_state.selected(),
-        };
-        let Some(i) = selected else {
+        let Some(i) = self.state(section).selected() else {
             self.select(section, 0);
             return;
         };
@@ -370,29 +381,23 @@ impl App {
 
     /// The currently selected tree node in the active section
     pub fn selected_node(&self) -> Option<&TreeNode> {
-        let (trees, state) = match self.active_section {
-            Section::Workspace => (&self.filtered_workspace, &self.workspace_state),
-            Section::Library => (&self.filtered_library, &self.library_state),
-        };
-        let index = state.selected()?;
-        flatten_trees(trees).get(index).map(|(node, _, _, _)| *node)
+        let index = self.state(self.active_section).selected()?;
+        flatten_trees(self.trees(self.active_section))
+            .get(index)
+            .map(|(node, _, _, _)| *node)
     }
 
     pub fn toggle_expand(&mut self) {
-        let (trees, state) = match self.active_section {
-            Section::Workspace => (&self.filtered_workspace, &self.workspace_state),
-            Section::Library => (&self.filtered_library, &self.library_state),
-        };
-        let index_path = state.selected().and_then(|i| {
-            flatten_trees(trees)
+        let index_path = self.state(self.active_section).selected().and_then(|i| {
+            flatten_trees(self.trees(self.active_section))
                 .get(i)
                 .map(|(_, _, path, _)| path.clone())
         });
 
         if let Some(index_path) = index_path {
             let trees = match self.active_section {
-                Section::Workspace => &mut self.filtered_workspace,
-                Section::Library => &mut self.filtered_library,
+                Section::Workspace => &mut self.workspace_tree,
+                Section::Library => &mut self.library_tree,
             };
             toggle_node_at_path(trees, &index_path);
         }
@@ -408,55 +413,37 @@ impl App {
             .collect()
     }
 
-    pub fn update_repo_status(
-        &mut self,
-        display_name: &str,
-        status: super::tree::RepoOperationStatus,
-    ) {
-        // Update in workspace tree
+    /// Mark a repo's row with the status of an operation running right now.
+    /// Only the rendered trees are touched, so the mark lasts until the next
+    /// rebuild — which is all `run_repo_operation` needs: it draws each step
+    /// itself, and the rescan that follows reports the real outcome.
+    pub fn update_repo_status(&mut self, display_name: &str, status: RepoOperationStatus) {
         update_repo_status_in_tree(&mut self.workspace_tree, display_name, status.clone());
-        update_repo_status_in_tree(&mut self.filtered_workspace, display_name, status.clone());
-
-        // Update in library tree
-        update_repo_status_in_tree(&mut self.library_tree, display_name, status.clone());
-        update_repo_status_in_tree(&mut self.filtered_library, display_name, status);
+        update_repo_status_in_tree(&mut self.library_tree, display_name, status);
     }
 
     /// Update the app with new repository data (for real-time loading).
     /// A selection made by the user is preserved across the update; automatic
     /// selections are redone so the workspace is preferred once it has repos.
     pub fn update_repos(&mut self, workspace_repos: Vec<RepoInfo>, library_repos: Vec<RepoInfo>) {
-        let previous = if self.selection_is_auto {
-            None
-        } else {
-            self.selected_position()
-        };
-
         // A rescan may have changed anything the info panel shows
         self.details.clear();
 
-        self.library_tree = build_library_tree(library_repos.clone(), &workspace_repos);
         self.workspace_repos_list = workspace_repos;
         self.library_repos_list = library_repos;
-        self.workspace_tree = build_tree(self.workspace_repos_with_overlays());
-        self.rebuild_filtered();
-
-        match previous {
-            Some((section, index, path)) => self.restore_selection(section, index, &path),
-            None => self.select_first_available(),
-        }
+        self.rebuild_preserving_selection();
     }
 
     /// Overlay a sync status (Fetching or SyncFailed) on the given repo
     pub fn set_sync_status(&mut self, display_name: &str, status: RepoOperationStatus) {
         self.sync_statuses.insert(display_name.to_string(), status);
-        self.rebuild_after_pending_change();
+        self.rebuild_preserving_selection();
     }
 
     /// Remove the sync status overlay from the given repo
     pub fn clear_sync_status(&mut self, display_name: &str) {
         if self.sync_statuses.remove(display_name).is_some() {
-            self.rebuild_after_pending_change();
+            self.rebuild_preserving_selection();
         }
     }
 
@@ -476,7 +463,7 @@ impl App {
             if modification_time.is_some() {
                 repo.modification_time = modification_time;
             }
-            self.rebuild_after_pending_change();
+            self.rebuild_preserving_selection();
         }
     }
 
@@ -501,12 +488,8 @@ impl App {
 
     /// The section, index, and full path of the currently selected item
     fn selected_position(&self) -> Option<(Section, usize, String)> {
-        let (trees, state) = match self.active_section {
-            Section::Workspace => (&self.filtered_workspace, &self.workspace_state),
-            Section::Library => (&self.filtered_library, &self.library_state),
-        };
-        let index = state.selected()?;
-        let path = flatten_trees(trees)
+        let index = self.state(self.active_section).selected()?;
+        let path = flatten_trees(self.trees(self.active_section))
             .get(index)
             .map(|(_, _, _, path)| path.clone())?;
         Some((self.active_section, index, path))
@@ -517,11 +500,7 @@ impl App {
     /// the nearest index in the previous section.
     fn restore_selection(&mut self, prev_section: Section, prev_index: usize, path: &str) {
         for section in [prev_section, prev_section.other()] {
-            let trees = match section {
-                Section::Workspace => &self.filtered_workspace,
-                Section::Library => &self.filtered_library,
-            };
-            if let Some(index) = flatten_trees(trees)
+            if let Some(index) = flatten_trees(self.trees(section))
                 .iter()
                 .position(|(_, _, _, p)| p == path)
             {
@@ -542,7 +521,7 @@ impl App {
 fn update_repo_status_in_tree(
     nodes: &mut [TreeNode],
     display_name: &str,
-    status: super::tree::RepoOperationStatus,
+    status: RepoOperationStatus,
 ) {
     for node in nodes {
         if let Some(ref mut repo) = node.repo_info
@@ -573,14 +552,14 @@ mod tests {
     }
 
     fn visible_workspace_paths(app: &App) -> Vec<String> {
-        flatten_trees(&app.filtered_workspace)
+        flatten_trees(&app.workspace_tree)
             .iter()
             .map(|(_, _, _, p)| p.clone())
             .collect()
     }
 
     fn workspace_repo_info(app: &App, name: &str) -> Option<RepoInfo> {
-        flatten_trees(&app.filtered_workspace)
+        flatten_trees(&app.workspace_tree)
             .iter()
             .find(|(_, _, _, p)| p == name)
             .and_then(|(node, _, _, _)| node.repo_info.clone())
@@ -616,6 +595,39 @@ mod tests {
         app.clear_sync_status("github.com/foo/app");
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
         assert_eq!(info.operation_status, RepoOperationStatus::None);
+    }
+
+    #[test]
+    fn search_filters_both_sections_without_losing_overlays() {
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app"), repo("github.com/foo/tool")],
+            vec![repo("github.com/bar/lib"), repo("github.com/bar/tool")],
+        );
+        app.set_sync_status("github.com/foo/tool", RepoOperationStatus::Fetching);
+        assert_eq!(app.count_workspace_repos(), 2);
+        assert_eq!(app.count_library_repos(), 2);
+
+        // Both panels narrow to the matching repo, which keeps its overlay
+        app.search_query = "tool".to_string();
+        app.filter_repos();
+        assert_eq!(app.count_workspace_repos(), 1);
+        assert_eq!(app.count_library_repos(), 1);
+        let info = workspace_repo_info(&app, "github.com/foo/tool").unwrap();
+        assert_eq!(info.operation_status, RepoOperationStatus::Fetching);
+
+        // A rescan landing while the filter is applied must not undo it
+        app.update_repos(
+            vec![repo("github.com/foo/app"), repo("github.com/foo/tool")],
+            vec![repo("github.com/bar/lib"), repo("github.com/bar/tool")],
+        );
+        assert_eq!(app.count_workspace_repos(), 1);
+        assert_eq!(app.count_library_repos(), 1);
+
+        // Clearing the search brings every repo back
+        app.clear_search();
+        assert_eq!(app.count_workspace_repos(), 2);
+        assert_eq!(app.count_library_repos(), 2);
     }
 
     #[test]
@@ -660,7 +672,7 @@ mod tests {
             vec![repo("github.com/foo/app"), repo("github.com/nosuch/thing")],
             Vec::new(),
         );
-        let status = flatten_trees(&app.filtered_workspace)
+        let status = flatten_trees(&app.workspace_tree)
             .iter()
             .find(|(_, _, _, p)| p == "github.com/nosuch/thing")
             .and_then(|(node, _, _, _)| node.repo_info.as_ref())
@@ -674,7 +686,7 @@ mod tests {
         // Expiry removes the overlay (the row survives here because the repo
         // landed on disk above)
         app.expire_failed_clones(Duration::from_secs(0));
-        let status = flatten_trees(&app.filtered_workspace)
+        let status = flatten_trees(&app.workspace_tree)
             .iter()
             .find(|(_, _, _, p)| p == "github.com/nosuch/thing")
             .and_then(|(node, _, _, _)| node.repo_info.as_ref())
