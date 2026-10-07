@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing::level_filters::LevelFilter;
 use workset::Workspace;
@@ -256,21 +256,32 @@ fn for_each_pattern(
     succeeded
 }
 
+/// Every repo checked out in the workspace, as its workspace-relative path
+/// paired with where it lives on disk, sorted by path.
+fn workspace_repos(workspace: &Workspace) -> Vec<(String, PathBuf)> {
+    let mut repos: Vec<(String, PathBuf)> =
+        workset::find_git_repositories(Path::new(&workspace.path))
+            .into_iter()
+            .map(|repo| (workspace.relative_name(&repo), repo))
+            .collect();
+    repos.sort();
+    repos.dedup();
+    repos
+}
+
 /// Workspace-relative paths of the checked-out repos whose path contains
 /// `pattern`, matching how the library is searched.
-fn workspace_matches(workspace: &Workspace, pattern: &str) -> Result<Vec<String>> {
-    Ok(workset::find_git_repositories(Path::new(&workspace.path))?
-        .iter()
-        .map(|repo| workspace.relative_name(repo))
+fn workspace_matches(workspace: &Workspace, pattern: &str) -> Vec<String> {
+    workspace_repos(workspace)
+        .into_iter()
+        .map(|(name, _)| name)
         .filter(|name| name.contains(pattern))
-        .collect())
+        .collect()
 }
 
 /// Restore repositories from library matching the pattern. Returns false when
 /// nothing was restored, so the caller can exit non-zero.
 fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
-    use std::path::PathBuf;
-
     // Get all repos from library
     let library_repos = workspace.list_library()?;
 
@@ -287,7 +298,7 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         // checked out is missing from the library rather than present in it.
         // Saying it's in the workspace beats claiming the library has nothing
         // matching, which reads like the repo was lost.
-        let in_workspace = workspace_matches(workspace, &pattern_str)?;
+        let in_workspace = workspace_matches(workspace, &pattern_str);
         if !in_workspace.is_empty() {
             for repo in in_workspace {
                 eprintln!("{} is already in the workspace", repo);
@@ -344,11 +355,12 @@ fn main() -> Result<ExitCode> {
     // the whole process on error.
     if let Ok(shell_type) = std::env::var("_ARGCOMPLETE_") {
         let maybe_workspace = Workspace::discover();
-        return match shell_type.as_str() {
-            "bash" => complete_bash(maybe_workspace).map(|()| ExitCode::SUCCESS),
-            "fish" => complete_fish(maybe_workspace).map(|()| ExitCode::SUCCESS),
+        match shell_type.as_str() {
+            "bash" => complete_bash(maybe_workspace),
+            "fish" => complete_fish(maybe_workspace),
             _ => anyhow::bail!("Unsupported shell type: {}", shell_type),
-        };
+        }
+        return Ok(ExitCode::SUCCESS);
     }
 
     let mut args = pico_args::Arguments::from_env();
@@ -651,7 +663,7 @@ fn report_drop(report: &workset::DropReport, delete: bool) {
 
 /// List all repositories in the workspace with their status
 fn list_workspace_status(workspace: &Workspace) -> Result<()> {
-    let repos = workset::find_git_repositories(Path::new(&workspace.path))?;
+    let repos = workset::find_git_repositories(Path::new(&workspace.path));
 
     if repos.is_empty() {
         outln!("No repositories found in workspace");
@@ -694,223 +706,358 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
 
     // Count repositories in workspace
     outln!();
-    if let Ok(repos) = workset::find_git_repositories(Path::new(&workspace.path)) {
-        outln!("Active repositories: {}", repos.len());
+    let repos = workset::find_git_repositories(Path::new(&workspace.path));
+    outln!("Active repositories: {}", repos.len());
 
-        let mut clean = 0;
-        let mut modified = 0;
-        let mut unpushed = 0;
-        let mut no_commits = 0;
-        let mut unreadable = 0;
+    let mut clean = 0;
+    let mut modified = 0;
+    let mut unpushed = 0;
+    let mut no_commits = 0;
+    let mut unreadable = 0;
 
-        for status in workset::scan_repos(&repos, workset::check_repo_status) {
-            match status {
-                Ok(workset::RepoStatus::Clean) => clean += 1,
-                Ok(workset::RepoStatus::Dirty) => modified += 1,
-                Ok(workset::RepoStatus::Unpushed) => unpushed += 1,
-                Ok(workset::RepoStatus::NoCommits) => no_commits += 1,
-                Ok(workset::RepoStatus::Unknown) => unreadable += 1,
-                Err(_) => unreadable += 1,
-            }
+    for status in workset::scan_repos(&repos, workset::check_repo_status) {
+        match status {
+            Ok(workset::RepoStatus::Clean) => clean += 1,
+            Ok(workset::RepoStatus::Dirty) => modified += 1,
+            Ok(workset::RepoStatus::Unpushed) => unpushed += 1,
+            Ok(workset::RepoStatus::NoCommits) => no_commits += 1,
+            Ok(workset::RepoStatus::Unknown) => unreadable += 1,
+            Err(_) => unreadable += 1,
         }
+    }
 
-        if clean > 0 {
-            outln!("  ✓ {} clean", clean);
-        }
-        if modified > 0 {
-            outln!("  ⚠ {} with uncommitted changes", modified);
-        }
-        if unpushed > 0 {
-            outln!("  ⚠ {} with unpushed commits", unpushed);
-        }
-        if no_commits > 0 {
-            outln!("  ⚠ {} with no commits", no_commits);
-        }
-        if unreadable > 0 {
-            println!("  ✗ {} workset can't read", unreadable);
-        }
+    if clean > 0 {
+        outln!("  ✓ {} clean", clean);
+    }
+    if modified > 0 {
+        outln!("  ⚠ {} with uncommitted changes", modified);
+    }
+    if unpushed > 0 {
+        outln!("  ⚠ {} with unpushed commits", unpushed);
+    }
+    if no_commits > 0 {
+        outln!("  ⚠ {} with no commits", no_commits);
+    }
+    if unreadable > 0 {
+        outln!("  ✗ {} workset can't read", unreadable);
     }
 
     Ok(())
 }
 
-/// Get repository completions from configured remotes
-fn get_repo_completions(workspace: &Workspace) -> Vec<String> {
-    let mut repos = Vec::new();
+/// Subcommands offered for completion, each with the one-line description
+/// that shells able to show one (fish) put next to it. Which table applies
+/// depends on whether there is a workspace: `init` is what makes one, and
+/// everything else needs one to already exist.
+const SUBCOMMANDS: &[(&str, &str)] = &[
+    ("clone", "Clone new repository(ies) to workspace"),
+    ("restore", "Restore repository(ies) from library"),
+    ("drop", "Drop one or more repositories"),
+    ("list", "List all repositories with their status"),
+    ("ls", "List all repositories with their status"),
+    ("status", "Show workspace summary and statistics"),
+];
+const INIT_SUBCOMMAND: &[(&str, &str)] = &[("init", "Initialize a workspace in current directory")];
 
-    // Only complete with local workspace repos
-    if let Ok(local_repos) = workset::find_git_repositories(Path::new(&workspace.path)) {
-        for repo in local_repos {
-            if let Ok(relative) = repo.strip_prefix(&workspace.path) {
-                repos.push(relative.display().to_string());
-            }
-        }
-    }
-
-    repos.sort();
-    repos.dedup();
-    repos
+/// What a completion request should offer.
+///
+/// Candidates carry only what is free to produce. A workspace repo's
+/// description costs a repo open, so the path on disk is kept here and only
+/// the shells that render descriptions go and get one.
+enum Completions {
+    /// (subcommand, description)
+    Subcommands(&'static [(&'static str, &'static str)]),
+    /// Repos the library holds, by workspace-relative path
+    Library(Vec<String>),
+    /// Repos checked out in the workspace: workspace-relative path and the
+    /// path on disk to describe it from
+    Workspace(Vec<(String, PathBuf)>),
 }
 
-/// Get repository completions with metadata (status and modification time) for fish shell
-fn get_repo_completions_with_metadata(workspace: &Workspace) -> Vec<(String, String)> {
-    let mut repos = Vec::new();
-
-    // Only complete with local workspace repos
-    if let Ok(local_repos) = workset::find_git_repositories(Path::new(&workspace.path)) {
-        // Completions run on every TAB press, so the per-repo worktree walks
-        // behind these descriptions go to the whole machine at once
-        let scanned = workset::scan_repos(&local_repos, |repo| {
-            // If this fails, we'll still provide a basic completion
-            match workset::check_repo_status_and_modification_time(repo) {
-                Ok((status, mod_time)) => (Some(status), mod_time),
-                Err(_) => (None, None),
-            }
-        });
-
-        for (repo, (status, mod_time)) in local_repos.iter().zip(scanned) {
-            if let Ok(relative) = repo.strip_prefix(&workspace.path) {
-                let repo_name = relative.display().to_string();
-
-                // Build description with status and time
-                let mut desc_parts = Vec::new();
-
-                // Add status indicator
-                match status {
-                    Some(workset::RepoStatus::Clean) => desc_parts.push("clean".to_string()),
-                    Some(workset::RepoStatus::Dirty) => desc_parts.push("dirty".to_string()),
-                    Some(workset::RepoStatus::Unpushed) => desc_parts.push("unpushed".to_string()),
-                    Some(workset::RepoStatus::NoCommits) => {
-                        desc_parts.push("no commits".to_string())
-                    }
-                    Some(workset::RepoStatus::Unknown) => desc_parts.push("unreadable".to_string()),
-                    None => {} // Don't add "unknown" if status check failed
-                }
-
-                // Add modification time
-                if let Some(time) = mod_time {
-                    desc_parts.push(workset::format_time_ago(time));
-                }
-
-                // If we couldn't get any metadata, use a default description
-                let description = if desc_parts.is_empty() {
-                    "repository".to_string()
-                } else {
-                    desc_parts.join(", ")
-                };
-
-                repos.push((repo_name, description));
-            }
+impl Completions {
+    /// Just the candidate words, for shells that take no descriptions
+    fn values(&self) -> Vec<&str> {
+        match self {
+            Self::Subcommands(subcommands) => subcommands.iter().map(|(name, _)| *name).collect(),
+            Self::Library(repos) => repos.iter().map(String::as_str).collect(),
+            Self::Workspace(repos) => repos.iter().map(|(name, _)| name.as_str()).collect(),
         }
     }
-
-    // Sort by repo name
-    repos.sort_by(|a, b| a.0.cmp(&b.0));
-    repos.dedup();
-    repos
 }
 
-/// Output dynamic completions for bash
-fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
+/// The command line up to the cursor.
+///
+/// `COMP_POINT` is the cursor's byte offset into `COMP_LINE`, but bash has
+/// multibyte quirks where it can exceed the line length or land inside a UTF-8
+/// character, so it is clamped to the nearest valid boundary. Shells that hand
+/// over a line already cut at the cursor (fish) pass no `COMP_POINT` at all.
+fn line_before_cursor(comp_line: &str, comp_point: Option<usize>) -> &str {
+    let mut point = comp_point.unwrap_or(comp_line.len()).min(comp_line.len());
+    while !comp_line.is_char_boundary(point) {
+        point -= 1;
+    }
+    &comp_line[..point]
+}
+
+/// Everything the word at the cursor could become, together with what has
+/// been typed of that word already.
+///
+/// Candidates are not filtered by the prefix here because the two shells want
+/// opposite things: bash takes our output into COMPREPLY verbatim, so it has
+/// to be filtered, while fish filters by the current token itself and wants
+/// the whole context.
+fn completions<'line>(
+    maybe_workspace: Option<&Workspace>,
+    comp_line: &'line str,
+    comp_point: Option<usize>,
+) -> (&'line str, Completions) {
+    let line = line_before_cursor(comp_line, comp_point);
+    let words: Vec<&str> = line.split_whitespace().collect();
+
+    // The word being completed is empty when the cursor follows whitespace,
+    // otherwise it is the last word
+    let (current_word, word_index) = if line.is_empty() || line.ends_with(char::is_whitespace) {
+        ("", words.len())
+    } else {
+        (*words.last().unwrap(), words.len() - 1)
+    };
+
+    // Word 0 is the binary's own name, so the subcommand is word 1
+    let candidates = if word_index <= 1 {
+        Completions::Subcommands(match maybe_workspace {
+            Some(_) => SUBCOMMANDS,
+            None => INIT_SUBCOMMAND,
+        })
+    } else {
+        // Past the subcommand every argument names a repo, which only means
+        // something inside a workspace
+        match maybe_workspace {
+            // `restore` names repos the library holds; every other subcommand
+            // names repos that are checked out
+            Some(workspace) if words.get(1) == Some(&"restore") => {
+                Completions::Library(workspace.list_library().unwrap_or_default())
+            }
+            Some(workspace) => Completions::Workspace(workspace_repos(workspace)),
+            None => Completions::Workspace(Vec::new()),
+        }
+    };
+
+    (current_word, candidates)
+}
+
+/// The completion request as the shell describes it in the environment
+fn completion_request() -> (String, Option<usize>) {
     let comp_line = std::env::var("COMP_LINE").unwrap_or_default();
-
-    // COMP_POINT is the cursor's byte offset into COMP_LINE, but bash has
-    // multibyte quirks where it can exceed the line length or land inside a
-    // UTF-8 character; clamp it to the nearest valid boundary.
-    let mut comp_point = std::env::var("COMP_POINT")
+    let comp_point = std::env::var("COMP_POINT")
         .ok()
-        .and_then(|p| p.parse::<usize>().ok())
-        .unwrap_or(comp_line.len())
-        .min(comp_line.len());
-    while !comp_line.is_char_boundary(comp_point) {
-        comp_point -= 1;
-    }
-
-    let current_line = &comp_line[..comp_point];
-    let words: Vec<&str> = current_line.split_whitespace().collect();
-
-    // The word being completed: empty if the cursor follows whitespace,
-    // otherwise the last word. Bash inserts our output into COMPREPLY
-    // verbatim, so we must filter candidates by this prefix ourselves.
-    let (current_word, word_index) =
-        if current_line.is_empty() || current_line.ends_with(char::is_whitespace) {
-            ("", words.len())
-        } else {
-            (*words.last().unwrap(), words.len() - 1)
-        };
-
-    if word_index <= 1 {
-        // Complete subcommands
-        let subcommands: &[&str] = if maybe_workspace.is_some() {
-            &["clone", "restore", "drop", "list", "ls", "status"]
-        } else {
-            &["init"]
-        };
-        for subcommand in subcommands {
-            if subcommand.starts_with(current_word) {
-                outln!("{}", subcommand);
-            }
-        }
-    } else if let Some(workspace) = maybe_workspace {
-        // Complete repository paths based on the subcommand
-        let subcommand = words.get(1).unwrap_or(&"");
-        if *subcommand == "restore" {
-            // For restore, complete from library
-            if let Ok(library_repos) = workspace.list_library() {
-                for repo in library_repos {
-                    if repo.starts_with(current_word) {
-                        outln!("{}", repo);
-                    }
-                }
-            }
-        } else {
-            // For drop and other commands, complete from workspace
-            for repo in get_repo_completions(&workspace) {
-                if repo.starts_with(current_word) {
-                    outln!("{}", repo);
-                }
-            }
-        }
-    }
-
-    Ok(())
+        .and_then(|point| point.parse().ok());
+    (comp_line, comp_point)
 }
 
-/// Output dynamic completions for fish
-fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
-    let comp_line = std::env::var("COMP_LINE").unwrap_or_default();
-    let words: Vec<&str> = comp_line.split_whitespace().collect();
+/// How a workspace repo is described next to its completion: its status and
+/// how long ago it changed, both from a single repo open
+fn describe_workspace_repo(repo: &Path) -> String {
+    // A repo we can't read still gets a completion, just an unadorned one
+    let (status, modification_time) = workset::check_repo_status_and_modification_time(repo)
+        .map(|(status, time)| (Some(status), time))
+        .unwrap_or((None, None));
 
-    // Determine what to complete based on context
-    if words.len() <= 1 || (words.len() == 2 && !comp_line.ends_with(' ')) {
-        // Complete subcommands
-        if maybe_workspace.is_some() {
-            outln!("clone\tClone new repository(ies) to workspace");
-            outln!("restore\tRestore repository(ies) from library");
-            outln!("drop\tDrop one or more repositories");
-            outln!("list\tList all repositories with their status");
-            outln!("ls\tList all repositories with their status");
-            outln!("status\tShow workspace summary and statistics");
-        } else {
-            outln!("init\tInitialize a workspace in current directory");
-        }
-    } else if let Some(workspace) = maybe_workspace {
-        // Complete repository paths based on the subcommand
-        let subcommand = words.get(1).unwrap_or(&"");
-        if *subcommand == "restore" {
-            // For restore, complete from library
-            if let Ok(library_repos) = workspace.list_library() {
-                for repo in library_repos {
-                    outln!("{}\tlibrary", repo);
-                }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(status) = status {
+        parts.push(
+            match status {
+                workset::RepoStatus::Clean => "clean",
+                workset::RepoStatus::Dirty => "dirty",
+                workset::RepoStatus::Unpushed => "unpushed",
+                workset::RepoStatus::NoCommits => "no commits",
+                workset::RepoStatus::Unknown => "unreadable",
             }
-        } else {
-            // For drop and other commands, complete from workspace with metadata
-            for (repo_name, description) in get_repo_completions_with_metadata(&workspace) {
-                outln!("{}\t{}", repo_name, description);
+            .to_string(),
+        );
+    }
+    if let Some(time) = modification_time {
+        parts.push(workset::format_time_ago(time));
+    }
+
+    if parts.is_empty() {
+        "repository".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Output dynamic completions for bash, which takes bare words and inserts
+/// them verbatim, so the prefix has to be honoured here
+fn complete_bash(maybe_workspace: Option<Workspace>) {
+    let (comp_line, comp_point) = completion_request();
+    let (current_word, candidates) = completions(maybe_workspace.as_ref(), &comp_line, comp_point);
+    for value in candidates.values() {
+        if value.starts_with(current_word) {
+            outln!("{}", value);
+        }
+    }
+}
+
+/// Output dynamic completions for fish, which shows a description after a tab
+/// and narrows the list by the current token itself
+fn complete_fish(maybe_workspace: Option<Workspace>) {
+    let (comp_line, comp_point) = completion_request();
+    match completions(maybe_workspace.as_ref(), &comp_line, comp_point).1 {
+        Completions::Subcommands(subcommands) => {
+            for (name, description) in subcommands {
+                outln!("{}\t{}", name, description);
+            }
+        }
+        Completions::Library(repos) => {
+            for repo in repos {
+                outln!("{}\tlibrary", repo);
+            }
+        }
+        Completions::Workspace(repos) => {
+            // Completions run on every TAB press, so the per-repo worktree
+            // walks behind these descriptions go to the whole machine at once
+            let paths: Vec<PathBuf> = repos.iter().map(|(_, path)| path.clone()).collect();
+            let descriptions = workset::scan_repos(&paths, describe_workspace_repo);
+            for ((name, _), description) in repos.iter().zip(descriptions) {
+                outln!("{}\t{}", name, description);
             }
         }
     }
+}
 
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A workspace holding one checked-out repo and one library entry
+    fn workspace(root: &Path) -> Workspace {
+        let workspace = Workspace {
+            path: root.to_string_lossy().to_string(),
+        };
+        let checked_out = root.join("github.com/user/alpha");
+        std::fs::create_dir_all(&checked_out).unwrap();
+        gix::init(&checked_out).unwrap();
+        std::fs::create_dir_all(
+            Path::new(&workspace.library_path()).join("github.com/user/stored"),
+        )
+        .unwrap();
+        gix::init_bare(Path::new(&workspace.library_path()).join("github.com/user/stored"))
+            .unwrap();
+        workspace
+    }
+
+    /// The candidate words for the given line, as fish gets them: everything
+    /// the completion context offers, since fish narrows the list itself
+    fn offered(maybe_workspace: Option<&Workspace>, line: &str) -> Vec<String> {
+        completions(maybe_workspace, line, None)
+            .1
+            .values()
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    }
+
+    /// The candidate words for the given line, as bash gets them: narrowed by
+    /// what has been typed of the word at `comp_point`, because bash inserts
+    /// them verbatim
+    fn offered_to_bash(
+        maybe_workspace: Option<&Workspace>,
+        line: &str,
+        comp_point: Option<usize>,
+    ) -> Vec<String> {
+        let (current_word, candidates) = completions(maybe_workspace, line, comp_point);
+        candidates
+            .values()
+            .iter()
+            .filter(|value| value.starts_with(current_word))
+            .map(|value| value.to_string())
+            .collect()
+    }
+
+    const ALL_SUBCOMMANDS: [&str; 6] = ["clone", "restore", "drop", "list", "ls", "status"];
+
+    #[test]
+    fn the_first_word_completes_to_a_subcommand() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = workspace(temp.path());
+
+        assert_eq!(offered(Some(&workspace), "workset "), ALL_SUBCOMMANDS);
+        // Bash is handed only what it may insert; fish gets the whole context
+        // and narrows it itself
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset l", None),
+            ["list", "ls"]
+        );
+        assert_eq!(offered(Some(&workspace), "workset l"), ALL_SUBCOMMANDS);
+        assert!(offered_to_bash(Some(&workspace), "workset nope", None).is_empty());
+    }
+
+    #[test]
+    fn outside_a_workspace_only_init_is_offered() {
+        // Every other subcommand needs a workspace, and no repo can be named
+        // before there is one
+        assert_eq!(offered(None, "workset "), ["init"]);
+        assert!(offered(None, "workset init ").is_empty());
+    }
+
+    #[test]
+    fn restore_names_the_library_and_everything_else_the_workspace() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = workspace(temp.path());
+
+        // A restore takes a repo out of the library, so only its entries can
+        // be named
+        assert_eq!(
+            offered(Some(&workspace), "workset restore "),
+            ["github.com/user/stored"]
+        );
+        // Everything else acts on repos that are checked out, and keeps
+        // offering them after the first one
+        for line in [
+            "workset drop ",
+            "workset clone ",
+            "workset drop github.com/user/alpha ",
+        ] {
+            assert_eq!(
+                offered(Some(&workspace), line),
+                ["github.com/user/alpha"],
+                "line: {line}"
+            );
+        }
+        // For bash, a repo name is narrowed by its prefix like anything else
+        assert!(offered_to_bash(Some(&workspace), "workset drop gitlab", None).is_empty());
+    }
+
+    #[test]
+    fn the_cursor_decides_which_word_is_being_completed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = workspace(temp.path());
+
+        // With the cursor still in the subcommand, the repo after it is not
+        // what's being completed
+        let line = "workset dr github.com/user/alpha";
+        assert_eq!(
+            offered_to_bash(Some(&workspace), line, Some("workset dr".len())),
+            ["drop"]
+        );
+
+        // The cursor inside the command's own name leaves nothing to offer;
+        // bash completes command names itself
+        assert!(offered_to_bash(Some(&workspace), "workset", Some(7)).is_empty());
+
+        // A COMP_POINT past the end, or inside a multi-byte character, must
+        // not panic on a non-boundary slice
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset ", Some(999)),
+            ALL_SUBCOMMANDS
+        );
+        // 'ü' spans bytes 13..15, so a cursor at 14 is inside it and the line
+        // is cut back to the boundary before it
+        let multibyte = "workset drop ünicode";
+        assert_eq!(
+            offered_to_bash(Some(&workspace), multibyte, Some(14)),
+            ["github.com/user/alpha"]
+        );
+        assert!(offered_to_bash(Some(&workspace), multibyte, Some(15)).is_empty());
+    }
 }

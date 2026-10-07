@@ -1750,7 +1750,7 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     // repo open — before any status work, so every row can render with a
     // "scanning" status right away. These rows are also the scan's task list,
     // so each repo is placed in the tree exactly once.
-    let workspace_paths = find_git_repositories(Path::new(&workspace.path)).unwrap_or_default();
+    let workspace_paths = find_git_repositories(Path::new(&workspace.path));
     let library_names = workspace.list_library().unwrap_or_default();
     let library_paths: Vec<PathBuf> = library_names
         .iter()

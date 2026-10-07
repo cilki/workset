@@ -75,14 +75,15 @@ fn is_git_dir(path: &Path) -> bool {
 
 /// Recursively find "top-level" git repositories.
 /// This function will not traverse into .git directories or nested git repositories.
-pub fn find_git_repositories(path: &Path) -> Result<Vec<PathBuf>> {
+///
+/// A directory that can't be read is skipped rather than reported, so the walk
+/// always yields whatever it could reach.
+pub fn find_git_repositories(path: &Path) -> Vec<PathBuf> {
     debug!(path = %path.display(), "Recursively searching for git repositories");
-    let mut found: Vec<PathBuf> = Vec::new();
 
     // Check if this path itself is a git repository
     if path.join(".git").exists() {
-        found.push(path.to_path_buf());
-        return Ok(found); // Don't traverse into git repositories
+        return vec![path.to_path_buf()]; // Don't traverse into git repositories
     }
 
     // A bare repository is a repository too, so the search stops here as
@@ -100,8 +101,10 @@ pub fn find_git_repositories(path: &Path) -> Result<Vec<PathBuf>> {
     // the library, which is the part of a workspace this tool exists to let
     // you grow.
     if is_git_dir(path) {
-        return Ok(found);
+        return Vec::new();
     }
+
+    let mut found: Vec<PathBuf> = Vec::new();
 
     // Otherwise, recursively search subdirectories. `read_dir` hands entries
     // back in whatever order the filesystem keeps them, which is neither
@@ -115,8 +118,6 @@ pub fn find_git_repositories(path: &Path) -> Result<Vec<PathBuf>> {
         entries.sort_by_key(|entry| entry.file_name());
 
         for entry in entries {
-            let entry_path = entry.path();
-
             // Only traverse real directories. `file_type` doesn't follow
             // symlinks, so a symlinked directory is skipped: whatever it
             // points at lives somewhere else, and a repo found through one
@@ -128,17 +129,11 @@ pub fn find_git_repositories(path: &Path) -> Result<Vec<PathBuf>> {
                 continue;
             }
 
-            match find_git_repositories(&entry_path) {
-                Ok(mut repos) => found.append(&mut repos),
-                Err(e) => {
-                    // Log but don't fail on permission errors
-                    debug!(path = %entry_path.display(), error = %e, "Skipping directory");
-                }
-            }
+            found.append(&mut find_git_repositories(&entry.path()));
         }
     }
 
-    Ok(found)
+    found
 }
 
 /// Whether a path read out of `.gitmodules` names a place inside the
@@ -1076,7 +1071,7 @@ impl Workspace {
     /// [`resolve_pattern`](Self::resolve_pattern) for turning a pattern the
     /// user typed relative to their current directory into one of these.
     pub fn search(&self, pattern: &RepoPattern) -> Result<Vec<PathBuf>> {
-        find_git_repositories(&self.repo_path(pattern)?)
+        Ok(find_git_repositories(&self.repo_path(pattern)?))
     }
 
     /// Rewrite a pattern that names a path under `cwd` into a workspace-relative
@@ -1145,7 +1140,7 @@ impl Workspace {
 
         let cwd = std::env::current_dir()?;
         let mut report = DropReport::default();
-        for repo in find_git_repositories(&cwd)? {
+        for repo in find_git_repositories(&cwd) {
             self.drop_repo(&repo, delete, force, &mut report)?;
         }
         Ok(report)
@@ -1619,11 +1614,7 @@ mod tests {
         }
 
         // Nor was the repo smuggled into the workspace on the way out
-        assert!(
-            find_git_repositories(Path::new(&workspace.path))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(find_git_repositories(Path::new(&workspace.path)).is_empty());
     }
 
     #[test]
@@ -1990,7 +1981,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("linked-dir")).unwrap();
         std::os::unix::fs::symlink(outside.join("repo"), root.join("linked-repo")).unwrap();
 
-        let repos = find_git_repositories(&root).unwrap();
+        let repos = find_git_repositories(&root);
         assert_eq!(repos, vec![root.join("inside")]);
     }
 
@@ -2347,7 +2338,7 @@ mod tests {
         let not_repo = base_path.join("not_a_repo");
         fs::create_dir_all(&not_repo).unwrap();
 
-        let repos = find_git_repositories(base_path).unwrap();
+        let repos = find_git_repositories(base_path);
 
         assert_eq!(repos.len(), 2);
         assert!(repos.iter().any(|p| p.ends_with("repo1")));
@@ -2375,7 +2366,6 @@ mod tests {
         }
 
         let repos: Vec<_> = find_git_repositories(base_path)
-            .unwrap()
             .iter()
             .map(|repo| {
                 repo.strip_prefix(base_path)
@@ -2482,7 +2472,7 @@ mod tests {
         // is exactly the shape the walk reports as a workspace repo.
         fs::create_dir_all(library_entry.join("objects/decoy/.git")).unwrap();
 
-        let repos = find_git_repositories(root).unwrap();
+        let repos = find_git_repositories(root);
         assert_eq!(repos, vec![kept]);
     }
 
