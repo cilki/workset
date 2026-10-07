@@ -1921,6 +1921,36 @@ mod tests {
         assert_eq!(submodule.parent_repo_path.as_deref(), Some(&*repo_path));
     }
 
+    /// A submodule row's path is its parent's joined with whatever
+    /// `.gitmodules` declares, and that file comes from the repo — so a cloned
+    /// repo could hand the scan a path outside itself. Everything the TUI does
+    /// to a row works from this path: the size walk, the git calls behind the
+    /// info panel, the shell Enter opens. An absolute path is the worst of it,
+    /// since joining replaces the parent's path outright.
+    #[test]
+    fn scanning_a_repo_yields_no_row_outside_it() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo_path = temp.path().join("work/app");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        gix::init(&repo_path).unwrap();
+        std::fs::write(
+            repo_path.join(".gitmodules"),
+            "[submodule \"root\"]\n\tpath = /\n\turl = https://example.com/a.git\n\
+             [submodule \"up\"]\n\tpath = ../../..\n\turl = https://example.com/b.git\n",
+        )
+        .unwrap();
+
+        let scanned = scan_workspace_repo(RepoInfo {
+            path: repo_path.clone(),
+            display_name: "work/app".to_string(),
+            ..Default::default()
+        });
+
+        // Only the repo itself, and nothing claiming to be a submodule of it
+        assert_eq!(scanned.len(), 1, "expected no submodule rows");
+        assert_eq!(scanned[0].path, repo_path);
+    }
+
     /// Every repo discovery announces comes back scanned exactly once, from
     /// both the workspace and the library.
     #[test]
