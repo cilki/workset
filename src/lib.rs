@@ -647,13 +647,14 @@ fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime>
 }
 
 /// Walk the repository's changed and untracked files in a single status pass,
-/// calling `visit` with the worktree path of each. Stops as soon as `visit`
-/// returns false, so callers that only need to know whether the worktree is
-/// dirty don't pay for the rest of the walk.
+/// calling `visit` with the worktree path of each, or None when git reports a
+/// path this platform can't represent. Stops as soon as `visit` returns false,
+/// so callers that only need to know whether the worktree is dirty don't pay
+/// for the rest of the walk.
 fn walk_worktree_changes(
     repo: &gix::Repository,
     repo_path: &Path,
-    mut visit: impl FnMut(PathBuf) -> bool,
+    mut visit: impl FnMut(Option<PathBuf>) -> bool,
 ) {
     let platform = match repo.status(gix::progress::Discard) {
         Ok(p) => p,
@@ -684,7 +685,23 @@ fn walk_worktree_changes(
     };
 
     for item in iter.flatten() {
-        if !visit(repo_path.join(gix::path::from_bstr(item.rela_path()))) {
+        // An entry whose path this platform can't represent is still a change,
+        // so hand it to `visit` unnamed rather than dropping it and risking a
+        // dirty worktree reported as clean
+        let path = match gix::path::from_bstr(item.rela_path()) {
+            Ok(rela_path) => Some(repo_path.join(rela_path)),
+            Err(e) => {
+                warn!(
+                    path = %repo_path.display(),
+                    rela_path = %item.rela_path(),
+                    error = %e,
+                    "Changed file has a path that can't be represented"
+                );
+                None
+            }
+        };
+
+        if !visit(path) {
             return;
         }
     }
@@ -706,8 +723,12 @@ fn worktree_is_dirty(repo: &gix::Repository, repo_path: &Path) -> bool {
 fn dirty_files_time(repo: &gix::Repository, repo_path: &Path) -> Option<std::time::SystemTime> {
     let mut latest = None;
     walk_worktree_changes(repo, repo_path, |file_path| {
-        let modified = std::fs::metadata(&file_path)
-            .and_then(|metadata| metadata.modified())
+        let modified = file_path
+            .and_then(|file_path| {
+                std::fs::metadata(&file_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            })
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         latest = latest.max(Some(modified));
         true
