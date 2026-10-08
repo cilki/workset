@@ -632,6 +632,24 @@ testListSortsRepos() {
 	diff expected actual
 }
 
+## A reader that goes away before workset is done writing ends the command,
+## it doesn't crash it. Rust ignores SIGPIPE, so the write fails instead of
+## killing the process, and println! answers a failed write with a panic: a
+## `workset list | head` used to print a panic and a backtrace note to stderr
+## and exit 101 where every other command in a pipeline exits quietly.
+testOutputIntoClosedPipeIsQuiet() {
+	newWorkspace
+	createRepo repo1
+	createRepo repo2
+
+	# The reader is gone before workset writes a byte, so the first line it
+	# prints fails for certain rather than only when the output outgrows the
+	# pipe buffer
+	for command in list ls status; do
+		[ -z "$({ { sleep 1; workset $command; } | true; } 2>&1)" ]
+	done
+}
+
 ## A repo whose HEAD is detached — mid-bisect, mid-rebase, or just checked
 ## out by commit — still has all its history, so it isn't "no commits"
 testListDetachedHeadRepo() {
