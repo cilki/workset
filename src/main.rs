@@ -669,6 +669,7 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
             Ok(workset::RepoStatus::Dirty) => "⚠ modified".to_string(),
             Ok(workset::RepoStatus::Unpushed) => "⚠ unpushed".to_string(),
             Ok(workset::RepoStatus::NoCommits) => "⚠ no commits".to_string(),
+            Ok(workset::RepoStatus::Unknown) => "✗ unreadable".to_string(),
             Err(_) => "✗ error".to_string(),
         };
 
@@ -698,6 +699,7 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
         let mut modified = 0;
         let mut unpushed = 0;
         let mut no_commits = 0;
+        let mut unreadable = 0;
 
         for repo in &repos {
             match workset::check_repo_status(repo) {
@@ -705,7 +707,8 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
                 Ok(workset::RepoStatus::Dirty) => modified += 1,
                 Ok(workset::RepoStatus::Unpushed) => unpushed += 1,
                 Ok(workset::RepoStatus::NoCommits) => no_commits += 1,
-                Err(_) => {}
+                Ok(workset::RepoStatus::Unknown) => unreadable += 1,
+                Err(_) => unreadable += 1,
             }
         }
 
@@ -720,6 +723,9 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
         }
         if no_commits > 0 {
             outln!("  ⚠ {} with no commits", no_commits);
+        }
+        if unreadable > 0 {
+            println!("  ✗ {} workset can't read", unreadable);
         }
     }
 
@@ -773,6 +779,7 @@ fn get_repo_completions_with_metadata(workspace: &Workspace) -> Vec<(String, Str
                     Some(workset::RepoStatus::NoCommits) => {
                         desc_parts.push("no commits".to_string())
                     }
+                    Some(workset::RepoStatus::Unknown) => desc_parts.push("unreadable".to_string()),
                     None => {} // Don't add "unknown" if status check failed
                 }
 

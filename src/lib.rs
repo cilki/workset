@@ -330,6 +330,20 @@ pub enum RepoStatus {
     NoCommits,
     /// Repository has unpushed commits (but is otherwise clean)
     Unpushed,
+    /// The repository couldn't be read, so what it holds is unknown. It may be
+    /// full of work that exists nowhere else.
+    ///
+    /// gix doesn't read every repository git can write: a repo created with
+    /// `--object-format=sha256` has a config gix refuses outright, and one
+    /// created with `--ref-format=reftable` (git 2.45+) opens but yields
+    /// nothing for HEAD or for the worktree status. Both are ordinary
+    /// repositories to git, and both land here.
+    ///
+    /// This is deliberately *not* [`NoCommits`](Self::NoCommits): reporting an
+    /// unreadable repo as empty told `drop` that moving its git directory
+    /// away and deleting its worktree lost nothing, and it deleted
+    /// uncommitted work that existed nowhere else.
+    Unknown,
 }
 
 /// Why a repository was left in the workspace instead of being dropped
@@ -370,7 +384,8 @@ impl std::fmt::Display for DropBlocker {
         match self {
             Self::Outstanding(RepoStatus::Dirty) => f.write_str("uncommitted changes"),
             Self::Outstanding(RepoStatus::Unpushed) => f.write_str("unpushed commits"),
-            // drop only ever blocks on the two statuses above
+            Self::Outstanding(RepoStatus::Unknown) => f.write_str("unreadable repository"),
+            // drop only ever blocks on the three statuses above
             Self::Outstanding(_) => f.write_str("outstanding changes"),
             Self::BorrowedGitDir => f.write_str("git directory belongs to another repository"),
             Self::MainWorktree(1) => f.write_str("git directory shared with 1 linked worktree"),
@@ -456,18 +471,22 @@ fn live_linked_worktrees(git_dir: &Path) -> usize {
 /// Check repository status (commits, changes, unpushed) in a single pass
 pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
     let Some(repo) = open_repo(repo_path) else {
-        return Ok(RepoStatus::NoCommits);
+        return Ok(RepoStatus::Unknown);
     };
     // Dirtiness is checked before the first commit is looked for, because a
     // repo without commits still holds whatever is staged or untracked in its
     // worktree, and that work exists nowhere but here: no commit, no remote,
     // nothing the library would keep. Reporting it as NoCommits told `drop` it
     // was safe to move the git directory away and delete the worktree.
-    if worktree_is_dirty(&repo, repo_path) {
-        return Ok(RepoStatus::Dirty);
+    match worktree_is_dirty(&repo, repo_path) {
+        Some(true) => return Ok(RepoStatus::Dirty),
+        // A worktree that couldn't be read is not a worktree without changes
+        None => return Ok(RepoStatus::Unknown),
+        Some(false) => {}
     }
     Ok(match head_state(&repo) {
         HeadState::Unborn => RepoStatus::NoCommits,
+        HeadState::Unreadable => RepoStatus::Unknown,
         HeadState::Detached => RepoStatus::Clean,
         HeadState::Branch(head_ref) => check_unpushed_status(&repo, head_ref),
     })
@@ -479,10 +498,15 @@ pub fn check_repo_status_and_modification_time(
     repo_path: &Path,
 ) -> Result<(RepoStatus, Option<std::time::SystemTime>)> {
     let Some(repo) = open_repo(repo_path) else {
-        return Ok((RepoStatus::NoCommits, None));
+        return Ok((RepoStatus::Unknown, None));
     };
 
-    let dirty_time = dirty_files_time(&repo, repo_path);
+    let (readable, dirty_time) = dirty_files_time(&repo, repo_path);
+    if !readable {
+        // Nothing may conclude from an unreadable worktree that it holds no
+        // work, least of all `drop`
+        return Ok((RepoStatus::Unknown, None));
+    }
 
     if let Some(dirty_time) = dirty_time {
         // For dirty repos, use the max of last commit time and dirty file
@@ -497,6 +521,7 @@ pub fn check_repo_status_and_modification_time(
             // so callers don't render a spurious "56y ago" from the UNIX epoch.
             return Ok((RepoStatus::NoCommits, None));
         }
+        HeadState::Unreadable => return Ok((RepoStatus::Unknown, None)),
         HeadState::Detached => RepoStatus::Clean,
         HeadState::Branch(head_ref) => check_unpushed_status(&repo, head_ref),
     };
@@ -528,6 +553,10 @@ enum HeadState<'repo> {
     Detached,
     /// At a branch that doesn't exist yet, because the repo has no commits
     Unborn,
+    /// HEAD couldn't be read, so where it points is unknown. A repo whose refs
+    /// gix can't read (reftable) lands here, and it is no more "no commits"
+    /// than it is clean.
+    Unreadable,
 }
 
 /// Classify what HEAD points at. Detached is kept apart from Unborn because
@@ -536,7 +565,7 @@ enum HeadState<'repo> {
 /// status line, the summary counts and the TUI all repeat.
 fn head_state(repo: &gix::Repository) -> HeadState<'_> {
     let Ok(head) = repo.head() else {
-        return HeadState::Unborn;
+        return HeadState::Unreadable;
     };
     if head.is_unborn() {
         return HeadState::Unborn;
@@ -660,11 +689,17 @@ fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime>
 /// path this platform can't represent. Stops as soon as `visit` returns false,
 /// so callers that only need to know whether the worktree is dirty don't pay
 /// for the rest of the walk.
+///
+/// Returns false when the walk couldn't be completed, in which case `visit`
+/// never saw the changes the worktree may well hold. Callers must not read
+/// that as a clean worktree: that is what let `drop` delete work it couldn't
+/// see.
+#[must_use]
 fn walk_worktree_changes(
     repo: &gix::Repository,
     repo_path: &Path,
     mut visit: impl FnMut(Option<PathBuf>) -> bool,
-) {
+) -> bool {
     let platform = match repo.status(gix::progress::Discard) {
         Ok(p) => p,
         Err(e) => {
@@ -673,7 +708,7 @@ fn walk_worktree_changes(
                 error = %e,
                 "Failed to create status platform"
             );
-            return;
+            return false;
         }
     };
 
@@ -689,11 +724,25 @@ fn walk_worktree_changes(
                 error = %e,
                 "Failed to check for changes"
             );
-            return;
+            return false;
         }
     };
 
-    for item in iter.flatten() {
+    for item in iter {
+        // An item that failed is a file whose state we don't know, so the walk
+        // can no longer vouch for the whole worktree
+        let item = match item {
+            Ok(item) => item,
+            Err(e) => {
+                warn!(
+                    path = %repo_path.display(),
+                    error = %e,
+                    "Failed to check a worktree entry for changes"
+                );
+                return false;
+            }
+        };
+
         // An entry whose path this platform can't represent is still a change,
         // so hand it to `visit` unnamed rather than dropping it and risking a
         // dirty worktree reported as clean
@@ -711,27 +760,35 @@ fn walk_worktree_changes(
         };
 
         if !visit(path) {
-            return;
+            break;
         }
     }
+    true
 }
 
-/// Whether the worktree holds any uncommitted change or untracked file
-fn worktree_is_dirty(repo: &gix::Repository, repo_path: &Path) -> bool {
+/// Whether the worktree holds any uncommitted change or untracked file, or
+/// None when it couldn't be read and the answer is unknown
+fn worktree_is_dirty(repo: &gix::Repository, repo_path: &Path) -> Option<bool> {
     let mut dirty = false;
-    walk_worktree_changes(repo, repo_path, |_| {
+    let readable = walk_worktree_changes(repo, repo_path, |_| {
         dirty = true;
         false
     });
-    dirty
+    readable.then_some(dirty)
 }
 
 /// The most recent modification time among the changed and untracked files,
 /// or None when the worktree is clean. Files that can't be stat'd count as the
 /// UNIX epoch, so a dirty worktree always yields some time.
-fn dirty_files_time(repo: &gix::Repository, repo_path: &Path) -> Option<std::time::SystemTime> {
+///
+/// The flag is false when the worktree couldn't be read, in which case the
+/// time says nothing about what the worktree holds.
+fn dirty_files_time(
+    repo: &gix::Repository,
+    repo_path: &Path,
+) -> (bool, Option<std::time::SystemTime>) {
     let mut latest = None;
-    walk_worktree_changes(repo, repo_path, |file_path| {
+    let readable = walk_worktree_changes(repo, repo_path, |file_path| {
         let modified = file_path
             .and_then(|file_path| {
                 std::fs::metadata(&file_path)
@@ -742,7 +799,7 @@ fn dirty_files_time(repo: &gix::Repository, repo_path: &Path) -> Option<std::tim
         latest = latest.max(Some(modified));
         true
     });
-    latest
+    (readable, latest)
 }
 
 /// A `Workspace` is filesystem directory containing git repositories checked out
@@ -975,10 +1032,16 @@ impl Workspace {
             return Ok(());
         }
 
-        // Check for uncommitted or unpushed changes unless --force is given
+        // Check for uncommitted or unpushed changes unless --force is given.
+        // A repo whose status couldn't be read at all is kept as well: this
+        // step exists to find work that would be lost, and a repo workset
+        // can't see into may be full of it.
         if !force {
             let status = check_repo_status(repo)?;
-            if matches!(status, RepoStatus::Dirty | RepoStatus::Unpushed) {
+            if matches!(
+                status,
+                RepoStatus::Dirty | RepoStatus::Unpushed | RepoStatus::Unknown
+            ) {
                 debug!(repo = %repo.display(), ?status, "Refusing to drop repository");
                 report
                     .skipped
@@ -1783,6 +1846,134 @@ mod tests {
         // Uncommitted work outranks where HEAD happens to point, so a drop
         // still refuses the repo
         assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+    }
+
+    /// A repository whose config gix refuses to load, which is what
+    /// `git init --object-format=sha256` writes. Spelled out here rather than
+    /// created with git so the test doesn't depend on the local git's version.
+    fn repo_gix_cannot_open(path: &Path) {
+        let git_dir = path.join(".git");
+        fs::create_dir_all(git_dir.join("objects/info")).unwrap();
+        fs::create_dir_all(git_dir.join("objects/pack")).unwrap();
+        fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 1\n\tbare = false\n\
+             [extensions]\n\tobjectformat = sha256\n",
+        )
+        .unwrap();
+    }
+
+    /// gix doesn't read every repository git can write, and a repo workset
+    /// can't see into is not a repo with nothing in it. Reporting one as
+    /// NoCommits said the exact opposite of the truth to everything that acts
+    /// on status.
+    #[test]
+    fn unreadable_repo_is_unknown_not_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("opaque");
+        repo_gix_cannot_open(&repo);
+        fs::write(repo.join("work.txt"), "exists nowhere else").unwrap();
+
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Unknown);
+        let (status, mod_time) = check_repo_status_and_modification_time(&repo).unwrap();
+        assert_eq!(status, RepoStatus::Unknown);
+        // Nothing was read, so there is no time to claim either
+        assert_eq!(mod_time, None);
+    }
+
+    /// The drop gate exists to keep work that exists nowhere else. A repo
+    /// whose status can't be determined may be full of it, so it is kept —
+    /// before this, an unreadable repo read as NoCommits and the worktree was
+    /// deleted (and with `--delete`, destroyed) without a word.
+    #[test]
+    fn drop_refuses_a_repo_it_cannot_read() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("opaque");
+        repo_gix_cannot_open(&repo);
+        fs::write(repo.join("work.txt"), "exists nowhere else").unwrap();
+
+        let pattern = "opaque".parse::<RepoPattern>().unwrap();
+        for delete in [false, true] {
+            let report = workspace.drop(&pattern, delete, false).unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(
+                report.skipped,
+                vec![(
+                    "opaque".to_string(),
+                    DropBlocker::Outstanding(RepoStatus::Unknown)
+                )]
+            );
+            assert_eq!(
+                fs::read_to_string(repo.join("work.txt")).unwrap(),
+                "exists nowhere else"
+            );
+            assert!(!Path::new(&workspace.library_path()).join("opaque").exists());
+        }
+
+        // --force is still the way to say "I know, drop it anyway"
+        let report = workspace.drop(&pattern, true, true).unwrap();
+        assert_eq!(report.dropped, vec!["opaque".to_string()]);
+        assert!(!repo.exists());
+    }
+
+    /// Run git in `dir`, returning None when it failed instead of asserting,
+    /// for probing whether the local git supports something
+    fn try_git(dir: &Path, args: &[&str]) -> Option<()> {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|_| ())
+    }
+
+    /// The other half of the same hazard, driven by real git: a reftable repo
+    /// (git 2.45+) opens fine but yields nothing for HEAD or for the worktree
+    /// status, so every signal workset reads says "empty" while the repo holds
+    /// a commit and uncommitted work. The assertion is that the status is
+    /// anything but NoCommits, which holds whether gix learns to read
+    /// reftables or not.
+    #[test]
+    fn reftable_repo_is_not_reported_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("reftable");
+        fs::create_dir_all(&repo).unwrap();
+        if try_git(&repo, &["init", "--quiet", "--ref-format=reftable"]).is_none() {
+            // Too old a git to make one; nothing to check here
+            return;
+        }
+        git(&repo, &["config", "user.name", "workset"]);
+        git(&repo, &["config", "user.email", "workset@example.com"]);
+        fs::write(repo.join("tracked.txt"), "committed").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "--quiet", "-m", "one"]);
+        fs::write(repo.join("tracked.txt"), "uncommitted").unwrap();
+
+        assert_ne!(
+            check_repo_status(&repo).unwrap(),
+            RepoStatus::NoCommits,
+            "a repo with a commit and uncommitted work is not empty"
+        );
+
+        let report = workspace
+            .drop(&"reftable".parse::<RepoPattern>().unwrap(), true, false)
+            .unwrap();
+        assert!(report.dropped.is_empty());
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "uncommitted"
+        );
     }
 
     #[test]

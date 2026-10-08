@@ -186,8 +186,10 @@ pub fn sync_repo(repo_path: &Path, interrupt: &AtomicBool) -> Result<SyncOutcome
         }
     }
 
+    // A status that can't be computed is unknown, not empty: see
+    // [`crate::RepoStatus::Unknown`]
     let (status, modification_time) = crate::check_repo_status_and_modification_time(repo_path)
-        .unwrap_or((crate::RepoStatus::NoCommits, None));
+        .unwrap_or((crate::RepoStatus::Unknown, None));
     outcome.status = Some(status);
     outcome.modification_time = modification_time;
     Ok(outcome)

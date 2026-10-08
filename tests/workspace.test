@@ -112,6 +112,43 @@ testDropRefusesCommitlessRepoWithWork() {
 	workset list | grep -- "fresh-repo - ⚠ modified"
 }
 
+## Not every repository git can write can be read by the library workset reads
+## repos with: a --object-format=sha256 repo's config alone defeats it. Such a
+## repo used to be reported as having no commits, which told the drop its
+## worktree held nothing that existed only there
+testDropRefusesRepoItCannotRead() {
+	newWorkspace
+	mkdir -p opaque-repo
+	git -C opaque-repo init -q -b main --object-format=sha256
+	git -C opaque-repo config user.email test@example.com
+	git -C opaque-repo config user.name "Test User"
+	echo "committed" >opaque-repo/file0.txt
+	git -C opaque-repo add file0.txt
+	git -C opaque-repo commit -q -m "commit 0"
+	echo "uncommitted work" >opaque-repo/scratch.txt
+
+	workset list | grep -- "opaque-repo - ✗ unreadable"
+	workset status | grep -- "✗ 1 workset can't read"
+
+	output=$(workset drop opaque-repo 2>&1) && exit 1
+	echo "$output" | grep -- "opaque-repo - ⚠ kept (unreadable repository"
+
+	# Worktree, uncommitted work and all, exactly as it was
+	[ -f opaque-repo/file0.txt ]
+	[ -f opaque-repo/scratch.txt ]
+	[ -d opaque-repo/.git ]
+	[ ! -e .workset/opaque-repo ]
+
+	# --delete would have destroyed it outright, so it refuses too
+	output=$(workset drop --delete opaque-repo 2>&1) && exit 1
+	echo "$output" | grep -- "opaque-repo - ⚠ kept (unreadable repository"
+	[ -f opaque-repo/scratch.txt ]
+
+	# --force is still the way to say "drop it anyway"
+	workset drop --force opaque-repo | grep -- "opaque-repo - ✓ dropped"
+	[ ! -e opaque-repo ]
+}
+
 ## A repo with no commits and nothing in its worktree has no work to lose
 testDropCommitlessEmptyRepo() {
 	newWorkspace

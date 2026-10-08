@@ -1419,6 +1419,8 @@ fn tree_list_item<'a>(
                 Some(crate::RepoStatus::Dirty) => ("* ", Color::Yellow),
                 Some(crate::RepoStatus::Unpushed) => ("↑ ", Color::Yellow),
                 Some(crate::RepoStatus::NoCommits) => ("· ", Color::DarkGray),
+                // Not "empty": workset couldn't read this repo at all
+                Some(crate::RepoStatus::Unknown) => ("? ", Color::Red),
             };
             spans.push(Span::styled(icon, Style::default().fg(color)));
         }
@@ -1651,7 +1653,7 @@ fn workspace_display_name(workspace_path: &str, path: &Path) -> String {
 fn scan_workspace_repo(mut repo: RepoInfo) -> Vec<RepoInfo> {
     // Check repo status and get modification time in a single repo open for performance
     let (status, modification_time) = crate::check_repo_status_and_modification_time(&repo.path)
-        .unwrap_or((crate::RepoStatus::NoCommits, None));
+        .unwrap_or((crate::RepoStatus::Unknown, None));
     repo.status = Some(status);
     repo.modification_time = modification_time;
     repo.operation_status = RepoOperationStatus::None;

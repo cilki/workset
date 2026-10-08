@@ -119,6 +119,11 @@ Losing `target/` is usually the point — it's what makes a dropped repo cheap t
 keep. Losing an untracked-but-ignored `.env` is not, so keep anything you can't
 regenerate either committed or outside the repo.
 
+A repository **workset** can't read at all is kept too, and reported as
+`✗ unreadable` by `list`. Not every repository git can write can be read by the
+library **workset** uses, so rather than guess at what such a repo holds, it is
+left where it is until you drop it with `--force`.
+
 Every command reports what it did and exits non-zero when it couldn't do all of
 it, so `workset` composes with other commands:
 
