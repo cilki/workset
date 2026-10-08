@@ -1576,72 +1576,63 @@ fn render_metadata_span<'a>(
     spans
 }
 
-/// Render highlighted name with character-by-character fuzzy match highlighting
+/// Render the node's name with the characters the search matched highlighted.
+///
+/// `indices` are character positions in `full_path`, the whole path of the row
+/// (see [`TreeNode::flatten`](tree::TreeNode::flatten)), whose tail is this
+/// node's name — a match on an ancestor's characters belongs to that
+/// ancestor's row, not this one.
 fn render_highlighted_name<'a>(
     node_name: &'a str,
     full_path: &str,
     should_highlight_dir: bool,
     indices: Option<Vec<usize>>,
 ) -> Vec<Span<'a>> {
-    let mut spans = vec![];
+    let span = |text: &'a str, matched: bool| {
+        if matched {
+            Span::styled(text, Style::default().fg(Color::Black).bg(Color::Yellow))
+        } else {
+            Span::raw(text)
+        }
+    };
 
-    if let Some(indices) = indices {
-        let mut last_pos = 0;
-        let chars: Vec<(usize, char)> = node_name.char_indices().collect();
-
-        // Find which indices apply to just the node name (not full path)
-        let path_offset = full_path.len() - node_name.len();
-
-        for &match_idx in &indices {
-            if match_idx < path_offset {
-                continue; // Skip matches in path prefix
-            }
-            let local_idx = match_idx - path_offset;
-
-            if local_idx >= chars.len() {
-                continue;
-            }
-
-            // Add unmatched text before this character
-            if local_idx > last_pos {
-                let start_byte = chars[last_pos].0;
-                let end_byte = chars[local_idx].0;
-                spans.push(Span::raw(&node_name[start_byte..end_byte]));
-            }
-
-            // Add highlighted character
-            let char_byte_start = chars[local_idx].0;
-            let char_byte_end = if local_idx + 1 < chars.len() {
-                chars[local_idx + 1].0
-            } else {
-                node_name.len()
+    // Character positions within the name itself
+    let matched: HashSet<usize> = match indices {
+        Some(indices) => {
+            let Some(offset) = full_path
+                .chars()
+                .count()
+                .checked_sub(node_name.chars().count())
+            else {
+                return vec![span(node_name, false)];
             };
-            spans.push(Span::styled(
-                &node_name[char_byte_start..char_byte_end],
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ));
-
-            last_pos = local_idx + 1;
+            indices
+                .into_iter()
+                .filter_map(|index| index.checked_sub(offset))
+                .collect()
         }
+        // Nothing in this row's path matched. A directory the query names
+        // outright ("<name>/") is still highlighted whole.
+        None => return vec![span(node_name, should_highlight_dir)],
+    };
 
-        // Add remaining text
-        if last_pos < chars.len() {
-            let start_byte = chars[last_pos].0;
-            spans.push(Span::raw(&node_name[start_byte..]));
-        } else if last_pos == 0 {
-            // No matches in name portion, show normally
-            spans.push(Span::raw(node_name));
+    // One span per run of consecutively matched (or unmatched) characters
+    let mut spans = Vec::new();
+    let mut run: Option<(usize, bool)> = None;
+    for (position, (byte, _)) in node_name.char_indices().enumerate() {
+        let is_match = matched.contains(&position);
+        match run {
+            Some((start, was_match)) if was_match != is_match => {
+                spans.push(span(&node_name[start..byte], was_match));
+                run = Some((byte, is_match));
+            }
+            Some(_) => {}
+            None => run = Some((byte, is_match)),
         }
-    } else if should_highlight_dir {
-        // Directory is part of search path, highlight entire name
-        spans.push(Span::styled(
-            node_name,
-            Style::default().fg(Color::Black).bg(Color::Yellow),
-        ));
-    } else {
-        spans.push(Span::raw(node_name));
     }
-
+    if let Some((start, was_match)) = run {
+        spans.push(span(&node_name[start..], was_match));
+    }
     spans
 }
 
@@ -2121,6 +2112,92 @@ mod tests {
         assert_eq!(
             classify_key(&key(KeyCode::Esc, KeyModifiers::NONE)),
             KeyBinding::Key(KeyCode::Esc)
+        );
+    }
+
+    /// Every row's path ends with that row's own name, which is what lets the
+    /// highlighter tell the node's characters from its ancestors'. A repo node
+    /// used to report its on-disk display name here instead: once repos are
+    /// grouped by remote the two differ, and a repo cloned into a directory
+    /// whose name is shorter than its remote's last component made the
+    /// highlighter subtract its way out of the string.
+    #[test]
+    fn a_row_path_ends_with_the_row_name() {
+        let mut app = App::new(
+            "/ws".to_string(),
+            vec![RepoInfo {
+                path: PathBuf::from("/ws/a"),
+                display_name: "a".to_string(),
+                tree_path: Some("github.com/fossable/longname".to_string()),
+                ..Default::default()
+            }],
+            Vec::new(),
+        );
+        app.search_query = "a".to_string();
+        app.filter_repos();
+
+        let rows = app.get_flattened_workspace();
+        assert_eq!(
+            rows.iter()
+                .map(|(_, _, _, path)| path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "github.com",
+                "github.com/fossable",
+                "github.com/fossable/longname",
+            ]
+        );
+        for (node, depth, _, full_path) in &rows {
+            assert!(
+                full_path.ends_with(&node.name),
+                "{full_path} / {}",
+                node.name
+            );
+            // Rendering the row with a search active is what used to panic
+            let _ = tree_list_item(node, *depth, full_path, &app, 40, true, |_| String::new());
+        }
+    }
+
+    #[test]
+    fn search_highlights_the_matched_characters_of_the_name() {
+        let render = |name: &str, full_path: &str, indices: Option<Vec<usize>>| {
+            render_highlighted_name(name, full_path, false, indices)
+                .iter()
+                .map(|span| {
+                    (
+                        span.content.to_string(),
+                        span.style.bg == Some(Color::Yellow),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Consecutive matches collapse into one span, not one per character
+        assert_eq!(
+            render("workset", "github.com/workset", Some(vec![11, 12, 13, 14])),
+            [("work".to_string(), true), ("set".to_string(), false)]
+        );
+
+        // Characters matched on an ancestor belong to that ancestor's row
+        assert_eq!(
+            render("workset", "github.com/workset", Some(vec![0, 1, 2])),
+            [("workset".to_string(), false)]
+        );
+
+        // Indices are character positions, so a multibyte path keeps its
+        // alignment; byte offsets used to shift the highlight off the end
+        assert_eq!(
+            render("wörld", "héllo/wörld", Some(vec![6, 7, 8, 9, 10])),
+            [("wörld".to_string(), true)]
+        );
+
+        // With nothing matched, a directory the query names outright is still
+        // highlighted whole
+        assert_eq!(
+            render_highlighted_name("fossable", "github.com/fossable", true, None)[0]
+                .style
+                .bg,
+            Some(Color::Yellow)
         );
     }
 

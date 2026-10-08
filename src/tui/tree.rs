@@ -82,17 +82,24 @@ impl TreeNode {
         }
     }
 
-    /// Flatten the tree into a list of (node, depth, index_path, full_path) tuples
+    /// Flatten the tree into a list of (node, depth, index_path, full_path)
+    /// tuples.
+    ///
+    /// `full_path` is the names from the root down to this node, joined with
+    /// slashes: the path the row actually spells out, and for a repo the same
+    /// string the search filter matched it against. Every node's name is
+    /// therefore the tail of its own full path, which is what lets the search
+    /// highlighter tell the node's characters from its ancestors'. A repo node
+    /// used to report its `display_name` here instead — its place on disk,
+    /// which is not where the tree puts it once repos are grouped by remote,
+    /// and need not even end with the node's name.
     pub fn flatten(
         &self,
         depth: usize,
         index_path: Vec<usize>,
         parent_path: &str,
     ) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
-        // Build the full path for this node
-        let full_path = if let Some(ref repo) = self.repo_info {
-            repo.display_name.clone()
-        } else if parent_path.is_empty() {
+        let full_path = if parent_path.is_empty() {
             self.name.clone()
         } else {
             format!("{}/{}", parent_path, self.name)
