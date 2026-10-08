@@ -76,9 +76,18 @@ pub fn find_git_repositories(path: &Path) -> Result<Vec<PathBuf>> {
         return Ok(found); // Don't traverse into git repositories
     }
 
-    // Otherwise, recursively search subdirectories
+    // Otherwise, recursively search subdirectories. `read_dir` hands entries
+    // back in whatever order the filesystem keeps them, which is neither
+    // alphabetical nor the same on two machines holding the same repos. Every
+    // caller shows this list to someone — `workset list`, the drop report, the
+    // completion candidates — so walking in name order is what makes their
+    // output the same everywhere, and a depth-first walk of sorted entries
+    // comes out sorted by path.
     if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.filter_map(|e| e.ok()) {
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
             let entry_path = entry.path();
 
             // Only traverse real directories. `file_type` doesn't follow
@@ -1775,6 +1784,49 @@ mod tests {
         assert_eq!(repos.len(), 2);
         assert!(repos.iter().any(|p| p.ends_with("repo1")));
         assert!(repos.iter().any(|p| p.ends_with("repo2")));
+    }
+
+    /// Repos come back in path order, not in whichever order the filesystem
+    /// happened to store the directory entries, so everything that prints the
+    /// list prints the same thing on every machine.
+    #[test]
+    fn find_git_repositories_reports_repos_in_path_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        // Created in an order that is neither alphabetical nor reverse, so a
+        // filesystem that keeps insertion order fails this too
+        for name in [
+            "gitlab.com/b/two",
+            "github.com/b/one",
+            "gitlab.com/a/one",
+            "github.com/a/two",
+            "github.com/a/one",
+        ] {
+            fs::create_dir_all(base_path.join(name).join(".git")).unwrap();
+        }
+
+        let repos: Vec<_> = find_git_repositories(base_path)
+            .unwrap()
+            .iter()
+            .map(|repo| {
+                repo.strip_prefix(base_path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert_eq!(
+            repos,
+            vec![
+                "github.com/a/one",
+                "github.com/a/two",
+                "github.com/b/one",
+                "gitlab.com/a/one",
+                "gitlab.com/b/two",
+            ]
+        );
     }
 
     #[test]

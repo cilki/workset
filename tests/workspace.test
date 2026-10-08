@@ -609,6 +609,29 @@ testListShowsRepoStatus() {
 	echo "$output" | grep "dirty-repo - ⚠ modified"
 }
 
+## Repos are listed in path order, whatever order the filesystem hands their
+## directory entries back in, so the same workspace lists the same way twice
+## and on two machines
+testListSortsRepos() {
+	newWorkspace
+	# Created in an order that is neither sorted nor reversed
+	createRepo gitlab.com/b/two
+	createRepo github.com/b/one
+	createRepo gitlab.com/a/one
+	createRepo github.com/a/two
+	createRepo github.com/a/one
+
+	cat >expected <<-'EOF'
+		github.com/a/one
+		github.com/a/two
+		github.com/b/one
+		gitlab.com/a/one
+		gitlab.com/b/two
+	EOF
+	workset list | sed -n 's/^  \([^ ]*\) - .*/\1/p' >actual
+	diff expected actual
+}
+
 ## A repo whose HEAD is detached — mid-bisect, mid-rebase, or just checked
 ## out by commit — still has all its history, so it isn't "no commits"
 testListDetachedHeadRepo() {
