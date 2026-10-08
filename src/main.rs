@@ -15,6 +15,55 @@ mod colors {
     pub const DIM: &str = "\x1b[2m";
 }
 
+/// Write `args` to stdout, ending the process quietly when the reader has gone
+/// away. Used through [`outln!`] and [`out!`] for everything workset prints.
+///
+/// Rust ignores SIGPIPE, so a reader that stops before workset is done writing
+/// — `workset list | head`, `workset status | grep -q`, a pager the user quits
+/// — doesn't kill the process; the next write fails with `BrokenPipe` instead.
+/// `println!` answers a failed write by panicking, so what the user got was a
+/// panic message and a backtrace note on stderr and exit 101, where every
+/// other command in the pipeline ended without a word. Restoring SIGPIPE's
+/// default disposition would fix the symptom everywhere at once, but it also
+/// turns every *other* failed write into a kill, including the ones gix makes
+/// talking to a local `git upload-pack` over a pipe and handles itself.
+///
+/// The reader deciding it has seen enough isn't a failure of the command, so
+/// the exit status stays successful and scripts under `set -o pipefail` keep
+/// working.
+fn write_out(args: std::fmt::Arguments) {
+    use std::io::Write;
+
+    // Flushed here rather than left to the buffer, so a failed write is seen
+    // where it can still be acted on instead of on the way out of main, where
+    // stdout's own flush discards the error
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_fmt(args).and_then(|()| stdout.flush()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        // A write that failed for any other reason (a full disk, a descriptor
+        // that was closed) leaves the output incomplete, which is a failure —
+        // reportable only on stderr, since stdout is where it just failed.
+        Err(e) => {
+            eprintln!("Failed to write output: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `println!` for workset's own output, without the panic on a closed pipe;
+/// see [`write_out`].
+macro_rules! outln {
+    () => { crate::write_out(format_args!("\n")) };
+    ($($arg:tt)*) => { crate::write_out(format_args!("{}\n", format_args!($($arg)*))) };
+}
+
+/// `print!` for workset's own output, without the panic on a closed pipe; see
+/// [`write_out`].
+macro_rules! out {
+    ($($arg:tt)*) => { crate::write_out(format_args!($($arg)*)) };
+}
+
 /// Clone repositories matching the pattern. Returns false when nothing was
 /// cloned, so the caller can exit non-zero.
 fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
@@ -25,7 +74,7 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
         // Check if this is a partial path for mass cloning
         if (provider == "github.com" || provider == "gitlab.com") && !path.contains('/') {
             // This is a user/org pattern like "github.com/user" - use gh/glab to mass clone
-            println!("Fetching the repository list for {}/{}", provider, path);
+            outln!("Fetching the repository list for {}/{}", provider, path);
 
             // Get list of repos using gh/glab
             let output = if provider == "github.com" {
@@ -81,7 +130,7 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
                 return Ok(false);
             }
 
-            println!("Found {} repository(ies)", repos.len());
+            outln!("Found {} repository(ies)", repos.len());
 
             let mut cloned = 0;
             let mut skipped = 0;
@@ -111,9 +160,11 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
                 }
             }
 
-            println!(
+            outln!(
                 "Cloned {} repository(ies), skipped {}, failed {}",
-                cloned, skipped, failed
+                cloned,
+                skipped,
+                failed
             );
             return Ok(failed == 0);
         }
@@ -148,12 +199,12 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
     if let Some((provider, repo_path_str)) = pattern.provider_and_path() {
         let clone_url = format!("https://{}/{}", provider, repo_path_str);
 
-        println!("Cloning {}", clone_url);
+        outln!("Cloning {}", clone_url);
 
         // TODO show progress
         workset::gix_clone(&clone_url, &repo_path)?;
 
-        println!("Cloned {}", pattern.full_path());
+        outln!("Cloned {}", pattern.full_path());
         Ok(true)
     } else {
         anyhow::bail!("No provider specified. Use format like github.com/user/repo");
@@ -263,7 +314,7 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         // Restore from library
         match workspace.restore_from_library(&repo_path) {
             Ok(_) => {
-                println!("Restored {}", repo_path);
+                outln!("Restored {}", repo_path);
                 restored += 1;
             }
             Err(e) => {
@@ -305,7 +356,7 @@ fn main() -> Result<ExitCode> {
     // Print the version and exit. Handled before loading the workspace so
     // `--version` works anywhere, not just inside a valid workspace.
     if args.contains(["-V", "--version"]) {
-        println!("workset {}", env!("CARGO_PKG_VERSION"));
+        outln!("workset {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -382,7 +433,7 @@ fn main() -> Result<ExitCode> {
             dim = code(colors::DIM),
             reset = code(colors::RESET),
         );
-        print!("{}", help);
+        out!("{}", help);
 
         return Ok(ExitCode::SUCCESS);
     }
@@ -445,13 +496,13 @@ fn main() -> Result<ExitCode> {
                 let library_path = workspace_path.join(".workset");
 
                 if library_path.exists() {
-                    println!(
+                    outln!(
                         "Workspace already initialized in {}",
                         workspace_path.display()
                     );
                 } else {
                     std::fs::create_dir_all(&library_path)?;
-                    println!("Initialized workspace in {}", workspace_path.display());
+                    outln!("Initialized workspace in {}", workspace_path.display());
                 }
                 true
             }
@@ -590,7 +641,7 @@ fn report_drop(report: &workset::DropReport, delete: bool) {
     let verb = if delete { "deleted" } else { "dropped" };
 
     for repo in &report.dropped {
-        println!("  {} - ✓ {}", repo, verb);
+        outln!("  {} - ✓ {}", repo, verb);
     }
 
     for (repo, blocker) in &report.skipped {
@@ -603,12 +654,12 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     let repos = workset::find_git_repositories(Path::new(&workspace.path))?;
 
     if repos.is_empty() {
-        println!("No repositories found in workspace");
+        outln!("No repositories found in workspace");
         return Ok(());
     }
 
-    println!("Repositories in workspace ({}):", workspace.path);
-    println!();
+    outln!("Repositories in workspace ({}):", workspace.path);
+    outln!();
 
     for repo in repos {
         let repo_name = workspace.relative_name(&repo);
@@ -621,7 +672,7 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
             Err(_) => "✗ error".to_string(),
         };
 
-        println!("  {} - {}", repo_name, status_str);
+        outln!("  {} - {}", repo_name, status_str);
     }
 
     Ok(())
@@ -629,19 +680,19 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
 
 /// Show a summary of the workspace
 fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
-    println!("Workspace: {}", workspace.path);
-    println!();
+    outln!("Workspace: {}", workspace.path);
+    outln!();
 
     // Show library information
-    println!("Library: {}", workspace.library_path());
+    outln!("Library: {}", workspace.library_path());
     if let Ok(repos) = workspace.list_library() {
-        println!("  {} repository(ies) in library", repos.len());
+        outln!("  {} repository(ies) in library", repos.len());
     }
 
     // Count repositories in workspace
-    println!();
+    outln!();
     if let Ok(repos) = workset::find_git_repositories(Path::new(&workspace.path)) {
-        println!("Active repositories: {}", repos.len());
+        outln!("Active repositories: {}", repos.len());
 
         let mut clean = 0;
         let mut modified = 0;
@@ -659,16 +710,16 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
         }
 
         if clean > 0 {
-            println!("  ✓ {} clean", clean);
+            outln!("  ✓ {} clean", clean);
         }
         if modified > 0 {
-            println!("  ⚠ {} with uncommitted changes", modified);
+            outln!("  ⚠ {} with uncommitted changes", modified);
         }
         if unpushed > 0 {
-            println!("  ⚠ {} with unpushed commits", unpushed);
+            outln!("  ⚠ {} with unpushed commits", unpushed);
         }
         if no_commits > 0 {
-            println!("  ⚠ {} with no commits", no_commits);
+            outln!("  ⚠ {} with no commits", no_commits);
         }
     }
 
@@ -786,7 +837,7 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
         };
         for subcommand in subcommands {
             if subcommand.starts_with(current_word) {
-                println!("{}", subcommand);
+                outln!("{}", subcommand);
             }
         }
     } else if let Some(workspace) = maybe_workspace {
@@ -797,7 +848,7 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
             if let Ok(library_repos) = workspace.list_library() {
                 for repo in library_repos {
                     if repo.starts_with(current_word) {
-                        println!("{}", repo);
+                        outln!("{}", repo);
                     }
                 }
             }
@@ -805,7 +856,7 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
             // For drop and other commands, complete from workspace
             for repo in get_repo_completions(&workspace) {
                 if repo.starts_with(current_word) {
-                    println!("{}", repo);
+                    outln!("{}", repo);
                 }
             }
         }
@@ -823,14 +874,14 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
     if words.len() <= 1 || (words.len() == 2 && !comp_line.ends_with(' ')) {
         // Complete subcommands
         if maybe_workspace.is_some() {
-            println!("clone\tClone new repository(ies) to workspace");
-            println!("restore\tRestore repository(ies) from library");
-            println!("drop\tDrop one or more repositories");
-            println!("list\tList all repositories with their status");
-            println!("ls\tList all repositories with their status");
-            println!("status\tShow workspace summary and statistics");
+            outln!("clone\tClone new repository(ies) to workspace");
+            outln!("restore\tRestore repository(ies) from library");
+            outln!("drop\tDrop one or more repositories");
+            outln!("list\tList all repositories with their status");
+            outln!("ls\tList all repositories with their status");
+            outln!("status\tShow workspace summary and statistics");
         } else {
-            println!("init\tInitialize a workspace in current directory");
+            outln!("init\tInitialize a workspace in current directory");
         }
     } else if let Some(workspace) = maybe_workspace {
         // Complete repository paths based on the subcommand
@@ -839,13 +890,13 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
             // For restore, complete from library
             if let Ok(library_repos) = workspace.list_library() {
                 for repo in library_repos {
-                    println!("{}\tlibrary", repo);
+                    outln!("{}\tlibrary", repo);
                 }
             }
         } else {
             // For drop and other commands, complete from workspace with metadata
             for (repo_name, description) in get_repo_completions_with_metadata(&workspace) {
-                println!("{}\t{}", repo_name, description);
+                outln!("{}\t{}", repo_name, description);
             }
         }
     }
