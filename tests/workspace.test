@@ -142,6 +142,64 @@ testDropRefusesUnpushedRepo() {
 	[ ! -e .workset/unpushed-repo ]
 }
 
+## A linked worktree ('git worktree add') has no git directory of its own, so
+## there is nothing for the library to hold and no flag that changes that
+testDropRefusesLinkedWorktree() {
+	newWorkspace
+	createRepo main-repo 1
+	git -C main-repo worktree add -q ../feature -b feature
+	echo "only here" >feature/work.txt
+
+	for flags in "" "--force" "--delete --force"; do
+		output=$(workset drop $flags feature 2>&1) && exit 1
+		echo "$output" | grep -- "feature - ⚠ kept (git directory belongs to another repository"
+	done
+
+	[ "$(cat feature/work.txt)" = "only here" ]
+	git -C feature status >/dev/null
+}
+
+## Dropping the main worktree would move the git directory every linked
+## worktree reads through into the library, breaking each of them in place
+testDropRefusesMainWorktreeWithLinkedWorktrees() {
+	newWorkspace
+	createRepo main-repo 1
+	git -C main-repo worktree add -q ../feature -b feature
+
+	for flags in "" "--force" "--delete --force"; do
+		output=$(workset drop $flags main-repo 2>&1) && exit 1
+		echo "$output" | grep -- "main-repo - ⚠ kept (git directory shared with 1 linked worktree"
+	done
+
+	# Both halves are exactly as they were
+	[ -d main-repo/.git ]
+	git -C feature status >/dev/null
+	[ ! -e .workset/main-repo ]
+
+	# Taking the worktree away leaves a repo nothing else is using
+	git -C main-repo worktree remove ../feature
+	workset drop main-repo | grep -- "main-repo - ✓ dropped"
+}
+
+## A repo a drop can't touch is reported like any other and doesn't abandon
+## the rest of the request
+testDropAllReportsWorktreesAndDropsTheRest() {
+	newWorkspace
+	createRepo main-repo 1
+	git -C main-repo worktree add -q ../feature -b feature
+	createRepo plain-repo 1
+
+	output=$(workset drop 2>&1) && exit 1
+	echo "$output" | grep -- "plain-repo - ✓ dropped"
+	echo "$output" | grep -- "feature - ⚠ kept"
+	echo "$output" | grep -- "main-repo - ⚠ kept"
+
+	[ ! -e plain-repo ]
+	[ -d .workset/plain-repo ]
+	[ -d main-repo/.git ]
+	git -C feature status >/dev/null
+}
+
 ## Every pattern on the command line is dropped, not just the first
 testDropSeveralPatterns() {
 	newWorkspace

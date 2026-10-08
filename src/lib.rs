@@ -323,14 +323,63 @@ pub enum RepoStatus {
     Unpushed,
 }
 
+/// Why a repository was left in the workspace instead of being dropped
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropBlocker {
+    /// Work that exists nowhere but this worktree, which `--force` discards
+    Outstanding(RepoStatus),
+
+    /// The repo doesn't own its git directory: `.git` is a file holding
+    /// `gitdir: <path>`, which is how git writes a linked worktree (`git
+    /// worktree add`) and a submodule. The library holds git directories, so
+    /// there is none here to store, and deleting the directory would leave the
+    /// repository that does own it holding a registration for a worktree
+    /// that's gone.
+    BorrowedGitDir,
+
+    /// The main worktree of this many live linked worktrees. Its git directory
+    /// is the one they all point at, so moving it into the library (or
+    /// deleting it) leaves every one of them pointing at a gitdir that isn't
+    /// there any more.
+    MainWorktree(usize),
+}
+
+impl DropBlocker {
+    /// What the user should do about it, if anything can be done at all
+    pub fn remedy(&self) -> &'static str {
+        match self {
+            Self::Outstanding(_) => "use --force to drop anyway",
+            Self::BorrowedGitDir => "drop that repository instead",
+            Self::MainWorktree(1) => "remove it with 'git worktree remove' first",
+            Self::MainWorktree(_) => "remove them with 'git worktree remove' first",
+        }
+    }
+}
+
+impl std::fmt::Display for DropBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Outstanding(RepoStatus::Dirty) => f.write_str("uncommitted changes"),
+            Self::Outstanding(RepoStatus::Unpushed) => f.write_str("unpushed commits"),
+            // drop only ever blocks on the two statuses above
+            Self::Outstanding(_) => f.write_str("outstanding changes"),
+            Self::BorrowedGitDir => f.write_str("git directory belongs to another repository"),
+            Self::MainWorktree(1) => f.write_str("git directory shared with 1 linked worktree"),
+            Self::MainWorktree(count) => {
+                write!(f, "git directory shared with {} linked worktrees", count)
+            }
+        }
+    }
+}
+
 /// The outcome of a drop, so the caller can report it to the user
 #[derive(Debug, Default)]
 pub struct DropReport {
     /// Workspace-relative paths of the repos that were dropped
     pub dropped: Vec<String>,
 
-    /// Repos left where they are, each with the status that blocked the drop
-    pub skipped: Vec<(String, RepoStatus)>,
+    /// Repos left where they are, each with what blocked the drop
+    pub skipped: Vec<(String, DropBlocker)>,
 }
 
 impl DropReport {
@@ -339,6 +388,60 @@ impl DropReport {
     pub fn is_empty(&self) -> bool {
         self.dropped.is_empty() && self.skipped.is_empty()
     }
+}
+
+/// Whether `git worktree` has left this repo in a shape a drop would damage,
+/// either because its git directory isn't its own or because other worktrees
+/// are using it.
+///
+/// `find_git_repositories` reports anything with a `.git` in it, and the two
+/// ends of a `git worktree add` both qualify, so both end up as repos of the
+/// workspace that `drop` will act on. Neither is a repo the library can hold
+/// on its own: one half has no git directory and the other half's git
+/// directory is shared.
+fn worktree_blocker(repo: &Path) -> Option<DropBlocker> {
+    // A repo that owns its history has a `.git` directory. A linked worktree
+    // and a submodule have a `.git` *file* holding `gitdir: <path>` instead,
+    // and that path is inside the repository the git directory belongs to.
+    // Storing one in the library reads `<worktree>/.git/config` through that
+    // file and fails with a bare ENOTDIR, which in a `workset drop` with no
+    // pattern abandoned the whole request; `--delete` skips the library and
+    // deletes the worktree while the owner keeps its registration.
+    let git_path = repo.join(".git");
+    if git_path.is_file() {
+        return Some(DropBlocker::BorrowedGitDir);
+    }
+
+    // The other half: the git directory under a main worktree is the one every
+    // linked worktree reads its objects and refs from. Moving it into the
+    // library breaks each of them in place — `git status` there reports "not a
+    // git repository", and because nothing can be read out of them any more
+    // they turn into "no commits" rows, the status that tells `drop` a repo is
+    // empty and safe to consume.
+    match live_linked_worktrees(&git_path) {
+        0 => None,
+        count => Some(DropBlocker::MainWorktree(count)),
+    }
+}
+
+/// How many linked worktrees are still using the given git directory.
+///
+/// git registers each one as `<git-dir>/worktrees/<name>/`, whose `gitdir`
+/// file holds the path of that worktree's own `.git` file. Once the worktree
+/// is gone, so is the path in it: that's the stale registration `git worktree
+/// prune` collects, and nothing points here through it, so only the live ones
+/// are counted.
+fn live_linked_worktrees(git_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(git_dir.join("worktrees")) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            std::fs::read_to_string(entry.path().join("gitdir"))
+                .is_ok_and(|gitdir| Path::new(gitdir.trim()).exists())
+        })
+        .count()
 }
 
 /// Check repository status (commits, changes, unpushed) in a single pass
@@ -830,12 +933,26 @@ impl Workspace {
         };
         let relative_path = relative.to_string_lossy().to_string();
 
+        // What a drop does is move a git directory into the library and delete
+        // the worktree around it, which only makes sense for a repo that owns
+        // its git directory and is the only worktree using it. The two ways
+        // `git worktree` breaks that assumption are checked before the status
+        // is, and ahead of `force`: neither is outstanding work the user can
+        // decide to discard, so there is nothing for `--force` to mean here.
+        if let Some(blocker) = worktree_blocker(repo) {
+            debug!(repo = %repo.display(), %blocker, "Refusing to drop repository");
+            report.skipped.push((relative_path, blocker));
+            return Ok(());
+        }
+
         // Check for uncommitted or unpushed changes unless --force is given
         if !force {
             let status = check_repo_status(repo)?;
             if matches!(status, RepoStatus::Dirty | RepoStatus::Unpushed) {
                 debug!(repo = %repo.display(), ?status, "Refusing to drop repository");
-                report.skipped.push((relative_path, status));
+                report
+                    .skipped
+                    .push((relative_path, DropBlocker::Outstanding(status)));
                 return Ok(());
             }
         }
@@ -1266,7 +1383,10 @@ mod tests {
         assert!(report.dropped.is_empty());
         assert_eq!(
             report.skipped,
-            vec![("fresh".to_string(), RepoStatus::Dirty)]
+            vec![(
+                "fresh".to_string(),
+                DropBlocker::Outstanding(RepoStatus::Dirty)
+            )]
         );
         assert_eq!(
             fs::read_to_string(repo.join("notes.txt")).unwrap(),
@@ -1282,6 +1402,131 @@ mod tests {
             .unwrap();
         assert_eq!(report.dropped, vec!["empty".to_string()]);
         assert!(!empty.exists());
+    }
+
+    /// Lay out a linked worktree the way `git worktree add` does: the worktree
+    /// keeps a `.git` *file* naming a registration directory under the main
+    /// repo's git directory, and that registration's `gitdir` file names the
+    /// file pointing at it.
+    fn add_linked_worktree(main_repo: &Path, worktree: &Path, name: &str) {
+        let registration = main_repo.join(".git").join("worktrees").join(name);
+        fs::create_dir_all(&registration).unwrap();
+        fs::create_dir_all(worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", registration.display()),
+        )
+        .unwrap();
+        fs::write(
+            registration.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+    }
+
+    /// A linked worktree has no git directory of its own — the one it uses
+    /// belongs to the repo it was added from. There is nothing here the
+    /// library can hold, and taking the directory anyway leaves that repo
+    /// registering a worktree that no longer exists.
+    #[test]
+    fn drop_refuses_a_linked_worktree() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        let main_repo = PathBuf::from(&workspace.path).join("main");
+        fs::create_dir_all(&main_repo).unwrap();
+        gix::init(&main_repo).unwrap();
+        let worktree = PathBuf::from(&workspace.path).join("feature");
+        add_linked_worktree(&main_repo, &worktree, "feature");
+        fs::write(worktree.join("work.txt"), "only here").unwrap();
+
+        let pattern = "feature".parse::<RepoPattern>().unwrap();
+        // Nothing the user can decide to discard, so neither flag gets past it
+        for (delete, force) in [(false, false), (false, true), (true, true)] {
+            let report = workspace.drop(&pattern, delete, force).unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(
+                report.skipped,
+                vec![("feature".to_string(), DropBlocker::BorrowedGitDir)]
+            );
+            assert_eq!(
+                fs::read_to_string(worktree.join("work.txt")).unwrap(),
+                "only here"
+            );
+            assert!(worktree.join(".git").is_file());
+        }
+    }
+
+    /// The git directory under a main worktree is the one every linked
+    /// worktree reads through. Moving it into the library breaks each of them
+    /// where it stands, and because nothing can be read out of them afterwards
+    /// they report as having no commits — the status that tells a later drop
+    /// they are empty and safe to consume.
+    #[test]
+    fn drop_refuses_the_main_worktree_of_a_live_linked_worktree() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        let main_repo = PathBuf::from(&workspace.path).join("main");
+        fs::create_dir_all(&main_repo).unwrap();
+        gix::init(&main_repo).unwrap();
+        // One inside the workspace and one outside it: either way the drop is
+        // what breaks them, so where they sit doesn't decide anything
+        add_linked_worktree(
+            &main_repo,
+            &PathBuf::from(&workspace.path).join("feature"),
+            "feature",
+        );
+        add_linked_worktree(&main_repo, &temp_dir.path().join("elsewhere"), "elsewhere");
+
+        let pattern = "main".parse::<RepoPattern>().unwrap();
+        for (delete, force) in [(false, false), (false, true), (true, true)] {
+            let report = workspace.drop(&pattern, delete, force).unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(
+                report.skipped,
+                vec![("main".to_string(), DropBlocker::MainWorktree(2))]
+            );
+            assert!(main_repo.join(".git").is_dir());
+        }
+
+        // Taking the worktrees away leaves a repo nothing else is using
+        fs::remove_dir_all(PathBuf::from(&workspace.path).join("feature")).unwrap();
+        fs::remove_dir_all(temp_dir.path().join("elsewhere")).unwrap();
+        let report = workspace.drop(&pattern, false, false).unwrap();
+        assert_eq!(report.dropped, vec!["main".to_string()]);
+    }
+
+    /// `git worktree` leaves the registration behind when the worktree itself
+    /// is deleted rather than removed; `git worktree prune` is what collects
+    /// it. Nothing points at the git directory through a registration like
+    /// that, so it is no reason to keep a repo in the workspace.
+    #[test]
+    fn a_pruned_linked_worktree_does_not_block_a_drop() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        let main_repo = PathBuf::from(&workspace.path).join("main");
+        fs::create_dir_all(&main_repo).unwrap();
+        gix::init(&main_repo).unwrap();
+        let worktree = temp_dir.path().join("gone");
+        add_linked_worktree(&main_repo, &worktree, "gone");
+        fs::remove_dir_all(&worktree).unwrap();
+
+        let report = workspace
+            .drop(&"main".parse::<RepoPattern>().unwrap(), false, false)
+            .unwrap();
+        assert_eq!(report.dropped, vec!["main".to_string()]);
+        assert!(workspace.library_contains("main"));
     }
 
     #[test]

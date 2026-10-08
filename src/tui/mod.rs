@@ -537,13 +537,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                             // silently reporting success
                             let report = workspace.drop(&pattern, false, false)?;
                             match report.skipped.first() {
-                                Some((_, crate::RepoStatus::Dirty)) => {
-                                    bail!("uncommitted changes")
-                                }
-                                Some((_, crate::RepoStatus::Unpushed)) => {
-                                    bail!("unpushed commits")
-                                }
-                                Some(_) => bail!("outstanding changes"),
+                                Some((_, blocker)) => bail!("{blocker}"),
                                 None => Ok(()),
                             }
                         },

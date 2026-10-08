@@ -2,7 +2,6 @@ use anyhow::Result;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
-use tracing::debug;
 use tracing::level_filters::LevelFilter;
 use workset::Workspace;
 
@@ -594,20 +593,8 @@ fn report_drop(report: &workset::DropReport, delete: bool) {
         println!("  {} - ✓ {}", repo, verb);
     }
 
-    for (repo, status) in &report.skipped {
-        let reason = match status {
-            workset::RepoStatus::Dirty => "uncommitted changes",
-            workset::RepoStatus::Unpushed => "unpushed commits",
-            // drop_repo only ever blocks on the two statuses above
-            other => {
-                debug!(?other, "Unexpected drop blocker");
-                "outstanding changes"
-            }
-        };
-        eprintln!(
-            "  {} - ⚠ kept ({}, use --force to drop anyway)",
-            repo, reason
-        );
+    for (repo, blocker) in &report.skipped {
+        eprintln!("  {} - ⚠ kept ({}, {})", repo, blocker, blocker.remedy());
     }
 }
 
