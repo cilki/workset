@@ -19,6 +19,12 @@ use std::time::{Duration, Instant};
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for purely local git commands
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How much of one untracked file is read to count its lines. A worktree can
+/// hold a file of any size — a core dump, a VM image, a dataset nobody
+/// ignored — and the info panel wants the number of lines, not the file, so
+/// the bytes read have to stop somewhere. Past this point the count is
+/// whatever the bytes up to it held.
+const UNTRACKED_SCAN_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Local and per-remote state of one branch, input to the behind-count
 /// computation
@@ -281,7 +287,8 @@ pub fn list_remotes(repo_path: &Path, interrupt: &AtomicBool) -> Result<Vec<Stri
 }
 
 /// Lines (added, removed) across the worktree and index relative to HEAD,
-/// with untracked file contents counted as additions
+/// with untracked file contents counted as additions; see `count_lines` for
+/// how much of one untracked file is read.
 pub fn count_diff_lines(repo_path: &Path, interrupt: &AtomicBool) -> Result<(usize, usize)> {
     let mut added = 0;
     let mut removed = 0;
@@ -313,15 +320,54 @@ pub fn count_diff_lines(repo_path: &Path, interrupt: &AtomicBool) -> Result<(usi
         bail!("git ls-files failed: {}", stderr_summary(&out));
     }
     for file in out.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()) {
-        let path = repo_path.join(String::from_utf8_lossy(file).as_ref());
-        if let Ok(contents) = std::fs::read(&path) {
-            added += contents.iter().filter(|b| **b == b'\n').count();
-            if contents.last().is_some_and(|b| *b != b'\n') {
-                added += 1;
-            }
+        if interrupt.load(Ordering::Relaxed) {
+            bail!("interrupted");
         }
+        let path = repo_path.join(String::from_utf8_lossy(file).as_ref());
+        added += count_lines(&path, UNTRACKED_SCAN_LIMIT, interrupt).unwrap_or(0);
     }
     Ok((added, removed))
+}
+
+/// Lines in `path`: its newlines, plus one for a last line that doesn't end in
+/// one. At most `limit` bytes are read, through a buffer of a fixed size, so
+/// neither the memory nor the work this takes follows the size of the file.
+/// `None` when the path holds no lines to count.
+///
+/// Only a regular file is read. A symlink's bytes live wherever it points,
+/// which is not the worktree: a path outside the repo, a directory, or a
+/// character device that yields bytes forever and so is never finished with.
+/// `git ls-files --others` hands back untracked symlinks along with everything
+/// else, so the check has to happen here.
+fn count_lines(path: &Path, limit: u64, interrupt: &AtomicBool) -> Option<usize> {
+    use std::io::Read;
+
+    if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return None;
+    }
+    let mut reader = std::fs::File::open(path).ok()?.take(limit);
+
+    let mut buf = [0u8; 64 * 1024];
+    let mut lines = 0;
+    // An empty file has no last line to make up for
+    let mut last = b'\n';
+    loop {
+        if interrupt.load(Ordering::Relaxed) {
+            return None;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => {
+                lines += buf[..read].iter().filter(|byte| **byte == b'\n').count();
+                last = buf[read - 1];
+            }
+            Err(_) => return None,
+        }
+    }
+    if last != b'\n' {
+        lines += 1;
+    }
+    Some(lines)
 }
 
 fn stderr_summary(out: &Output) -> String {
@@ -603,6 +649,65 @@ mod tests {
         );
         assert!(!outcome.offline);
         assert!(repo.join(".git/refs/remotes/evil/main").exists());
+    }
+
+    /// `git ls-files --others` reports an untracked symlink as a path like
+    /// any other, so counting the file "at" that path reads whatever it
+    /// points at: bytes that live outside the worktree, or a character device
+    /// that never reaches an end. Reading a 4 GiB artifact nobody ignored
+    /// costs just as much, and a line count doesn't need the file in memory.
+    #[cfg(unix)]
+    #[test]
+    fn untracked_symlinks_and_oversized_files_do_not_become_the_line_count() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("work");
+        std::fs::create_dir(&repo).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        // Three lines of the repo's own, which are the only ones to find
+        std::fs::write(repo.join("notes.txt"), "a\nb\nc\n").unwrap();
+
+        // Bytes that belong to something else, reachable only through a link
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, "x\n".repeat(500)).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("linked")).unwrap();
+        // A link to a directory, and one to a stream with no end at all:
+        // following either is wrong, but the second never even returns
+        std::os::unix::fs::symlink(temp.path(), repo.join("linked-dir")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", repo.join("endless")).unwrap();
+
+        let interrupt = AtomicBool::new(false);
+        assert_eq!(count_diff_lines(&repo, &interrupt).unwrap(), (3, 0));
+    }
+
+    /// A file is counted through a fixed buffer, so its size is not the amount
+    /// of memory the count takes, and the scan gives up on one file rather
+    /// than reading an unbounded number of bytes to label a panel.
+    #[test]
+    fn line_count_reads_at_most_the_scan_limit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("many.txt");
+        std::fs::write(&file, "x\n".repeat(100)).unwrap();
+        let interrupt = AtomicBool::new(false);
+
+        assert_eq!(count_lines(&file, u64::MAX, &interrupt), Some(100));
+        // Only the first 10 bytes are read, which hold five lines
+        assert_eq!(count_lines(&file, 10, &interrupt), Some(5));
+
+        // A line without a trailing newline is still a line
+        std::fs::write(&file, "one\ntwo").unwrap();
+        assert_eq!(count_lines(&file, u64::MAX, &interrupt), Some(2));
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(count_lines(&file, u64::MAX, &interrupt), Some(0));
+
+        // Nothing is read once the user has moved on
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        assert_eq!(count_lines(&file, u64::MAX, &AtomicBool::new(true)), None);
     }
 
     #[test]
