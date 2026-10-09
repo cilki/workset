@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use tracing::level_filters::LevelFilter;
-use workset::Workspace;
+use workset::{Workspace, quote_path};
 
 /// ANSI color codes
 mod colors {
@@ -72,7 +72,10 @@ fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<b
 
     // Check if repo already exists in workspace
     if repo_path.exists() {
-        eprintln!("{} is already in the workspace", pattern.full_path());
+        eprintln!(
+            "{} is already in the workspace",
+            quote_path(&pattern.full_path())
+        );
         return Ok(false);
     }
 
@@ -80,8 +83,8 @@ fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<b
     if workspace.library_contains(&pattern.full_path()) {
         eprintln!(
             "{} is in the library; run 'workset restore {}' instead",
-            pattern.full_path(),
-            pattern.full_path()
+            quote_path(&pattern.full_path()),
+            quote_path(&pattern.full_path())
         );
         return Ok(false);
     }
@@ -90,12 +93,12 @@ fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<b
     if let Some((provider, repo_path_str)) = pattern.provider_and_path() {
         let clone_url = format!("https://{}/{}", provider, repo_path_str);
 
-        outln!("Cloning {}", clone_url);
+        outln!("Cloning {}", quote_path(&clone_url));
 
         // TODO show progress
         workspace.clone_into(&clone_url, &repo_path)?;
 
-        outln!("Cloned {}", pattern.full_path());
+        outln!("Cloned {}", quote_path(&pattern.full_path()));
         Ok(true)
     } else {
         anyhow::bail!("No provider specified. Use format like github.com/user/repo");
@@ -114,7 +117,12 @@ enum BadArg {
 impl std::fmt::Display for BadArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unrecognized(arg) => write!(f, "Unrecognized argument: {}", arg),
+            // The argument is echoed back, and an argument can be a repo's
+            // name: the shell completions offer them, and scripts pass them
+            // along; see [`workset::quote_path`]
+            Self::Unrecognized(arg) => {
+                write!(f, "Unrecognized argument: {}", quote_path(arg))
+            }
             Self::Empty => write!(f, "Empty repository pattern"),
         }
     }
@@ -170,7 +178,7 @@ fn for_each_pattern(
         match action(requested) {
             Ok(done) => succeeded &= done,
             Err(e) => {
-                eprintln!("Failed to {} '{}': {:#}", verb, requested, e);
+                eprintln!("Failed to {} '{}': {:#}", verb, quote_path(requested), e);
                 succeeded = false;
             }
         }
@@ -234,12 +242,15 @@ fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
         let in_workspace = workspace_matches(workspace, &pattern_str);
         if !in_workspace.is_empty() {
             for repo in in_workspace {
-                eprintln!("{} is already in the workspace", repo);
+                eprintln!("{} is already in the workspace", quote_path(&repo));
             }
         } else if library_repos.is_empty() {
             eprintln!("The library is empty");
         } else {
-            eprintln!("No repository in the library matches '{}'", pattern_str);
+            eprintln!(
+                "No repository in the library matches '{}'",
+                quote_path(&pattern_str)
+            );
         }
         return Ok(false);
     }
@@ -251,19 +262,19 @@ fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
         // Check if already exists in workspace
         let dest_path = PathBuf::from(&workspace.path).join(&repo_path);
         if dest_path.exists() {
-            eprintln!("{} is already in the workspace", repo_path);
+            eprintln!("{} is already in the workspace", quote_path(&repo_path));
             continue;
         }
 
         // Restore from library
         match workspace.restore_from_library(&repo_path) {
             Ok(_) => {
-                outln!("Restored {}", repo_path);
+                outln!("Restored {}", quote_path(&repo_path));
                 restored += 1;
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("Failed to restore {}: {}", repo_path, e);
+                eprintln!("Failed to restore {}: {}", quote_path(&repo_path), e);
             }
         }
     }
@@ -454,14 +465,15 @@ fn main() -> Result<ExitCode> {
                 let workspace_path = std::env::current_dir()?;
                 let library_path = workspace_path.join(".workset");
 
+                let workspace_name = workspace_path.display().to_string();
                 if library_path.exists() {
                     outln!(
                         "Workspace already initialized in {}",
-                        workspace_path.display()
+                        quote_path(&workspace_name)
                     );
                 } else {
                     std::fs::create_dir_all(&library_path)?;
-                    outln!("Initialized workspace in {}", workspace_path.display());
+                    outln!("Initialized workspace in {}", quote_path(&workspace_name));
                 }
                 true
             }
@@ -579,7 +591,10 @@ fn drop_repos(
         let report = workspace.drop(&pattern, delete, force)?;
         report_drop(&report, delete);
         if report.is_empty() {
-            eprintln!("No repository in the workspace matches '{}'", requested);
+            eprintln!(
+                "No repository in the workspace matches '{}'",
+                quote_path(requested)
+            );
         }
         Ok(!report.is_empty() && report.skipped.is_empty())
     }))
@@ -591,11 +606,16 @@ fn report_drop(report: &workset::DropReport, delete: bool) {
     let verb = if delete { "deleted" } else { "dropped" };
 
     for repo in &report.dropped {
-        outln!("  {} - ✓ {}", repo, verb);
+        outln!("  {} - ✓ {}", quote_path(repo), verb);
     }
 
     for (repo, blocker) in &report.skipped {
-        eprintln!("  {} - ⚠ kept ({}, {})", repo, blocker, blocker.remedy());
+        eprintln!(
+            "  {} - ⚠ kept ({}, {})",
+            quote_path(repo),
+            blocker,
+            blocker.remedy()
+        );
     }
 }
 
@@ -605,9 +625,15 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     let repos = workspace.repos();
 
     if repos.is_empty() {
-        outln!("No repositories found in workspace ({})", workspace.path);
+        outln!(
+            "No repositories found in workspace ({})",
+            quote_path(&workspace.path)
+        );
     } else {
-        outln!("Repositories in workspace ({}):", workspace.path);
+        outln!(
+            "Repositories in workspace ({}):",
+            quote_path(&workspace.path)
+        );
         outln!();
 
         let statuses = workset::scan_repos(&repos, |repo| workset::check_repo_status(repo));
@@ -624,7 +650,10 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
                 Err(_) => "✗ error",
             };
 
-            outln!("  {} - {}", repo_name, status_str);
+            // A repo's directory name is the repo's to choose, and this line
+            // is what the user reads before deciding what to drop; see
+            // [`workset::quote_path`]
+            outln!("  {} - {}", quote_path(&repo_name), status_str);
         }
     }
 
@@ -635,7 +664,7 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
         outln!();
         outln!(
             "Library ({}): {} repository(ies)",
-            workspace.library_path(),
+            quote_path(&workspace.library_path()),
             library.len()
         );
     }
