@@ -19,6 +19,42 @@ use std::time::{Duration, Instant};
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for purely local git commands
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Config overrides passed to every git invocation workset makes, so that a
+/// repository can't name the command git runs on its behalf.
+///
+/// A repo that arrived as files rather than through `git clone` — a tarball, a
+/// shared directory, a copy someone handed over — carries its own
+/// `.git/config` and its own `.git/hooks`, and workset hands both to git
+/// without the user ever asking for a fetch: the TUI syncs every remote of
+/// every repo at startup and periodically after that, and selecting a row
+/// runs the info panel's `git diff`/`git ls-files`. Each entry below is a
+/// place where that config or those hooks name a program to execute. A `-c`
+/// given on the command line outranks every config file, so each one is
+/// pinned back to something inert.
+///
+/// Only overrides that cost a legitimate repo nothing belong here; the two
+/// vectors that would trade away working setups (`remote.<name>.uploadpack`
+/// and gix's filter drivers) are left to the decision in issue #57.
+const UNTRUSTED_CONFIG_OVERRIDES: [&str; 3] = [
+    // A command git runs to learn which paths changed, which it does whenever
+    // it refreshes the index — both of the info panel's calls do. It is a
+    // performance feature, so pinning it off only costs a slower scan of a
+    // very large worktree.
+    "core.fsmonitor=",
+    // A fetch that updates a tracking ref runs the repo's
+    // reference-transaction hook, and auto-gc runs its pre-auto-gc hook. The
+    // hooks are the repo's own files, and workset's background fetch is not
+    // the user's fetch, so no hook of theirs should fire for it. The path has
+    // to be one that cannot exist: an empty value would send git looking for
+    // hooks relative to the worktree, which is where the repo's files are.
+    "core.hooksPath=/dev/null/workset-no-hooks",
+    // An `ext::<command>` remote URL *is* a command. git refuses the
+    // transport by default, but that default is itself config the repo can
+    // overrule with its own `protocol.ext.allow = always`, and then the
+    // background fetch runs the command.
+    "protocol.ext.allow=never",
+];
+
 /// How much of one untracked file is read to count its lines. A worktree can
 /// hold a file of any size — a core dump, a VM image, a dataset nobody
 /// ignored — and the info panel wants the number of lines, not the file, so
@@ -384,17 +420,31 @@ fn stderr_summary(out: &Output) -> String {
 
 /// Run a git command with output capture, a timeout, and interrupt support.
 /// Credential prompts are disabled so background tasks fail instead of
-/// hanging or corrupting the terminal.
+/// hanging or corrupting the terminal, and the repository's own config is
+/// kept from naming a command for git to run (see
+/// [`UNTRUSTED_CONFIG_OVERRIDES`]).
 fn run_git(
     repo_path: &Path,
     args: &[&str],
     interrupt: &AtomicBool,
     timeout: Duration,
 ) -> Result<Output> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    for override_ in UNTRUSTED_CONFIG_OVERRIDES {
+        command.args(["-c", override_]);
+    }
+    let mut child = command
         .args(args)
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // The command git runs to reach a `git://` remote, which it execs
+        // directly. Unlike the entries above this one can't be pinned with
+        // `-c`: `core.gitProxy` is a list whose *first* matching value wins,
+        // and config files are read before the command line, so the repo's
+        // value would still be the one used. Empty means no proxy, which is
+        // also what a workspace without one wants, so a legitimate `git://`
+        // remote still connects directly.
+        .env("GIT_PROXY_COMMAND", "")
         // BatchMode alone rejects hosts not yet in known_hosts, since there is
         // no terminal to confirm on; accept-new trusts a host's key on first
         // contact but still fails hard if a known key ever changes
@@ -651,6 +701,209 @@ mod tests {
         );
         assert!(!outcome.offline);
         assert!(repo.join(".git/refs/remotes/evil/main").exists());
+    }
+
+    /// Set up a work repo with `origin` pointing at a bare upstream that
+    /// already holds a `main` branch, so the next fetch has a tracking ref to
+    /// create. Returns the work repo's path.
+    #[cfg(unix)]
+    fn repo_with_fetchable_remote(temp: &Path) -> std::path::PathBuf {
+        let repo = temp.join("work");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(temp, &["init", "--quiet", "--bare", "upstream"]);
+        let upstream = temp.join("upstream");
+        let source = temp.join("source");
+        std::fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--quiet", "--initial-branch=main"]);
+        git(&source, &["config", "user.name", "workset"]);
+        git(&source, &["config", "user.email", "workset@example.com"]);
+        git(&source, &["commit", "--quiet", "--allow-empty", "-m", "one"]);
+        git(
+            &source,
+            &["push", "--quiet", &upstream.to_string_lossy(), "main"],
+        );
+
+        // No fetch yet, so the fetch under test is the one that writes
+        // refs/remotes/origin/main
+        git(&repo, &["init", "--quiet"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", &upstream.to_string_lossy()],
+        );
+        repo
+    }
+
+    /// Write an executable script that leaves `marker` behind when it runs
+    #[cfg(unix)]
+    fn marker_script(path: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\ntouch {}\n", marker.to_string_lossy()),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A repo's hooks are its own files, and a fetch that writes a tracking
+    /// ref runs its reference-transaction hook. The TUI fetches every remote
+    /// of every repo in the workspace by itself, so for a repo that arrived as
+    /// files rather than through a clone, opening the TUI would be enough to
+    /// run a hook the user never installed. None of workset's fetches are the
+    /// user's own fetch, so no hook of the repo's should fire for them.
+    #[cfg(unix)]
+    #[test]
+    fn a_background_fetch_does_not_run_the_repos_hooks() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = repo_with_fetchable_remote(temp.path());
+        let marker = temp.path().join("pwned");
+        marker_script(&repo.join(".git/hooks/reference-transaction"), &marker);
+
+        let outcome = sync_repo(&repo, &AtomicBool::new(false)).unwrap();
+
+        assert!(!marker.exists(), "the fetch ran the repo's hook");
+        // The fetch still did its job: the hook is skipped, not the ref update
+        assert!(
+            outcome.fetch_errors.is_empty(),
+            "{:?}",
+            outcome.fetch_errors
+        );
+        assert!(!outcome.offline);
+        assert!(repo.join(".git/refs/remotes/origin/main").exists());
+    }
+
+    /// `ext::<command>` remote URLs are a command rather than an address. git
+    /// refuses that transport by default, but the default is config too, and
+    /// the repo carries its own: `protocol.ext.allow = always` in it turns the
+    /// background fetch into the command's launcher.
+    #[cfg(unix)]
+    #[test]
+    fn an_ext_url_the_repo_allows_itself_is_still_not_run() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("work");
+        std::fs::create_dir(&repo).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let marker = temp.path().join("pwned");
+        let script = temp.path().join("payload.sh");
+        marker_script(&script, &marker);
+        let mut config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+        config.push_str(&format!(
+            "[protocol \"ext\"]\n\tallow = always\n\
+             [remote \"evil\"]\n\turl = ext::{}\n\tfetch = +refs/heads/*:refs/remotes/evil/*\n",
+            script.to_string_lossy()
+        ));
+        std::fs::write(repo.join(".git/config"), config).unwrap();
+
+        let outcome = sync_repo(&repo, &AtomicBool::new(false)).unwrap();
+
+        assert!(!marker.exists(), "the fetch ran the ext:: command");
+        // The only remote there is couldn't be reached, which reads as offline
+        assert!(outcome.offline);
+    }
+
+    /// `core.gitProxy` is a command git execs to reach a `git://` remote. A
+    /// `-c` can't take it back, since the first matching value in config order
+    /// wins and the repo's config is read before the command line, so the
+    /// fetch has to tell git through the environment that it has no proxy.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_url_does_not_run_the_repos_proxy_command() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("work");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+
+        let marker = temp.path().join("pwned");
+        let script = temp.path().join("proxy.sh");
+        marker_script(&script, &marker);
+        git(&["config", "core.gitproxy", &script.to_string_lossy()]);
+        // Port 1 on loopback refuses at once, so the fetch that gets to make
+        // its own connection fails without waiting on anything
+        git(&["remote", "add", "evil", "git://127.0.0.1:1/repo.git"]);
+
+        let outcome = sync_repo(&repo, &AtomicBool::new(false)).unwrap();
+
+        assert!(!marker.exists(), "the fetch ran the repo's proxy command");
+        assert!(outcome.offline);
+    }
+
+    /// `core.fsmonitor` is a command git runs whenever it refreshes the index,
+    /// which both of the info panel's calls do. Resting the selection on a row
+    /// is all it takes to reach them.
+    #[cfg(unix)]
+    #[test]
+    fn counting_changed_lines_does_not_run_the_repos_fsmonitor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("work");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "workset"]);
+        git(&["config", "user.email", "workset@example.com"]);
+        std::fs::write(repo.join("tracked.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "--quiet", "-m", "one"]);
+
+        let marker = temp.path().join("pwned");
+        let script = temp.path().join("fsmonitor.sh");
+        marker_script(&script, &marker);
+        git(&["config", "core.fsmonitor", &script.to_string_lossy()]);
+
+        // One line changed in a tracked file, one line in an untracked one
+        std::fs::write(repo.join("tracked.txt"), "one\nthree\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "four\n").unwrap();
+
+        let counts = count_diff_lines(&repo, &AtomicBool::new(false)).unwrap();
+
+        assert!(!marker.exists(), "the line count ran the repo's fsmonitor");
+        // And the count is still the one the panel wants
+        assert_eq!(counts, (2, 1));
     }
 
     /// `git ls-files --others` reports an untracked symlink as a path like
