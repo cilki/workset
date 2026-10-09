@@ -802,6 +802,54 @@ fn dirty_files_time(
     (readable, latest)
 }
 
+/// Delete the directories a repo's workspace path leaves behind once the repo
+/// itself is gone, walking up from `repo` and stopping at the workspace root,
+/// at the library, or at the first directory that still holds something.
+///
+/// A repo sits at the path its remote dictates, so the directories above it
+/// exist only to hold it: dropping `github.com/user/repo` left `github.com` and
+/// `github.com/user` behind with nothing in them, and a clone that failed left
+/// the pair it had just made for a repo that never arrived. Nothing ever
+/// collected those, so a workspace accumulated an empty tree mirroring every
+/// repo it had held and every name the user had mistyped — the clutter a drop
+/// exists to clear.
+///
+/// Tidying up is not worth pulling the ground out from under the caller's
+/// shell, so the current directory and everything above it is left alone:
+/// `cd github.com/user && workset drop project` empties the directory it is
+/// standing in rather than removing it.
+fn prune_empty_dirs(root: &Path, repo: &Path) {
+    let library = root.join(".workset");
+    let cwd = std::env::current_dir().ok();
+    let mut candidate = Some(repo);
+
+    while let Some(dir) = candidate {
+        // Never the root or above it, and never the library: an empty library
+        // is still the directory that makes this a workspace
+        if dir == root || dir == library.as_path() || !dir.starts_with(root) {
+            break;
+        }
+
+        // Nor the current directory or any of its parents, which the caller is
+        // still standing in
+        if cwd.as_deref().is_some_and(|cwd| cwd.starts_with(dir)) {
+            break;
+        }
+
+        match std::fs::remove_dir(dir) {
+            Ok(()) => {}
+            // Already gone, which the repo's own directory normally is by the
+            // time a drop gets here: keep walking up to the parents it emptied
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // A directory that still holds something, or one that isn't ours
+            // to remove, is where the walk ends
+            Err(_) => break,
+        }
+
+        candidate = dir.parent();
+    }
+}
+
 /// A `Workspace` is filesystem directory containing git repositories checked out
 /// from one or more providers. Each repository's path matches the remote's path,
 /// for example:
@@ -1058,8 +1106,22 @@ impl Workspace {
         // Remove the directory
         debug!(path = ?repo, "Removing directory");
         std::fs::remove_dir_all(repo)?;
+        prune_empty_dirs(&root, &root.join(&relative));
         report.dropped.push(relative_path);
         Ok(())
+    }
+
+    /// Clone `url` into `dest`, which must be a path inside this workspace.
+    ///
+    /// A clone has to make the directories leading to the repo before it knows
+    /// whether there is a repo to put in them, so a clone that fails — a
+    /// mistyped pattern, a private repo, a remote that is down — has to take
+    /// them back out on the way, or a typo leaves a piece of workspace behind
+    /// for good.
+    pub fn clone_into(&self, url: &str, dest: &Path) -> Result<()> {
+        gix_clone(url, dest)
+            .map(|_| ())
+            .inspect_err(|_| prune_empty_dirs(Path::new(&self.path), dest))
     }
 
     /// Attempt to clone a repository from configured remotes or infer the clone URL
@@ -1073,7 +1135,7 @@ impl Workspace {
             let clone_url = format!("https://{}/{}", provider, repo_path);
             let dest_path = self.repo_path(pattern)?;
 
-            gix_clone(&clone_url, &dest_path)?;
+            self.clone_into(&clone_url, &dest_path)?;
             return Ok(dest_path);
         }
 
@@ -1154,7 +1216,7 @@ impl Workspace {
         // git directory is thrown away again right below. A clone only
         // creates a local branch for HEAD, so keeping it would silently drop
         // every other branch (and any commit only reachable from one).
-        gix_clone(&source.to_string_lossy(), &dest)?;
+        self.clone_into(&source.to_string_lossy(), &dest)?;
 
         let git_dir = dest.join(".git");
         let discarded = dest.join(".git.workset-restore");
@@ -1642,6 +1704,146 @@ mod tests {
         }
         assert!(outside.join(".git").exists());
         assert!(report.is_empty());
+    }
+
+    /// A repo's path is its remote's path, so the directories above it are
+    /// workset's bookkeeping rather than anything the user put there. Leaving
+    /// them behind empty meant a workspace emptied of every repo still held a
+    /// directory tree naming each one.
+    #[test]
+    fn drop_takes_the_directories_it_leaves_empty_with_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let root = PathBuf::from(&workspace.path);
+        repo_with_a_commit(&root.join("github.com/user/project"));
+
+        let report = workspace
+            .drop(
+                &"github.com/user/project".parse::<RepoPattern>().unwrap(),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(report.dropped, vec!["github.com/user/project".to_string()]);
+
+        // Nothing is left of the repo's path, but the workspace itself and the
+        // library holding the repo are untouched
+        assert!(!root.join("github.com").exists());
+        assert!(root.is_dir());
+        assert!(workspace.library_contains("github.com/user/project"));
+
+        // And a restore builds the path back, so the pruning costs nothing
+        workspace
+            .restore_from_library("github.com/user/project")
+            .unwrap();
+        assert!(root.join("github.com/user/project/.git").is_dir());
+    }
+
+    /// Only the directories that the dropped repo was the last thing in are
+    /// workset's to remove: anything still holding something stays, whether
+    /// that something is another repo or a file the user left there.
+    #[test]
+    fn drop_keeps_a_directory_that_still_holds_something() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let root = PathBuf::from(&workspace.path);
+        repo_with_a_commit(&root.join("github.com/user/first"));
+        repo_with_a_commit(&root.join("github.com/user/second"));
+        repo_with_a_commit(&root.join("gitlab.com/group/only"));
+        fs::write(root.join("gitlab.com/notes.txt"), "mine").unwrap();
+
+        let report = workspace
+            .drop(
+                &"github.com/user/first".parse::<RepoPattern>().unwrap(),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(report.dropped, vec!["github.com/user/first".to_string()]);
+
+        // The sibling repo is still in the workspace, so its parents are too
+        assert!(!root.join("github.com/user/first").exists());
+        assert!(root.join("github.com/user/second/.git").is_dir());
+
+        let report = workspace
+            .drop(
+                &"gitlab.com/group/only".parse::<RepoPattern>().unwrap(),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(report.dropped, vec!["gitlab.com/group/only".to_string()]);
+
+        // The empty group directory goes; the one with the user's file in it
+        // is not workset's to clean up
+        assert!(!root.join("gitlab.com/group").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("gitlab.com/notes.txt")).unwrap(),
+            "mine"
+        );
+    }
+
+    /// The directories leading to a repo are made before the clone knows
+    /// whether there is a repo to put in them, so a mistyped pattern used to
+    /// leave a piece of workspace behind that nothing would ever fill or
+    /// remove.
+    #[test]
+    fn a_failed_clone_takes_the_directories_it_made_with_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let root = PathBuf::from(&workspace.path);
+
+        // A local path holding no repository stands in for every way a clone
+        // can fail, and needs no network to do it
+        let nowhere = temp_dir.path().join("nowhere");
+        assert!(
+            workspace
+                .clone_into(
+                    &nowhere.to_string_lossy(),
+                    &root.join("github.com/user/typo")
+                )
+                .is_err()
+        );
+
+        assert!(!root.join("github.com").exists());
+        assert!(root.is_dir());
+        assert!(Path::new(&workspace.library_path()).is_dir());
+    }
+
+    /// The walk upward has to stop somewhere: the workspace root and the
+    /// library are what make the directory a workspace at all, and a path that
+    /// isn't under the root was never workset's to touch.
+    #[test]
+    fn pruning_stops_at_the_root_the_library_and_the_workspace_edge() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("ws");
+        let library = root.join(".workset");
+        fs::create_dir_all(&library).unwrap();
+
+        // A repo directly under the root, already removed: there is nothing
+        // above it to prune but the root
+        prune_empty_dirs(&root, &root.join("repo"));
+        assert!(root.is_dir());
+        assert!(library.is_dir());
+
+        // An empty library is still the workspace's library
+        prune_empty_dirs(&root, &library.join("github.com/user/project"));
+        assert!(library.is_dir());
+
+        // Nothing outside the workspace is removed, however empty
+        let outside = temp_dir.path().join("outside/dir");
+        fs::create_dir_all(&outside).unwrap();
+        prune_empty_dirs(&root, &outside);
+        assert!(outside.is_dir());
     }
 
     /// A symlinked directory in the workspace is a path that reads as

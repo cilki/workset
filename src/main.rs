@@ -202,7 +202,7 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
         outln!("Cloning {}", clone_url);
 
         // TODO show progress
-        workset::gix_clone(&clone_url, &repo_path)?;
+        workspace.clone_into(&clone_url, &repo_path)?;
 
         outln!("Cloned {}", pattern.full_path());
         Ok(true)

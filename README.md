@@ -87,6 +87,13 @@ moved into the library and the working tree is deleted, and `restore` checks the
 working tree back out of the library. So a round trip keeps everything git has —
 every branch, tag and stash — but nothing it doesn't.
 
+A repo's path only exists to hold the repo, so the directories above it go with
+it as far up as they are left empty: dropping `github.com/jqlang/jq` takes
+`github.com/jqlang` too, and `github.com` as well once it holds nothing else.
+Anything that isn't workset's keeps its directory — another repo, a file of your
+own — and so does the directory you happen to be standing in, so `workset drop`
+from the workspace root is what empties the tree completely.
+
 Untracked files are safe, because they make the repo "modified" and a drop
 refuses to touch it. **Ignored** files are not: git doesn't report them, so the
 repo counts as clean and they are deleted without warning and don't come back.

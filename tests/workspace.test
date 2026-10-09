@@ -474,6 +474,58 @@ testDropAndRestoreNestedRepo() {
 	[ -d github.com/testuser/nested-repo/.git ]
 }
 
+## A repo sits at the path its remote dictates, so the directories above it
+## are workset's bookkeeping and go when the repo does. Without this a
+## workspace emptied of every repo still held a directory tree naming each one.
+testDropPrunesTheDirectoriesItEmpties() {
+	newWorkspace
+	createRepo github.com/jqlang/jq
+	createRepo gitlab.com/group/project
+
+	workset drop
+
+	[ ! -e github.com ]
+	[ ! -e gitlab.com ]
+	# The workspace and its library are untouched, and a restore builds the
+	# path back
+	[ -d .workset/github.com/jqlang/jq ]
+	workset restore github.com/jqlang/jq
+	[ -d github.com/jqlang/jq/.git ]
+}
+
+## Only the directories the dropped repo was the last thing in are workset's
+## to remove
+testDropKeepsDirectoriesStillInUse() {
+	newWorkspace
+	createRepo github.com/user/first
+	createRepo github.com/user/second
+	createRepo gitlab.com/group/only
+	echo "mine" >gitlab.com/notes.txt
+
+	workset drop github.com/user/first gitlab.com/group/only
+
+	# A sibling repo keeps its parents
+	[ -d github.com/user/second/.git ]
+	# So does a file the user left behind, while the directory that held
+	# nothing but the repo goes
+	[ ! -e gitlab.com/group ]
+	[ -f gitlab.com/notes.txt ]
+}
+
+## Tidying up stops short of the directory the caller is standing in, so a
+## drop from inside the tree doesn't leave the shell nowhere
+testDropKeepsTheCurrentDirectory() {
+	newWorkspace
+	createRepo github.com/user/project
+
+	cd github.com/user
+	workset drop project
+
+	[ ! -e project ]
+	[ -d . ]
+	[ -d ../../.workset/github.com/user/project ]
+}
+
 ## Drop patterns are workspace-relative, so a full path works from anywhere
 testDropFullPathFromSubdirectory() {
 	newWorkspace
@@ -544,6 +596,9 @@ testDropWithDeleteReportsDeletion() {
 testRestoreFromSubdirectory() {
 	newWorkspace
 	createRepo projects/my-project
+	# A neighbour, so that dropping the repo doesn't take the directory the
+	# restore is run from with it
+	createRepo projects/neighbour
 
 	workset drop projects/my-project
 	[ ! -e projects/my-project ]
