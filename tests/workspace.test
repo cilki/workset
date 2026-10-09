@@ -736,9 +736,11 @@ testOutputIntoClosedPipeIsQuiet() {
 
 	# The reader is gone before workset writes a byte, so the first line it
 	# prints fails for certain rather than only when the output outgrows the
-	# pipe buffer
+	# pipe buffer. Only workset's stderr is collected: capturing the whole
+	# pipeline's would collect the test runner's own command trace with it.
 	for command in list ls status; do
-		[ -z "$({ { sleep 1; workset $command; } | true; } 2>&1)" ]
+		{ sleep 1; workset $command 2>stderr.txt; } | true
+		[ ! -s stderr.txt ]
 	done
 }
 
