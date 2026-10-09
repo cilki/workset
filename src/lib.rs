@@ -64,6 +64,15 @@ pub struct SubmoduleInfo {
     pub initialized: bool,
 }
 
+/// Whether this directory is a git directory itself rather than a worktree
+/// with one in it: a bare repository, or the `.git` directory of a non-bare
+/// one. Uses the same cheap test git does — a `HEAD`, an `objects` directory
+/// and a `refs` directory — and stats `HEAD` first, because almost nothing
+/// else has one and the other two cost nothing once it's missing.
+fn is_git_dir(path: &Path) -> bool {
+    path.join("HEAD").is_file() && path.join("objects").is_dir() && path.join("refs").is_dir()
+}
+
 /// Recursively find "top-level" git repositories.
 /// This function will not traverse into .git directories or nested git repositories.
 pub fn find_git_repositories(path: &Path) -> Result<Vec<PathBuf>> {
@@ -74,6 +83,24 @@ pub fn find_git_repositories(path: &Path) -> Result<Vec<PathBuf>> {
     if path.join(".git").exists() {
         found.push(path.to_path_buf());
         return Ok(found); // Don't traverse into git repositories
+    }
+
+    // A bare repository is a repository too, so the search stops here as
+    // well. It isn't reported, because every caller wants the working set:
+    // repos with a worktree to show a status for, to drop, to open a shell
+    // in. A bare repo has none, which is why it was never reported before
+    // either — but the search used to walk straight through it.
+    //
+    // Walking through one is what made every command pay for the library.
+    // `drop` stores each repo as a bare git directory under `.workset/`, and
+    // `.workset/` lives in the workspace, so the walk that enumerates the
+    // working set descended through every library entry's whole object store
+    // — a 256-way fanout per repo, thousands of directories that cannot hold
+    // a workspace repo — to find nothing in any of them. The cost grew with
+    // the library, which is the part of a workspace this tool exists to let
+    // you grow.
+    if is_git_dir(path) {
+        return Ok(found);
     }
 
     // Otherwise, recursively search subdirectories. `read_dir` hands entries
@@ -2039,6 +2066,45 @@ mod tests {
                 "gitlab.com/b/two",
             ]
         );
+    }
+
+    /// A dropped repo lives on in the library as a bare git directory, and the
+    /// library lives inside the workspace, so the walk that enumerates the
+    /// working set meets one. It must stop there: walking in costs a read_dir
+    /// of every directory of every library entry's object store — the walk's
+    /// whole runtime, once a library has grown — and anything found inside is
+    /// not a repo the workspace contains.
+    #[test]
+    fn find_git_repositories_stops_at_a_library_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let workspace = Workspace {
+            path: root.to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        // One repo stays in the workspace, one is dropped into the library
+        let kept = root.join("github.com/user/kept");
+        gix::init(&kept).unwrap();
+        let dropped = root.join("github.com/user/dropped");
+        gix::init(&dropped).unwrap();
+        workspace
+            .store_in_library("github.com/user/dropped")
+            .unwrap();
+
+        let library_entry = Path::new(&workspace.library_path()).join("github.com/user/dropped");
+        assert!(
+            library_entry.join("objects").is_dir(),
+            "the library entry should be a bare git directory"
+        );
+
+        // A `.git` planted inside the library entry is the walk's own
+        // evidence: it is only reachable by descending into the entry, and it
+        // is exactly the shape the walk reports as a workspace repo.
+        fs::create_dir_all(library_entry.join("objects/decoy/.git")).unwrap();
+
+        let repos = find_git_repositories(root).unwrap();
+        assert_eq!(repos, vec![kept]);
     }
 
     #[test]
