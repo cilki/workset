@@ -124,6 +124,38 @@ A repository **workset** can't read at all is kept too, and reported as
 library **workset** uses, so rather than guess at what such a repo holds, it is
 left where it is until you drop it with `--force`.
 
+### What a drop won't touch at all
+
+A drop moves a git directory into the library and deletes the working tree
+around it, which only makes sense for a repo that owns its git directory and is
+the only working tree using it. `git worktree add` breaks both halves of that,
+so a linked worktree inside the workspace leaves you with two repos that stay
+put — and `--force` is no help here, because neither is outstanding work you
+could decide to discard:
+
+```sh
+❯ git -C github.com/jqlang/jq worktree add ../jq-wt some-branch
+
+❯ workset drop --force
+  github.com/jqlang/jq - ⚠ kept (git directory shared with 1 linked worktree, remove it with 'git worktree remove' first)
+  github.com/jqlang/jq-wt - ⚠ kept (git directory belongs to another repository, drop that repository instead)
+❯ echo $?
+1
+```
+
+The main worktree is kept because its git directory is the one the linked
+worktree reads its objects and refs from; the linked worktree is kept because
+its `.git` is a file pointing back at that git directory, so there's nothing
+here for the library to store. `git worktree remove` leaves an ordinary repo
+behind, which drops as usual:
+
+```sh
+❯ git -C github.com/jqlang/jq worktree remove ../jq-wt
+
+❯ workset drop
+  github.com/jqlang/jq - ✓ dropped
+```
+
 Every command reports what it did and exits non-zero when it couldn't do all of
 it, so `workset` composes with other commands:
 
