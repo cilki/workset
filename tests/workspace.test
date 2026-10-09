@@ -724,6 +724,41 @@ testListSortsRepos() {
 	diff expected actual
 }
 
+## A repo's directory name is the repo's to choose — a repo can arrive as
+## files, from a tarball or a shared directory — and on Unix a name can hold
+## anything but '/' and NUL. Reported verbatim, a name holding a newline
+## forged rows in output the user reads before deciding what to drop, and one
+## holding a carriage return or an ESC sequence erased the status beside it.
+testListQuotesNamesThatWouldForgeRows() {
+	newWorkspace
+	# A clean repo whose name claims to be a modified repo followed by a
+	# second, clean one; and a repo with uncommitted changes whose name
+	# erases the line and rewrites it as clean
+	forged=$'github.com/acme/tool - \u26a0 modified\n  github.com/acme/other - \u2713 clean'
+	erased=$'github.com/acme/hidden\u001b[2K\r  github.com/acme/hidden - \u2713 clean'
+	createRepo "$forged" 1
+	createRepo "$erased" 1
+	echo "uncommitted" >"$erased/uncommitted.txt"
+
+	output=$(workset list)
+
+	# Two repos, so two rows besides the header and its blank line
+	[ "$(echo "$output" | grep -c ' - ')" -eq 2 ]
+	# Neither forged row got a line of its own
+	! echo "$output" | grep -q "^  github.com/acme/other - ✓ clean$"
+	# Every control byte but the newlines between rows is gone
+	[ -z "$(printf '%s' "$output" | tr -cd '\000-\011\013-\037\177')" ]
+	# What the repos really are is still reported, on the quoted rows
+	echo "$output" | grep -- '\\n  github.com/acme/other - ✓ clean" - ✓ clean$'
+	echo "$output" | grep -- '\\u{1b}\[2K\\r  github.com/acme/hidden - ✓ clean" - ⚠ modified$'
+
+	# The same name through a drop report, which 'drop' prints before and
+	# after acting on each repo
+	output=$(workset drop "$forged")
+	[ "$(echo "$output" | grep -c ' - ✓ dropped')" -eq 1 ]
+	! echo "$output" | grep -q "^  github.com/acme/other - ✓ clean$"
+}
+
 ## A reader that goes away before workset is done writing ends the command,
 ## it doesn't crash it. Rust ignores SIGPIPE, so the write fails instead of
 ## killing the process, and println! answers a failed write with a panic: a

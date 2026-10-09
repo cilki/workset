@@ -55,6 +55,68 @@ impl RepoPattern {
     }
 }
 
+/// Printable form of a path, C-style quoted when it holds characters that
+/// would rewrite the output around it rather than just adding to it. A path
+/// that needs no quoting is returned untouched.
+///
+/// A repo's directory name is not workset's to choose. On Unix it may hold
+/// any byte but `/` and NUL, and a repo can arrive as *files* — a tarball, a
+/// shared directory, a copy someone handed over — so whoever assembled it
+/// decides what its name says. workset reports repos one per line, and that
+/// line is what the user reads before deciding what to drop, so a name
+/// holding a newline doesn't just look odd, it forges rows:
+///
+/// ```text
+///   github.com/acme/tool - ⚠ modified
+///   github.com/acme/other - ✓ clean
+/// ```
+///
+/// is what `workset list` printed for a *single* clean repo whose directory
+/// was named `github.com/acme/tool - ⚠ modified\n  github.com/acme/other - ✓
+/// clean`. A carriage return or an ESC sequence does the same job by erasing
+/// what was already written on the line (`...\r  safe-repo - ✓ clean`), and
+/// the bidi formatting characters by reordering it.
+///
+/// git has the same problem with pathnames in its own output and answers it
+/// the same way, with the C-style quoting of `core.quotePath`; the quotes are
+/// part of the answer, because they are what tells the user that what they
+/// are looking at is not literally the name.
+pub fn quote_path(path: &str) -> std::borrow::Cow<'_, str> {
+    // The C0/C1 control characters, plus the bidi embeddings, overrides and
+    // isolates: what they all have in common is that they change the text
+    // around them instead of occupying a column of their own.
+    fn must_escape(c: char) -> bool {
+        c.is_control()
+            || matches!(c,
+                '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    }
+
+    if !path.contains(must_escape) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for c in path.chars() {
+        match c {
+            // Escaped only inside a quoted name, so that the quoting stays
+            // unambiguous; on their own neither character is worth quoting a
+            // name for
+            '"' | '\\' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            c if must_escape(c) => quoted.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    std::borrow::Cow::Owned(quoted)
+}
+
 /// Represents a git submodule within a repository
 #[derive(Debug, Clone)]
 pub struct SubmoduleInfo {
@@ -1458,6 +1520,66 @@ mod tests {
         for (url, expected) in cases {
             assert_eq!(url_tree_path(url).as_deref(), expected, "url: {url}");
         }
+    }
+
+    #[test]
+    fn ordinary_paths_are_printed_as_they_are() {
+        for path in [
+            "github.com/fossable/workset",
+            "repo",
+            "",
+            // Spaces, dashes and the status glyphs workset prints itself are
+            // all ordinary text, and a backslash on its own is a legal
+            // character in a name rather than a reason to quote one
+            "my repos/a - b",
+            "github.com/acme/✓",
+            "weird\\name",
+            "кирилица/проект",
+        ] {
+            assert!(
+                matches!(quote_path(path), std::borrow::Cow::Borrowed(_)),
+                "path should not have been quoted: {:?}",
+                path
+            );
+            assert_eq!(quote_path(path), path);
+        }
+    }
+
+    #[test]
+    fn a_path_cannot_forge_a_line_of_its_own() {
+        // The forgery: one repo, named so that its row reads as two
+        let forged = "github.com/acme/tool - ⚠ modified\n  github.com/acme/other - ✓ clean";
+        let quoted = quote_path(forged);
+        assert!(!quoted.contains('\n'), "{}", quoted);
+        assert_eq!(
+            quoted,
+            "\"github.com/acme/tool - ⚠ modified\\n  github.com/acme/other - ✓ clean\""
+        );
+    }
+
+    #[test]
+    fn characters_that_rewrite_the_line_are_escaped() {
+        // A carriage return rewrites the line from the start, an ESC
+        // sequence erases whatever is already on it, and a bidi override
+        // reorders what follows
+        assert_eq!(
+            quote_path("repo\rsafe - ✓ clean"),
+            "\"repo\\rsafe - ✓ clean\""
+        );
+        assert_eq!(
+            quote_path("repo\u{1b}[2K - ✓ clean"),
+            "\"repo\\u{1b}[2K - ✓ clean\""
+        );
+        assert_eq!(
+            quote_path("repo\u{202e}txt.evil"),
+            "\"repo\\u{202e}txt.evil\""
+        );
+        assert_eq!(quote_path("a\tb"), "\"a\\tb\"");
+        assert_eq!(quote_path("a\u{7f}b"), "\"a\\u{7f}b\"");
+
+        // Quoting a name is also what makes its quotes and backslashes
+        // ambiguous, so inside the quotes they're escaped too
+        assert_eq!(quote_path("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
     }
 
     #[test]
