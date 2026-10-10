@@ -467,14 +467,18 @@ impl App {
         }
     }
 
-    /// Paths of the workspace repos that background sync should consider
-    /// (submodules are synced through their parent repo)
-    pub fn syncable_repo_paths(&self) -> Vec<PathBuf> {
-        self.workspace_repos_list
-            .iter()
+    /// Path of the selected repo if background sync should fetch it: a
+    /// workspace repo that isn't a submodule (submodules sync through their
+    /// parent repo; library repos are never fetched)
+    pub fn selected_syncable_repo_path(&self) -> Option<PathBuf> {
+        if self.active_section != Section::Workspace {
+            return None;
+        }
+        self.selected_node()?
+            .repo_info
+            .as_ref()
             .filter(|r| !r.is_submodule)
             .map(|r| r.path.clone())
-            .collect()
     }
 
     /// Snapshot of the current repo lists, used to seed a background refresh

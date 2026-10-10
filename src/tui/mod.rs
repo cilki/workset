@@ -39,8 +39,12 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 /// How many repos may fetch concurrently
 const MAX_CONCURRENT_SYNCS: usize = 4;
-/// How often all repos are re-checked against their remotes
-const SYNC_INTERVAL: Duration = Duration::from_secs(300);
+/// How long the selection must rest on a repo before it is fetched, so
+/// scrolling through the list doesn't fetch every row passed over. Longer
+/// than the details debounce because a fetch hits the network.
+const SELECTION_SYNC_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Don't refetch a repo the selection returns to within this window
+const SELECTION_SYNC_COOLDOWN: Duration = Duration::from_secs(60);
 /// Ignore watcher-triggered sync requests this soon after a sync finished,
 /// since the sync's own fetch writes the tracking refs the watcher observes
 const WATCHER_SYNC_COOLDOWN: Duration = Duration::from_secs(2);
@@ -202,9 +206,11 @@ enum SyncEvent {
     Failed(String),
 }
 
-/// Schedules background jobs that fetch each repo's remotes and refresh its
-/// status. Jobs run on their own threads (up to `MAX_CONCURRENT_SYNCS`) and
-/// report back through a channel drained by the event loop.
+/// Schedules background jobs that fetch a repo's remotes and refresh its
+/// status — the repo the selection rests on, plus any repo whose tracking
+/// refs the watcher saw change. Jobs run on their own threads (up to
+/// `MAX_CONCURRENT_SYNCS`) and report back through a channel drained by the
+/// event loop.
 struct SyncManager {
     tx: mpsc::Sender<(PathBuf, SyncEvent)>,
     rx: mpsc::Receiver<(PathBuf, SyncEvent)>,
@@ -214,11 +220,11 @@ struct SyncManager {
     /// the running job finishes
     rerun_after: HashSet<PathBuf>,
     recently_synced: HashMap<PathBuf, Instant>,
-    last_periodic: Instant,
-    /// Sync every repo once the initial scan completes. Because the outer TUI
-    /// loop rebuilds everything after an interactive shell exits, this covers
-    /// both startup and returning from a shell.
-    startup_pending: bool,
+    /// Selection waiting out the debounce window before being fetched
+    selection_pending: Option<(PathBuf, Instant)>,
+    /// Last selection acted on (fetched or skipped by cooldown), so a resting
+    /// selection is handled once rather than re-queued every loop iteration
+    last_selection: Option<PathBuf>,
     interrupt: Arc<AtomicBool>,
     workspace_path: String,
 }
@@ -233,8 +239,8 @@ impl SyncManager {
             in_flight: HashSet::new(),
             rerun_after: HashSet::new(),
             recently_synced: HashMap::new(),
-            last_periodic: Instant::now(),
-            startup_pending: true,
+            selection_pending: None,
+            last_selection: None,
             interrupt: Arc::new(AtomicBool::new(false)),
             workspace_path,
         }
@@ -260,21 +266,50 @@ impl SyncManager {
         }
     }
 
-    /// Queue a fetch for every syncable workspace repo
-    fn request_sync_all(&mut self, app: &App) {
-        for repo in app.syncable_repo_paths() {
-            self.request_sync(repo, false);
+    /// Track the selected repo; a changed selection re-arms the debounce.
+    /// Called every event-loop iteration.
+    fn note_selection(&mut self, selected: Option<PathBuf>) {
+        let Some(path) = selected else {
+            self.selection_pending = None;
+            return;
+        };
+        if self.last_selection.as_ref() == Some(&path) {
+            // Already handled; also drop any pending fetch left by a row the
+            // cursor only passed over on the way back here
+            self.selection_pending = None;
+            return;
+        }
+        if !self.selection_pending.as_ref().is_some_and(|(p, _)| *p == path) {
+            self.selection_pending = Some((path, Instant::now()));
         }
     }
 
-    /// Re-check all repos on a timer; skipped while a scan is loading since
-    /// the repo list may be incomplete
-    fn maybe_periodic(&mut self, app: &App, loader_active: bool) {
-        if loader_active || self.last_periodic.elapsed() < SYNC_INTERVAL {
+    /// Queue a fetch for the selection once it has rested past the debounce,
+    /// unless the repo was fetched recently (returning to a row shouldn't
+    /// refetch it). Held while a scan is loading so results don't race the
+    /// loader; the initial selection therefore fires right after the first
+    /// scan lands, which is what used to be the startup sync-all.
+    fn pump_selection(&mut self, loader_active: bool) {
+        if loader_active {
             return;
         }
-        self.last_periodic = Instant::now();
-        self.request_sync_all(app);
+        let Some((path, since)) = &self.selection_pending else {
+            return;
+        };
+        if since.elapsed() < SELECTION_SYNC_DEBOUNCE {
+            return;
+        }
+        let path = path.clone();
+        self.selection_pending = None;
+        self.last_selection = Some(path.clone());
+        if self
+            .recently_synced
+            .get(&path)
+            .is_some_and(|t| t.elapsed() < SELECTION_SYNC_COOLDOWN)
+        {
+            return;
+        }
+        self.request_sync(path, false);
     }
 
     /// Spawn queued jobs up to the concurrency cap
@@ -680,15 +715,11 @@ fn run_app<B: ratatui::backend::Backend>(
             if let Some(watcher) = file_watcher.as_mut() {
                 watcher.drain_pending();
             }
-            // Check every repo against its remotes once the first scan lands
-            if background.sync.startup_pending {
-                background.sync.startup_pending = false;
-                background.sync.request_sync_all(app);
-            }
         }
         let loader_active = background.loader.is_some();
         background.sync.poll(app);
-        background.sync.maybe_periodic(app, loader_active);
+        background.sync.note_selection(app.selected_syncable_repo_path());
+        background.sync.pump_selection(loader_active);
         background.sync.pump();
         background.details.poll(app);
         background.details.note_selection(app);
@@ -1189,10 +1220,14 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
     lines
 }
 
-/// One detail row showing a remote, its sync state, and how many commits it
-/// is behind (when it is)
+/// One detail row showing a remote, the id its tracking ref holds for the
+/// checked-out branch, its sync state, and how many commits it is behind
+/// (when it is)
 fn remote_status_line(remote: &RemoteInfo, state: RemoteSyncState) -> Line<'static> {
-    // While fetching, the behind count is about to be superseded
+    // While fetching, the behind count is about to be superseded. The commit
+    // id stays: it states what the local tracking ref holds, which remains
+    // true until the fetch rewrites it, and hiding it would make the line
+    // jump on every fetch.
     let show_behind = remote.behind > 0 && state != RemoteSyncState::Fetching;
     let status = match state {
         RemoteSyncState::Fetching => Some(Span::styled(
@@ -1215,6 +1250,13 @@ fn remote_status_line(remote: &RemoteInfo, state: RemoteSyncState) -> Line<'stat
         )),
     };
     let mut spans = vec![Span::raw("  "), Span::raw(remote.name.clone())];
+    if let Some(commit) = &remote.commit {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            commit.clone(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     if let Some(status) = status {
         spans.push(Span::raw(" "));
         spans.push(status);
@@ -2219,6 +2261,7 @@ mod tests {
                 remotes: Some(vec![RemoteInfo {
                     name: "origin".to_string(),
                     behind: 0,
+                    commit: None,
                 }]),
             },
         );
@@ -2259,10 +2302,12 @@ mod tests {
                     RemoteInfo {
                         name: "origin".to_string(),
                         behind: 0,
+                        commit: Some("a1b2c3d".to_string()),
                     },
                     RemoteInfo {
                         name: "backup".to_string(),
                         behind: 3,
+                        commit: None,
                     },
                 ]),
             },
@@ -2275,7 +2320,9 @@ mod tests {
             .join("\n");
         assert!(text.contains("Changes: clean"));
         assert!(text.contains("Remotes:"));
-        assert!(text.contains("origin not synced yet"));
+        // The checked-out branch's id follows the remote name when the
+        // remote tracks the branch, and is omitted when it doesn't
+        assert!(text.contains("origin a1b2c3d not synced yet"));
         assert!(text.contains("backup not synced yet"));
         assert!(text.contains("↓ 3 behind"));
         assert!(!text.contains("↓ 0"));
@@ -2313,5 +2360,69 @@ mod tests {
         // Explicit (non-watcher) requests ignore the cooldown
         mgr.request_sync(repo.clone(), false);
         assert_eq!(mgr.queue.len(), 1);
+    }
+
+    #[test]
+    fn sync_manager_selection_fetches_once_with_cooldown() {
+        let backdate = |by: Duration| Instant::now().checked_sub(by).expect("clock too young");
+        let mut mgr = SyncManager::new("ws".to_string());
+        let repo = PathBuf::from("ws/repo");
+        let other = PathBuf::from("ws/other");
+
+        // A fresh selection arms the debounce but queues nothing yet
+        mgr.note_selection(Some(repo.clone()));
+        assert!(mgr.selection_pending.is_some());
+        mgr.pump_selection(false);
+        assert!(mgr.queue.is_empty());
+
+        // Past the debounce, but held while a scan is loading
+        mgr.selection_pending = Some((repo.clone(), backdate(SELECTION_SYNC_DEBOUNCE)));
+        mgr.pump_selection(true);
+        assert!(mgr.queue.is_empty());
+        mgr.pump_selection(false);
+        assert_eq!(mgr.queue.len(), 1);
+        assert_eq!(mgr.last_selection.as_ref(), Some(&repo));
+
+        // A parked cursor is handled once, not re-armed every iteration
+        mgr.note_selection(Some(repo.clone()));
+        assert!(mgr.selection_pending.is_none());
+
+        // Simulate the queued job running to completion
+        mgr.queue.pop_front();
+        mgr.in_flight.insert(repo.clone());
+        mgr.finish(&repo);
+
+        // Returning to the row inside the cooldown doesn't refetch
+        mgr.note_selection(Some(other.clone()));
+        mgr.note_selection(Some(repo.clone()));
+        mgr.selection_pending = Some((repo.clone(), backdate(SELECTION_SYNC_DEBOUNCE)));
+        mgr.pump_selection(false);
+        assert!(mgr.queue.is_empty());
+
+        // Past the cooldown the same return fetches again
+        mgr.recently_synced
+            .insert(repo.clone(), backdate(SELECTION_SYNC_COOLDOWN));
+        mgr.note_selection(Some(other.clone()));
+        mgr.note_selection(Some(repo.clone()));
+        mgr.selection_pending = Some((repo.clone(), backdate(SELECTION_SYNC_DEBOUNCE)));
+        mgr.pump_selection(false);
+        assert_eq!(mgr.queue.len(), 1);
+    }
+
+    #[test]
+    fn sync_manager_drops_pending_fetch_of_a_row_passed_over() {
+        let mut mgr = SyncManager::new("ws".to_string());
+        let repo = PathBuf::from("ws/repo");
+        let other = PathBuf::from("ws/other");
+        mgr.last_selection = Some(repo.clone());
+
+        // The cursor passes over another row and returns before its debounce
+        // elapses; the passed-over row must not be fetched
+        mgr.note_selection(Some(other.clone()));
+        assert!(mgr.selection_pending.is_some());
+        mgr.note_selection(Some(repo.clone()));
+        assert!(mgr.selection_pending.is_none());
+        mgr.pump_selection(false);
+        assert!(mgr.queue.is_empty());
     }
 }

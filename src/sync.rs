@@ -30,6 +30,8 @@ const UNTRACKED_SCAN_LIMIT: u64 = 16 * 1024 * 1024;
 /// computation
 #[derive(Debug, Clone)]
 pub struct RefState {
+    /// Branch name this state describes
+    pub branch: String,
     /// Local commit id, if the branch exists locally
     pub local: Option<String>,
     /// (remote name, id of this branch on that remote, if it exists there)
@@ -116,14 +118,39 @@ pub fn plan_behind_counts(
     behind
 }
 
-/// Per-remote counts of commits missing from each remote, computed from the
-/// local tracking refs of the repo's branches (no network — counts are
-/// stale until the next fetch, which is fine for a UI indicator).
-pub fn behind_counts(
+/// Full tracking-ref id each remote holds for the checked-out branch; empty
+/// when HEAD names no branch or no remote tracks it
+pub fn head_tracking_ids(states: &[RefState], head: Option<&str>) -> BTreeMap<String, String> {
+    let Some(state) = head.and_then(|head| states.iter().find(|s| s.branch == head)) else {
+        return BTreeMap::new();
+    };
+    state
+        .remotes
+        .iter()
+        .filter_map(|(remote, id)| Some((remote.clone(), id.clone()?)))
+        .collect()
+}
+
+/// Per-remote view of the local tracking refs (no network — stale until the
+/// next fetch, which is fine for a UI indicator): how many commits the remote
+/// is behind, and the id it holds for the checked-out branch
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RemoteRefInfo {
+    /// Commits this remote is missing from the newest published id across the
+    /// repo's branches; 0 = up to date
+    pub behind: usize,
+    /// Full id of this remote's tracking ref for the checked-out branch;
+    /// None when HEAD is detached or the remote doesn't track the branch
+    pub head_id: Option<String>,
+}
+
+/// Compute a [`RemoteRefInfo`] per remote from the local tracking refs of the
+/// repo's branches — this never touches the network.
+pub fn remote_ref_info(
     repo_path: &Path,
     remotes: &[String],
     interrupt: &AtomicBool,
-) -> Result<BTreeMap<String, usize>> {
+) -> Result<BTreeMap<String, RemoteRefInfo>> {
     let states = collect_ref_states(repo_path, remotes, interrupt)?;
     let mut is_ancestor =
         |ancestor: &str, descendant: &str| is_ancestor(repo_path, ancestor, descendant, interrupt);
@@ -140,7 +167,35 @@ pub fn behind_counts(
         .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
         .unwrap_or(0)
     };
-    Ok(plan_behind_counts(&states, &mut is_ancestor, &mut count_range))
+    let behind = plan_behind_counts(&states, &mut is_ancestor, &mut count_range);
+    let head = head_branch(repo_path, interrupt);
+    let head_ids = head_tracking_ids(&states, head.as_deref());
+
+    let mut info: BTreeMap<String, RemoteRefInfo> = BTreeMap::new();
+    for (remote, behind) in behind {
+        info.entry(remote).or_default().behind = behind;
+    }
+    for (remote, id) in head_ids {
+        info.entry(remote).or_default().head_id = Some(id);
+    }
+    Ok(info)
+}
+
+/// Name of the checked-out branch, or None when HEAD is detached. An unborn
+/// branch still resolves: its tracking ref (if a remote has the branch) is
+/// what the remote holds for the branch you're on, so reporting it is
+/// truthful.
+pub fn head_branch(repo_path: &Path, interrupt: &AtomicBool) -> Option<String> {
+    run_git(
+        repo_path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        interrupt,
+        LOCAL_TIMEOUT,
+    )
+    .ok()
+    .filter(|out| out.status.success())
+    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    .filter(|name| !name.is_empty())
 }
 
 /// Fetch all remotes to refresh tracking refs, then recompute the repo's
@@ -249,6 +304,7 @@ fn collect_ref_states(
                 .iter()
                 .map(|r| (r.clone(), tracking.get(&(r.clone(), name.clone())).cloned()))
                 .collect(),
+            branch: name,
         });
     }
 
@@ -451,8 +507,9 @@ fn run_git(
 mod tests {
     use super::*;
 
-    fn branch(local: Option<&str>, remotes: &[(&str, Option<&str>)]) -> RefState {
+    fn branch(name: &str, local: Option<&str>, remotes: &[(&str, Option<&str>)]) -> RefState {
         RefState {
+            branch: name.to_string(),
             local: local.map(|s| s.to_string()),
             remotes: remotes
                 .iter()
@@ -470,8 +527,8 @@ mod tests {
     #[test]
     fn behind_counts_summed_across_branches() {
         let states = [
-            branch(Some("b"), &[("a", Some("b")), ("backup", Some("a"))]),
-            branch(Some("d"), &[("a", Some("d")), ("backup", Some("c"))]),
+            branch("main", Some("b"), &[("a", Some("b")), ("backup", Some("a"))]),
+            branch("dev", Some("d"), &[("a", Some("d")), ("backup", Some("c"))]),
         ];
         let mut is_ancestor = stub_is_ancestor(&["ab", "cd"]);
         let mut count = |behind: &str, candidate: &str| -> usize {
@@ -489,21 +546,43 @@ mod tests {
     fn missing_diverged_and_unpublished_refs_not_counted() {
         let states = [
             // Remote missing the ref: nothing published there to lag behind
-            branch(Some("b"), &[("a", Some("b")), ("backup", None)]),
+            branch("one", Some("b"), &[("a", Some("b")), ("backup", None)]),
             // Diverged remote: neither id is reachable from the other, so
             // there is no fast-forward distance to report
-            branch(Some("x"), &[("a", Some("x")), ("backup", Some("y"))]),
+            branch("two", Some("x"), &[("a", Some("x")), ("backup", Some("y"))]),
             // Never-published ref: no published id to lag behind
-            branch(Some("z"), &[("a", None), ("backup", None)]),
+            branch("three", Some("z"), &[("a", None), ("backup", None)]),
         ];
         let mut is_ancestor = stub_is_ancestor(&[]);
         let mut count = |_: &str, _: &str| -> usize { panic!("no range should be counted") };
         assert!(plan_behind_counts(&states, &mut is_ancestor, &mut count).is_empty());
     }
 
+    #[test]
+    fn head_tracking_ids_pick_the_checked_out_branch() {
+        let states = [
+            branch("main", Some("a"), &[("origin", Some("a")), ("backup", None)]),
+            branch("dev", Some("c"), &[("origin", Some("b")), ("backup", Some("c"))]),
+        ];
+        assert_eq!(
+            head_tracking_ids(&states, Some("main")),
+            BTreeMap::from([("origin".to_string(), "a".to_string())]),
+        );
+        assert_eq!(
+            head_tracking_ids(&states, Some("dev")),
+            BTreeMap::from([
+                ("origin".to_string(), "b".to_string()),
+                ("backup".to_string(), "c".to_string()),
+            ]),
+        );
+        // Detached HEAD or a branch no ref mentions: nothing to report
+        assert!(head_tracking_ids(&states, None).is_empty());
+        assert!(head_tracking_ids(&states, Some("gone")).is_empty());
+    }
+
     /// End-to-end over a real repository: `collect_ref_states` reads the
-    /// branch heads and tracking refs, and `behind_counts` turns them into a
-    /// per-remote commit distance.
+    /// branch heads and tracking refs, and `remote_ref_info` turns them into
+    /// a per-remote commit distance and checked-out-branch id.
     #[test]
     fn behind_counts_read_from_real_tracking_refs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -530,6 +609,7 @@ mod tests {
         git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "one"]);
         let first = git(&repo, &["rev-parse", "HEAD"]);
         git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "two"]);
+        let second = git(&repo, &["rev-parse", "HEAD"]);
 
         // "current" has both commits, "stale" only the first, so it is one
         // commit behind the newest published id of main
@@ -548,9 +628,32 @@ mod tests {
         let remotes = list_remotes(&repo, &interrupt).unwrap();
         assert_eq!(remotes, vec!["current".to_string(), "stale".to_string()]);
         assert_eq!(
-            behind_counts(&repo, &remotes, &interrupt).unwrap(),
-            BTreeMap::from([("stale".to_string(), 1)]),
+            remote_ref_info(&repo, &remotes, &interrupt).unwrap(),
+            BTreeMap::from([
+                (
+                    "current".to_string(),
+                    RemoteRefInfo {
+                        behind: 0,
+                        head_id: Some(second.clone()),
+                    }
+                ),
+                (
+                    "stale".to_string(),
+                    RemoteRefInfo {
+                        behind: 1,
+                        head_id: Some(first.clone()),
+                    }
+                ),
+            ]),
         );
+
+        // Detached HEAD names no branch, so the per-remote ids disappear
+        // while the behind counts stay
+        git(&repo, &["checkout", "--quiet", "--detach"]);
+        assert_eq!(head_branch(&repo, &interrupt), None);
+        let info = remote_ref_info(&repo, &remotes, &interrupt).unwrap();
+        assert!(info.values().all(|i| i.head_id.is_none()));
+        assert_eq!(info.get("stale").unwrap().behind, 1);
     }
 
     #[test]
@@ -588,8 +691,8 @@ mod tests {
     /// arrive from anywhere (a tarball, a shared directory, a copy someone
     /// handed over). `git remote add` refuses a name beginning with a dash,
     /// but a hand-written config can hold one, and the TUI fetches every
-    /// remote of every repo in the workspace on its own. Passed as a bare
-    /// argument, `--upload-pack=<cmd>` makes git run <cmd>.
+    /// remote of the selected repo on its own. Passed as a bare argument,
+    /// `--upload-pack=<cmd>` makes git run <cmd>.
     #[cfg(unix)]
     #[test]
     fn dashed_remote_name_is_not_read_as_a_fetch_option() {

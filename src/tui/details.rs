@@ -29,6 +29,9 @@ pub struct RemoteInfo {
     /// Commits this remote is missing from the newest published id across the
     /// repo's branches, per the local tracking refs; 0 = up to date
     pub behind: usize,
+    /// Short id of this remote's tracking ref for the checked-out branch;
+    /// None when HEAD is detached or the remote doesn't track the branch
+    pub commit: Option<String>,
 }
 
 impl RepoDetails {
@@ -202,15 +205,21 @@ impl DetailsLoader {
     }
 }
 
-/// List the repo's remotes, annotating each with how far behind it is
+/// List the repo's remotes, annotating each with how far behind it is and
+/// the id it holds for the checked-out branch
 fn load_remotes(path: &Path, interrupt: &AtomicBool) -> Vec<RemoteInfo> {
     let names = crate::sync::list_remotes(path, interrupt).unwrap_or_default();
-    let behind = crate::sync::behind_counts(path, &names, interrupt).unwrap_or_default();
+    let info = crate::sync::remote_ref_info(path, &names, interrupt).unwrap_or_default();
     names
         .into_iter()
-        .map(|name| RemoteInfo {
-            behind: behind.get(&name).copied().unwrap_or(0),
-            name,
+        .map(|name| {
+            let info = info.get(&name).cloned().unwrap_or_default();
+            RemoteInfo {
+                behind: info.behind,
+                // Truncation is a display concern; sync keeps full ids
+                commit: info.head_id.map(|id| id.chars().take(7).collect()),
+                name,
+            }
         })
         .collect()
 }

@@ -14,12 +14,17 @@ between the two should be quick and easy.
 
 The TUI keeps remote state fresh in the background: a sync (fetch every
 remote, recompute the repo's status from the refreshed tracking refs) runs
-on TUI startup, after the interactive shell exits, when a push from another
-terminal updates `.git/refs/remotes`, and periodically while the TUI is
-open. Repo rows show "fetching" while a sync runs, and fetch failures
-surface on the row; when every remote is unreachable the repo is reported
-as offline instead. The info panel lists each remote with how many commits
-it is behind the newest id published to any remote for each branch
+for the workspace repo the selection rests on — debounced, once per
+selection, with a per-repo cooldown so returning to a row doesn't
+immediately refetch — and for any repo whose `.git/refs/remotes` a push
+from another terminal updates. There is no whole-workspace sync: startup
+and returning from the interactive shell are covered by the fetch of the
+then-selected row. Repo rows show "fetching" while a sync runs, and fetch
+failures surface on the row; when every remote is unreachable the repo is
+reported as offline instead. The info panel lists each remote with the
+short id its tracking ref holds for the checked-out branch (omitted when
+HEAD is detached or the remote doesn't track the branch) and how many
+commits it is behind the newest id published to any remote for each branch
 ("↓ N behind"). workset never pushes or modifies refs — local or remote.
 
 The core logic lives in `src/sync.rs`; the TUI scheduling in `SyncManager`
