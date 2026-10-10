@@ -179,12 +179,12 @@ Two read-only commands report on the whole workspace, no matter which directory
 you run them from:
 
 ```sh
-# Every repo in the workspace, with its status
+# Every repo in the workspace, with its status, in path order
 ❯ workset list
 Repositories in workspace (/home/user/workspace):
 
-  github.com/jqlang/jq - ✓ clean
   github.com/fossable/workset - ⚠ modified
+  github.com/jqlang/jq - ✓ clean
 
 # Workspace and library totals
 ❯ workset status
@@ -197,6 +197,41 @@ Active repositories: 2
   ✓ 1 clean
   ⚠ 1 with uncommitted changes
 ```
+
+### What counts as a repo of the workspace
+
+Your working set is made of the repos that have a working tree to work in, so a
+**bare** repository in the workspace isn't one of them and no command reaches
+it: `list` doesn't name it, `status` doesn't count it, and `drop` passes it by —
+including a bare `workset drop`, which empties the working set around it and
+reports success.
+
+```sh
+❯ git clone --bare https://github.com/jqlang/jq github.com/jqlang/jq.git
+
+# The bare clone isn't part of the working set, so it isn't listed
+❯ workset list
+Repositories in workspace (/home/user/workspace):
+
+  github.com/jqlang/jq - ✓ clean
+
+# Naming it matches nothing
+❯ workset drop github.com/jqlang/jq.git
+No repository in the workspace matches 'github.com/jqlang/jq.git'
+❯ echo $?
+1
+
+# And dropping everything leaves it where it is
+❯ workset drop
+  github.com/jqlang/jq - ✓ dropped
+❯ ls github.com/jqlang
+jq.git
+```
+
+The library stays out of the way by that same rule: a drop stores each repo as
+a bare git directory under `.workset/`, which lives in the workspace, so the
+search that enumerates the working set stops at every library entry instead of
+walking through it.
 
 Running `workset` with no subcommand opens the TUI, where `?` shows the
 keybindings.
