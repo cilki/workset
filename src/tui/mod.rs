@@ -1750,31 +1750,43 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     // repo open — before any status work, so every row can render with a
     // "scanning" status right away. These rows are also the scan's task list,
     // so each repo is placed in the tree exactly once.
-    let discovered_workspace: Vec<RepoInfo> = find_git_repositories(Path::new(&workspace.path))
-        .unwrap_or_default()
+    let workspace_paths = find_git_repositories(Path::new(&workspace.path)).unwrap_or_default();
+    let library_names = workspace.list_library().unwrap_or_default();
+    let library_paths: Vec<PathBuf> = library_names
+        .iter()
+        .map(|repo_path| PathBuf::from(&library_path).join(repo_path))
+        .collect();
+
+    // A tree path is read out of the repo's config, so deriving one opens the
+    // repo — and no row can be drawn until every row has one. Done one repo
+    // after another that open-per-repo is the whole of the wait before the
+    // first paint, and it grows with the workspace and the library together,
+    // so spread it over the cores the same way the status scan below is.
+    let workspace_tree_paths = crate::scan_repos(&workspace_paths, crate::remote_tree_path);
+    let library_tree_paths = crate::scan_repos(&library_paths, crate::remote_tree_path);
+
+    let discovered_workspace: Vec<RepoInfo> = workspace_paths
         .into_iter()
-        .map(|path| RepoInfo {
+        .zip(workspace_tree_paths)
+        .map(|(path, tree_path)| RepoInfo {
             display_name: workspace_display_name(&workspace.path, &path),
-            tree_path: crate::remote_tree_path(&path),
+            tree_path,
             path,
             operation_status: RepoOperationStatus::Scanning,
             ..Default::default()
         })
         .collect();
-    let discovered_library: Vec<RepoInfo> = workspace
-        .list_library()
-        .unwrap_or_default()
+    let discovered_library: Vec<RepoInfo> = library_names
         .into_iter()
-        .map(|repo_path| {
-            let path = PathBuf::from(&library_path).join(&repo_path);
-            RepoInfo {
-                tree_path: crate::remote_tree_path(&path),
-                path,
-                display_name: repo_path,
-                status: Some(crate::RepoStatus::Clean), // Library repos are always clean
-                operation_status: RepoOperationStatus::Scanning,
-                ..Default::default()
-            }
+        .zip(library_paths)
+        .zip(library_tree_paths)
+        .map(|((display_name, path), tree_path)| RepoInfo {
+            tree_path,
+            path,
+            display_name,
+            status: Some(crate::RepoStatus::Clean), // Library repos are always clean
+            operation_status: RepoOperationStatus::Scanning,
+            ..Default::default()
         })
         .collect();
     if tx

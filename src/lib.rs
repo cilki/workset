@@ -1379,8 +1379,19 @@ impl Workspace {
         // Recursively find all git repositories in the library
         fn find_repos(base_path: &str, current_path: &Path, repos: &mut Vec<String>) -> Result<()> {
             if current_path.is_dir() {
-                // Check if this is a bare git repository
-                if gix::open(current_path).is_ok() {
+                // Is this directory a repository? `gix::open` answers by
+                // building a whole Repository — locating the git directory,
+                // reading and parsing the repo's config and every file it
+                // includes, resolving the object store — and all of it is
+                // thrown away here, where only the yes or no is wanted. The
+                // stats git itself uses answer the same question for a
+                // fraction of the cost, and this walk is not a rare one: it
+                // runs before the TUI's first paint, on every `workset
+                // status`, before every restore, and on every TAB press
+                // through the shell completions. Its cost grows with the
+                // library, which is the part of a workspace this tool exists
+                // to let you grow.
+                if is_git_dir(current_path) || current_path.join(".git").exists() {
                     // Get the relative path from the library base
                     if let Ok(rel_path) = current_path.strip_prefix(base_path) {
                         let repo_path = rel_path.to_string_lossy().to_string();
@@ -2383,6 +2394,56 @@ mod tests {
                 "gitlab.com/a/one",
                 "gitlab.com/b/two",
             ]
+        );
+    }
+
+    /// The library listing reports each dropped repo once, under the path it
+    /// was dropped from, and stops at the entry — the object store inside it
+    /// holds no library entries, and reading all of it is what the listing
+    /// costs when it doesn't stop.
+    #[test]
+    fn list_library_reports_each_entry_once_and_stops_inside_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let workspace = Workspace {
+            path: root.to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        for name in ["gitlab.com/b/two", "github.com/a/one", "github.com/a/two"] {
+            gix::init(root.join(name)).unwrap();
+            workspace.store_in_library(name).unwrap();
+        }
+
+        // Only reachable by descending into an entry, and shaped exactly like
+        // the repos the listing reports
+        let entry = Path::new(&workspace.library_path()).join("github.com/a/one");
+        fs::create_dir_all(entry.join("objects/decoy/.git")).unwrap();
+
+        assert_eq!(
+            workspace.list_library().unwrap(),
+            vec!["github.com/a/one", "github.com/a/two", "gitlab.com/b/two"]
+        );
+    }
+
+    /// An entry that still has its worktree — a restore that died halfway, or
+    /// a repo moved into the library by hand — is a repo in the library and is
+    /// listed as one, rather than being walked into as if it were a directory
+    /// of entries.
+    #[test]
+    fn list_library_reports_an_entry_that_kept_its_worktree() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let workspace = Workspace {
+            path: root.to_string_lossy().to_string(),
+        };
+        let entry = Path::new(&workspace.library_path()).join("github.com/user/repo");
+        gix::init(&entry).unwrap();
+        fs::write(entry.join("tracked.txt"), "hello").unwrap();
+
+        assert_eq!(
+            workspace.list_library().unwrap(),
+            vec!["github.com/user/repo"]
         );
     }
 
