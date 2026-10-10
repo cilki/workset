@@ -186,14 +186,57 @@ from: every repo with its status, and how many repos the library is holding
 for you.
 
 ```sh
+# Every repo in the workspace, with its status, in path order
+❯ workset list
+Repositories in workspace (/home/user/workspace):
+
+  github.com/fossable/workset - ⚠ modified
+  github.com/jqlang/jq - ✓ clean
+
+Library (/home/user/workspace/.workset): 12 repository(ies)
+```
+
+### What counts as a repo of the workspace
+
+Your working set is made of the repos that have a working tree to work in, so a
+**bare** repository in the workspace isn't one of them and no command reaches
+it: `list` doesn't name it, the TUI doesn't show it, and `drop` passes it by —
+including a bare `workset drop`, which empties the working set around it and
+reports success.
+
+There is no way to name one either, because a `.git` suffix is stripped from a
+repo pattern so that the clone URL a forge hands you works as one. Naming the
+bare clone below therefore matches the ordinary repo beside it:
+
+```sh
+❯ git clone --bare https://github.com/jqlang/jq github.com/jqlang/jq.git
+
+# The bare clone isn't part of the working set, so it isn't listed
 ❯ workset list
 Repositories in workspace (/home/user/workspace):
 
   github.com/jqlang/jq - ✓ clean
-  github.com/fossable/workset - ⚠ modified
 
 Library (/home/user/workspace/.workset): 12 repository(ies)
+
+# 'github.com/jqlang/jq.git' means 'github.com/jqlang/jq', so this drops the
+# repo with the working tree and leaves the bare clone where it is
+❯ workset drop github.com/jqlang/jq.git
+  github.com/jqlang/jq - ✓ dropped
+❯ ls github.com/jqlang
+jq.git
+
+# With nothing but the bare clone left, there is no working set to empty
+❯ workset drop
+No repositories found in the current directory
+❯ echo $?
+1
 ```
+
+The library stays out of the way by that same rule: a drop stores each repo as
+a bare git directory under `.workset/`, which lives in the workspace, so the
+search that enumerates the working set stops at every library entry instead of
+walking through it.
 
 Running `workset` with no subcommand opens the TUI, where `?` shows the
 keybindings.
