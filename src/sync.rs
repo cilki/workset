@@ -2,8 +2,14 @@
 //!
 //! A sync fetches every remote (keeping tracking refs fresh), recomputes the
 //! repo's status, and counts how many commits each remote is behind the
-//! newest id published to any remote for each branch. Nothing is ever pushed
-//! and local refs are never modified — workset only observes remotes.
+//! newest id published to any remote for each branch.
+//!
+//! Nothing is ever pushed, but a fetch is not a read: it refreshes
+//! `refs/remotes/<remote>/*`, the `--prune` it is given deletes the entries
+//! whose branches are gone from the remote, and git's default tag following
+//! creates any `refs/tags/*` reachable from what was fetched. What a sync
+//! leaves alone is the working tree and — with the default fetch refspec —
+//! `refs/heads/*`.
 //!
 //! All network operations shell out to the `git` CLI (consistent with the
 //! existing `gh`/`glab` shell-outs).

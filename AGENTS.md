@@ -19,13 +19,22 @@ selection, with a per-repo cooldown so returning to a row doesn't
 immediately refetch — and for any repo whose `.git/refs/remotes` a push
 from another terminal updates. There is no whole-workspace sync: startup
 and returning from the interactive shell are covered by the fetch of the
-then-selected row. Repo rows show "fetching" while a sync runs, and fetch
-failures surface on the row; when every remote is unreachable the repo is
-reported as offline instead. The info panel lists each remote with the
+then-selected row. Repo rows show "fetching" while a sync runs, and a fetch
+that fails reads `sync failed: fetch <remote>: ...`; when *every* remote
+is unreachable the row says nothing at all — the outcome is marked offline
+instead, which clears the row's sync status and surfaces per remote in the
+info panel as "unreachable". The info panel lists each remote with the
 short id its tracking ref holds for the checked-out branch (omitted when
 HEAD is detached or the remote doesn't track the branch) and how many
-commits it is behind the newest id published to any remote for each branch
-("↓ N behind"). workset never pushes or modifies refs — local or remote.
+commits it is behind the newest id published to any remote, summed over the
+repo's branches ("↓ N behind").
+
+workset never pushes. It does write refs, though, so don't describe a sync
+as leaving the repo untouched: the fetch refreshes
+`refs/remotes/<remote>/*`, `--prune` deletes the entries whose branches are
+gone from the remote, and git's default tag following creates any
+`refs/tags/*` reachable from what was fetched. What a sync leaves alone is
+the working tree and — with the default fetch refspec — `refs/heads/*`.
 
 The core logic lives in `src/sync.rs`; the TUI scheduling in `SyncManager`
 (`src/tui/mod.rs`).
