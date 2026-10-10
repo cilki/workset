@@ -495,6 +495,84 @@ fn live_linked_worktrees(git_dir: &Path) -> usize {
         .count()
 }
 
+/// Scan every repo in `repos` with `scan` on a pool of worker threads, and
+/// return what `scan` produced in the order the repos were given.
+///
+/// Scanning a repo means walking its whole worktree: the index-to-worktree
+/// comparison every status check starts with stats each tracked file, and the
+/// directory walk that finds untracked files reads each directory. That is the
+/// bulk of the work behind `workset list`, `workset status` and the shell
+/// completions, and done one repo after another it takes the sum of every
+/// repo's walk while the rest of the machine idles. The walks don't depend on
+/// each other at all — each one reads one repo and writes nothing.
+///
+/// Each worker is also told how many threads it may use for its own walk, so
+/// the walks share the cores rather than each one claiming all of them: gix
+/// spreads a single repo's comparison over every core by default, which is
+/// right for the one-repo workspace and, with a worker per core, means cores²
+/// threads spawned for the work of one.
+pub fn scan_repos<T, F>(repos: &[PathBuf], scan: F) -> Vec<T>
+where
+    F: Fn(&Path) -> T + Send + Sync,
+    T: Send,
+{
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let workers = cores.min(repos.len());
+    if workers <= 1 {
+        return repos.iter().map(|repo| scan(repo)).collect();
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let scan = &scan;
+    let mut scanned: Vec<(usize, T)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..workers)
+            .map(|_| {
+                let next = &next;
+                scope.spawn(move || {
+                    limit_status_walk_threads(cores / workers);
+                    let mut scanned = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(repo) = repos.get(index) else {
+                            break;
+                        };
+                        scanned.push((index, scan(repo)));
+                    }
+                    scanned
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| match worker.join() {
+                Ok(scanned) => scanned,
+                // A worker that panicked scanned an unknown subset, so there is
+                // no partial answer to report: fail the way the serial scan
+                // this replaced would have.
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    });
+
+    // Callers show this list to someone, and the order they gave is the order
+    // they want it back in — the walks finish in whatever order the repos
+    // happen to take
+    scanned.sort_by_key(|(index, _)| *index);
+    scanned.into_iter().map(|(_, scanned)| scanned).collect()
+}
+
+thread_local! {
+    /// How many threads a status walk on this thread may use, or 0 to let gix
+    /// decide (one per core). See [`scan_repos`].
+    static STATUS_WALK_THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Limit the status walks run on this thread to `threads` threads of their
+/// own, because this thread is sharing the machine with other repo scans.
+pub fn limit_status_walk_threads(threads: usize) {
+    STATUS_WALK_THREADS.set(threads);
+}
+
 /// Check repository status (commits, changes, unpushed) in a single pass
 pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
     let Some(repo) = open_repo(repo_path) else {
@@ -737,6 +815,16 @@ fn walk_worktree_changes(
             );
             return false;
         }
+    };
+
+    // One walk per core is right when this is the only walk running; it isn't
+    // when a pool of workers is scanning a repo each, and then each walk takes
+    // the share of the cores its worker was given.
+    let platform = match STATUS_WALK_THREADS.get() {
+        0 => platform,
+        threads => platform.index_worktree_options_mut(|options| {
+            options.thread_limit = Some(threads);
+        }),
     };
 
     // Tracked changes and untracked files come from the same iterator
@@ -1893,6 +1981,34 @@ mod tests {
 
         let repos = find_git_repositories(&root).unwrap();
         assert_eq!(repos, vec![root.join("inside")]);
+    }
+
+    /// Every caller of `scan_repos` pairs what came back with the repo list it
+    /// passed in — `workset list` prints the two side by side — so a result
+    /// that lands in the order its walk happened to finish names the wrong
+    /// repo. Each repo also has to be scanned exactly once: a repo handed to
+    /// two workers is counted twice in the summary, and one handed to none is
+    /// missing from the listing.
+    #[test]
+    fn scan_repos_reports_each_repo_once_in_the_order_given() {
+        // Many more repos than the machine has cores, and work that takes
+        // longer the earlier the repo comes, so the walks can only finish out
+        // of order
+        let repos: Vec<PathBuf> = (0..200).map(|i| PathBuf::from(format!("r{i}"))).collect();
+        let scans = std::sync::atomic::AtomicUsize::new(0);
+
+        let scanned = scan_repos(&repos, |repo| {
+            scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let index: u64 = repo.to_str().unwrap()[1..].parse().unwrap();
+            std::thread::sleep(std::time::Duration::from_micros(200 - index.min(199)));
+            repo.to_path_buf()
+        });
+
+        assert_eq!(scanned, repos);
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::Relaxed),
+            repos.len()
+        );
     }
 
     #[cfg(unix)]

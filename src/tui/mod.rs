@@ -1795,16 +1795,19 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
             .collect(),
     );
 
-    let workers = std::thread::available_parallelism()
+    let cores = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8);
+        .unwrap_or(4);
+    let workers = cores.min(8);
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let tx = tx.clone();
             let tasks = &tasks;
             scope.spawn(move || {
+                // Each worker walks a repo of its own, so the cores are shared
+                // between the walks instead of each walk claiming all of them
+                crate::limit_status_walk_threads(cores / workers);
                 loop {
                     let task = tasks.lock().unwrap().pop();
                     let Some(task) = task else {

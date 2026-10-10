@@ -661,16 +661,18 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     outln!("Repositories in workspace ({}):", workspace.path);
     outln!();
 
-    for repo in repos {
-        let repo_name = workspace.relative_name(&repo);
+    let statuses = workset::scan_repos(&repos, workset::check_repo_status);
 
-        let status_str = match workset::check_repo_status(&repo) {
-            Ok(workset::RepoStatus::Clean) => "✓ clean".to_string(),
-            Ok(workset::RepoStatus::Dirty) => "⚠ modified".to_string(),
-            Ok(workset::RepoStatus::Unpushed) => "⚠ unpushed".to_string(),
-            Ok(workset::RepoStatus::NoCommits) => "⚠ no commits".to_string(),
-            Ok(workset::RepoStatus::Unknown) => "✗ unreadable".to_string(),
-            Err(_) => "✗ error".to_string(),
+    for (repo, status) in repos.iter().zip(statuses) {
+        let repo_name = workspace.relative_name(repo);
+
+        let status_str = match status {
+            Ok(workset::RepoStatus::Clean) => "✓ clean",
+            Ok(workset::RepoStatus::Dirty) => "⚠ modified",
+            Ok(workset::RepoStatus::Unpushed) => "⚠ unpushed",
+            Ok(workset::RepoStatus::NoCommits) => "⚠ no commits",
+            Ok(workset::RepoStatus::Unknown) => "✗ unreadable",
+            Err(_) => "✗ error",
         };
 
         outln!("  {} - {}", repo_name, status_str);
@@ -701,8 +703,8 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
         let mut no_commits = 0;
         let mut unreadable = 0;
 
-        for repo in &repos {
-            match workset::check_repo_status(repo) {
+        for status in workset::scan_repos(&repos, workset::check_repo_status) {
+            match status {
                 Ok(workset::RepoStatus::Clean) => clean += 1,
                 Ok(workset::RepoStatus::Dirty) => modified += 1,
                 Ok(workset::RepoStatus::Unpushed) => unpushed += 1,
@@ -756,17 +758,19 @@ fn get_repo_completions_with_metadata(workspace: &Workspace) -> Vec<(String, Str
 
     // Only complete with local workspace repos
     if let Ok(local_repos) = workset::find_git_repositories(Path::new(&workspace.path)) {
-        for repo in local_repos {
+        // Completions run on every TAB press, so the per-repo worktree walks
+        // behind these descriptions go to the whole machine at once
+        let scanned = workset::scan_repos(&local_repos, |repo| {
+            // If this fails, we'll still provide a basic completion
+            match workset::check_repo_status_and_modification_time(repo) {
+                Ok((status, mod_time)) => (Some(status), mod_time),
+                Err(_) => (None, None),
+            }
+        });
+
+        for (repo, (status, mod_time)) in local_repos.iter().zip(scanned) {
             if let Ok(relative) = repo.strip_prefix(&workspace.path) {
                 let repo_name = relative.display().to_string();
-
-                // Get repo status and modification time in a single repo open
-                // If this fails, we'll still provide a basic completion
-                let (status, mod_time) =
-                    match workset::check_repo_status_and_modification_time(&repo) {
-                        Ok((status, mod_time)) => (Some(status), mod_time),
-                        Err(_) => (None, None),
-                    };
 
                 // Build description with status and time
                 let mut desc_parts = Vec::new();
