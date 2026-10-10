@@ -411,6 +411,7 @@ fn main() -> Result<ExitCode> {
 {commands_header}
   {subcmd}init{reset}                                 Initialize a workspace in current directory
   {subcmd}clone{reset} {arg}<pattern>...{reset}                   Clone new repository(ies) to workspace
+{dim}                                       A clone URL, with or without '.git', works too{reset}
   {subcmd}restore{reset} {arg}<pattern>...{reset}                 Restore repository(ies) from library
   {subcmd}drop{reset} {arg}[pattern]{reset} {arg}[--delete]{reset} {arg}[--force]{reset}  Drop repository(ies) from workspace
 {dim}                                       Several patterns can be given at once
@@ -424,6 +425,7 @@ fn main() -> Result<ExitCode> {
 {examples_header}
   {cmd}workset init{reset}                              Initialize workspace here
   {cmd}workset clone github.com/user/repo{reset}        Clone a new repository
+  {cmd}workset clone git@github.com:user/repo{reset}    Same repo, named by its clone URL
   {cmd}workset clone github.com/user{reset}             Clone all repos from github.com/user
   {cmd}workset restore repo{reset}                      Restore every library repo matching 'repo'
   {cmd}workset drop ./repo{reset}                       Drop repo (save to library)

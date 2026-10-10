@@ -34,6 +34,12 @@ and `status` always cover the whole workspace, wherever you run them from.
 # Add a repository to your workspace
 ❯ workset clone github.com/jqlang/jq
 
+# A clone URL is a pattern too, so the URL a forge gives you can be pasted
+# straight in — scheme, credentials and the '.git' suffix are all dropped, and
+# every spelling below names that same github.com/jqlang/jq
+❯ workset clone https://github.com/jqlang/jq.git
+❯ workset clone git@github.com:jqlang/jq.git
+
 # The repository's local path always reflects the remote path
 ❯ cd ./github.com/jqlang/jq
 

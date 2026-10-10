@@ -20,19 +20,74 @@ pub struct RepoPattern {
     pub path: String,
 }
 
+/// Rewrite the clone URL a forge hands out into the `[provider]/<path>` form a
+/// pattern is written in.
+///
+/// Every forge's "clone" button offers a URL, so a URL is what gets pasted onto
+/// the command line, and the pattern it means is spelled out inside it. Taking
+/// it literally instead left `workset clone https://github.com/jqlang/jq`
+/// failing with "No provider specified" while the provider sat in plain sight,
+/// and turned the SSH form into the clone URL
+/// `https://git@github.com:jqlang/jq.git`, which git then rejected for having an
+/// invalid port number.
+///
+/// The transport (scheme, credentials, and the `:` the SSH form puts between
+/// host and path) says nothing a pattern records, so it is dropped here rather
+/// than becoming part of a repo's name in the workspace. A port is not
+/// transport: it belongs to the provider, and the clone URL needs it back.
+fn strip_url_syntax(pattern: &str) -> String {
+    let pattern = pattern.trim();
+    // https://, ssh://, git://, git+ssh://
+    let pattern = pattern.split_once("://").map_or(pattern, |(_, rest)| rest);
+
+    // The host is everything up to the first '/' — or, in the SSH form
+    // `git@host:owner/repo`, up to the ':' inside that first component
+    let (host, path) = pattern.split_once('/').unwrap_or((pattern, ""));
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    let host = match host.split_once(':') {
+        // `host:1234` is a port and stays with the host; `host:owner` is the
+        // SSH form's separator and becomes the '/' a pattern uses
+        Some((host, rest)) if !rest.is_empty() && !rest.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{}/{}", host, rest)
+        }
+        _ => host.to_string(),
+    };
+
+    let joined = if path.is_empty() {
+        host
+    } else {
+        format!("{}/{}", host, path)
+    };
+    joined.trim_end_matches('/').to_string()
+}
+
 impl FromStr for RepoPattern {
     type Err = std::convert::Infallible;
 
-    fn from_str(path: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(pattern: &str) -> std::result::Result<Self, Self::Err> {
+        let pattern = strip_url_syntax(pattern);
+
         // If the first component looks like a domain (contains '.'), it's a provider
-        Ok(match path.split_once('/') {
+        Ok(match pattern.split_once('/') {
             Some((first, rest)) if first.contains('.') => Self {
                 provider: Some(first.to_string()),
-                path: rest.to_string(),
+                // A clone URL's ".git" suffix names the repository on the
+                // remote, not the directory it is checked out into. Left on, it
+                // put `jq.git` in the workspace beside the `jq` the same repo
+                // gets without the suffix, so the two spellings of one URL
+                // cloned, dropped and restored as two unrelated repos. Only a
+                // pattern that names a provider is URL-shaped; a bare local one
+                // keeps whatever name it was given, so `drop` can still name a
+                // directory that really does end in ".git".
+                path: rest
+                    .strip_suffix(".git")
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or(rest)
+                    .to_string(),
             },
             _ => Self {
                 provider: None,
-                path: path.to_string(),
+                path: pattern,
             },
         })
     }
@@ -2597,6 +2652,72 @@ mod tests {
         assert_eq!(pattern.provider, Some("gitlab.com".to_string()));
         assert_eq!(pattern.path, "company/project/repo".to_string());
         Ok(())
+    }
+
+    /// Every spelling of a clone URL a forge offers names the same repo, and so
+    /// has to parse to the same pattern — otherwise the path it occupies in the
+    /// workspace depends on which button the user copied.
+    #[test]
+    fn a_pasted_clone_url_names_the_same_repo_as_the_pattern() {
+        let expected = RepoPattern {
+            provider: Some("github.com".to_string()),
+            path: "jqlang/jq".to_string(),
+        };
+        for url in [
+            "github.com/jqlang/jq",
+            "github.com/jqlang/jq.git",
+            "github.com/jqlang/jq/",
+            "https://github.com/jqlang/jq",
+            "https://github.com/jqlang/jq.git",
+            "http://github.com/jqlang/jq.git",
+            "ssh://git@github.com/jqlang/jq.git",
+            "git://github.com/jqlang/jq.git",
+            "git@github.com:jqlang/jq.git",
+            "git@github.com:jqlang/jq",
+            "  https://github.com/jqlang/jq.git  ",
+        ] {
+            assert_eq!(
+                str::parse::<RepoPattern>(url).unwrap(),
+                expected,
+                "parsing {url}"
+            );
+        }
+    }
+
+    /// A self-hosted forge publishes a port in its clone URLs, and the clone
+    /// URL workset rebuilds from the pattern has to keep it or it reaches
+    /// nothing. A port is also the one ':' in a URL that is not the SSH form's
+    /// host/path separator.
+    #[test]
+    fn a_port_stays_with_the_provider() {
+        let expected = RepoPattern {
+            provider: Some("git.example.com:3000".to_string()),
+            path: "cilki/workset".to_string(),
+        };
+        for url in [
+            "https://git.example.com:3000/cilki/workset.git",
+            "ssh://git@git.example.com:3000/cilki/workset.git",
+        ] {
+            assert_eq!(
+                str::parse::<RepoPattern>(url).unwrap(),
+                expected,
+                "parsing {url}"
+            );
+        }
+    }
+
+    /// Patterns that name a path rather than a remote are what `drop` and
+    /// `restore` are given, and URL syntax must not rewrite them: a bare name
+    /// keeps its ".git" suffix so a directory that really has one can still be
+    /// named, and a traversal attempt stays recognizable to `repo_path`.
+    #[test]
+    fn a_local_pattern_is_left_alone() {
+        for pattern in ["repo", "repo.git", "user/repo", "./repo", "../outside/repo"] {
+            assert_eq!(
+                str::parse::<RepoPattern>(pattern).unwrap().full_path(),
+                pattern,
+            );
+        }
     }
 
     #[test]

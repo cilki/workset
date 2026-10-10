@@ -474,6 +474,46 @@ testDropAndRestoreNestedRepo() {
 	[ -d github.com/testuser/nested-repo/.git ]
 }
 
+## Every forge offers a clone URL rather than a workset pattern, so a URL is
+## what gets pasted onto the command line, and the pattern it means is spelled
+## out inside it. The transport around that pattern — the scheme, the
+## credentials, the ':' the SSH form puts between host and path — names nothing
+## a workspace path records, and neither does the '.git' suffix, so every
+## spelling below reaches the one repo instead of inventing a second one beside
+## it.
+testPatternsAcceptCloneUrls() {
+	newWorkspace
+	createRepo github.com/testuser/project 2
+
+	for pattern in \
+		github.com/testuser/project.git \
+		https://github.com/testuser/project \
+		https://github.com/testuser/project.git \
+		ssh://git@github.com/testuser/project.git \
+		git@github.com:testuser/project.git; do
+		workset drop "$pattern" | grep -- "github.com/testuser/project - ✓ dropped"
+		[ ! -e github.com ]
+		[ -d .workset/github.com/testuser/project ]
+
+		workset restore "$pattern" | grep "^Restored github.com/testuser/project$"
+		[ -f github.com/testuser/project/file0.txt ]
+	done
+}
+
+## Only a pattern that names a provider is URL-shaped, so a bare local name
+## keeps the '.git' a directory may really end in
+testDropLocalNameEndingInGit() {
+	newWorkspace
+	createRepo mirror.git 1
+
+	workset drop mirror.git | grep -- "mirror.git - ✓ dropped"
+	[ ! -e mirror.git ]
+	[ -d .workset/mirror.git ]
+
+	workset restore mirror.git | grep "^Restored mirror.git$"
+	[ -f mirror.git/file0.txt ]
+}
+
 ## A repo sits at the path its remote dictates, so the directories above it
 ## are workset's bookkeeping and go when the repo does. Without this a
 ## workspace emptied of every repo still held a directory tree naming each one.
