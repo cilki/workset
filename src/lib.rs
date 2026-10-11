@@ -430,6 +430,22 @@ fn live_linked_worktrees(git_dir: &Path) -> usize {
         .count()
 }
 
+/// How many repos [`scan_repos`] keeps in flight per core.
+///
+/// A repo scan is not a core grinding on numbers: it is a walk that asks the
+/// kernel for a directory's entries, waits, stats what came back, waits again.
+/// A worker is off the CPU for a good part of its repo, and with one worker
+/// per core the core it was running on has nothing else to pick up and idles
+/// until the walk comes back — which is why scanning a workspace on every core
+/// came out well short of the speedup the core count promised. A second repo
+/// in flight per core is what gives each core something to run while the first
+/// one is waiting on the disk.
+///
+/// Two, and not more, because the point is covering the wait rather than
+/// racing: past that the walks start competing for the same cores and the
+/// cache they warmed, and the gain flattens out and then reverses.
+const WORKERS_PER_CORE: usize = 2;
+
 /// Scan every repo in `repos` with `scan` on a pool of worker threads, and
 /// return what `scan` produced in the order the repos were given.
 ///
@@ -449,7 +465,10 @@ fn live_linked_worktrees(git_dir: &Path) -> usize {
 /// the walks share the cores rather than each one claiming all of them: gix
 /// spreads a single repo's comparison over every core by default, which is
 /// right for the one-repo workspace and, with a worker per core, means cores²
-/// threads spawned for the work of one.
+/// threads spawned for the work of one. A workspace holding fewer repos than
+/// the pool has room for keeps that parallelism, because the share is the
+/// cores divided by the workers actually started — and never less than the one
+/// thread a worker needs to get its repo walked at all.
 pub fn scan_repos<R, T, F>(repos: &[R], scan: F) -> Vec<T>
 where
     R: Sync,
@@ -457,7 +476,7 @@ where
     T: Send,
 {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let workers = cores.min(repos.len());
+    let workers = (cores * WORKERS_PER_CORE).min(repos.len());
     if workers <= 1 {
         return repos.iter().map(&scan).collect();
     }
@@ -469,7 +488,7 @@ where
             .map(|_| {
                 let next = &next;
                 scope.spawn(move || {
-                    limit_status_walk_threads(cores / workers);
+                    limit_status_walk_threads((cores / workers).max(1));
                     let mut scanned = Vec::new();
                     loop {
                         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
