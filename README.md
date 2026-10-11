@@ -25,8 +25,7 @@
 
 `workset init` and a bare `workset drop` act on the current directory. `clone`
 and `restore` place a repo at its full path under the workspace root, and `list`
-(aliased `ls`) and `status` always cover the whole workspace, wherever you run
-them from.
+(aliased `ls`) always covers the whole workspace, wherever you run it from.
 
 ```sh
 # Initialize a new workspace in the current directory
@@ -40,11 +39,6 @@ them from.
 # every spelling below names that same github.com/jqlang/jq
 ❯ workset clone https://github.com/jqlang/jq.git
 ❯ workset clone git@github.com:jqlang/jq.git
-
-# Naming a user or org instead of a single repo clones everything they own.
-# The repo list comes from the provider's own CLI, so this needs `gh` (for
-# github.com) or `glab` (for gitlab.com) installed and logged in.
-❯ workset clone github.com/jqlang
 
 # The repository's local path always reflects the remote path
 ❯ cd ./github.com/jqlang/jq
@@ -187,27 +181,18 @@ it, so `workset` composes with other commands:
 1
 ```
 
-Two read-only commands report on the whole workspace, no matter which directory
-you run them from:
+`list` reports on the whole workspace, no matter which directory you run it
+from: every repo with its status, and how many repos the library is holding
+for you.
 
 ```sh
-# Every repo in the workspace, with its status
 ❯ workset list
 Repositories in workspace (/home/user/workspace):
 
   github.com/jqlang/jq - ✓ clean
   github.com/fossable/workset - ⚠ modified
 
-# Workspace and library totals
-❯ workset status
-Workspace: /home/user/workspace
-
-Library: /home/user/workspace/.workset
-  12 repository(ies) in library
-
-Active repositories: 2
-  ✓ 1 clean
-  ⚠ 1 with uncommitted changes
+Library (/home/user/workspace/.workset): 12 repository(ies)
 ```
 
 Running `workset` with no subcommand opens the TUI, where `?` shows the

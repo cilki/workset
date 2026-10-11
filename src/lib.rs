@@ -110,15 +110,6 @@ impl RepoPattern {
     }
 }
 
-/// Represents a git submodule within a repository
-#[derive(Debug, Clone)]
-pub struct SubmoduleInfo {
-    /// Relative path within parent repo
-    pub path: PathBuf,
-    /// Whether submodule is checked out
-    pub initialized: bool,
-}
-
 /// Whether this directory is a git directory itself rather than a worktree
 /// with one in it: a bare repository, or the `.git` directory of a non-bare
 /// one. Uses the same cheap test git does — a `HEAD`, an `objects` directory
@@ -189,112 +180,6 @@ pub fn find_git_repositories(path: &Path) -> Vec<PathBuf> {
     }
 
     found
-}
-
-/// Whether a path read out of `.gitmodules` names a place inside the
-/// repository.
-///
-/// `.gitmodules` is part of the repo's content, so whoever wrote the repo
-/// decides what it says — cloning one is enough to get their text. Every
-/// submodule it declares becomes a repo-shaped row in the TUI whose path is
-/// the parent's joined with this one, and everything workset does to such a
-/// row follows that path: the size walk, the `git diff`/`ls-files` the info
-/// panel runs (which then reads each untracked file whole), the shell Enter
-/// opens there. An absolute path replaces the parent's entirely when joined,
-/// so a single `path = /` aims all of that at the whole filesystem, and `..`
-/// walks anywhere a relative path can reach.
-///
-/// A path that merely spells out as relative proves nothing either: a symlink
-/// in the worktree points wherever it likes, so where the path lands decides.
-/// Nothing on disk yet means an uninitialized submodule, which has no link to
-/// follow and is fine. git refuses out-of-tree submodule paths as well.
-fn submodule_path_is_contained(repo_path: &Path, path: &Path) -> bool {
-    if path.as_os_str().is_empty() {
-        return false;
-    }
-    if !path
-        .components()
-        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
-    {
-        return false;
-    }
-    match (
-        std::fs::canonicalize(repo_path),
-        std::fs::canonicalize(repo_path.join(path)),
-    ) {
-        (Ok(root), Ok(resolved)) => resolved
-            .strip_prefix(&root)
-            // An empty remainder is the repo root itself, not something in it
-            .is_ok_and(|relative| !relative.as_os_str().is_empty()),
-        // Not checked out, or the repo is gone: no link to follow
-        _ => true,
-    }
-}
-
-/// Find all submodules in a git repository by parsing the .gitmodules file.
-///
-/// Declared paths that don't stay inside the repository are skipped; see
-/// [`submodule_path_is_contained`].
-pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
-    let gitmodules_path = repo_path.join(".gitmodules");
-
-    // If .gitmodules doesn't exist, return empty vec
-    if !gitmodules_path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let content = std::fs::read_to_string(&gitmodules_path)?;
-    let mut submodules = Vec::new();
-
-    // Simple parser for .gitmodules INI format
-    let mut current_path: Option<PathBuf> = None;
-
-    // Emit a submodule once its section has yielded a path
-    let mut flush = |path: &mut Option<PathBuf>| {
-        if let Some(path) = path.take() {
-            if !submodule_path_is_contained(repo_path, &path) {
-                warn!(
-                    repo = %repo_path.display(),
-                    submodule = %path.display(),
-                    "Ignoring submodule declared outside the repository"
-                );
-                return;
-            }
-            let initialized = repo_path.join(&path).join(".git").exists();
-            submodules.push(SubmoduleInfo { path, initialized });
-        }
-    };
-
-    for line in content.lines() {
-        let line = line.trim();
-
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-
-        // Parse [submodule "name"] section headers
-        if line.starts_with('[') && line.ends_with(']') {
-            // Save the previous submodule before starting a new section
-            flush(&mut current_path);
-            continue;
-        }
-
-        // Parse key = value lines
-        if let Some(eq_pos) = line.find('=') {
-            let key = line[..eq_pos].trim();
-            let value = line[eq_pos + 1..].trim();
-
-            if key == "path" {
-                current_path = Some(PathBuf::from(value));
-            }
-        }
-    }
-
-    // Don't forget the last submodule
-    flush(&mut current_path);
-
-    Ok(submodules)
 }
 
 /// Return the config text with core.bare set to the given value, adding the
@@ -1157,32 +1042,6 @@ impl Workspace {
         resolved.unwrap_or_else(|| pattern.to_string())
     }
 
-    /// Clone/open a repository in this workspace
-    pub fn open(&self, pattern: &RepoPattern) -> Result<PathBuf> {
-        debug!(pattern = ?pattern, "Opening repos");
-
-        // First check if repository already exists locally
-        let local_repos = self.search(pattern)?;
-
-        if !local_repos.is_empty() {
-            return Ok(local_repos[0].clone());
-        }
-
-        // Check library and restore if found
-        let relative_path = pattern.full_path();
-        let repo_path = format!("{}/{}", self.path, relative_path);
-
-        if self.library_contains(&relative_path) {
-            self.restore_from_library(&relative_path)?;
-            // TODO: fetch latest changes from upstream once the gix API is clearer
-            return Ok(PathBuf::from(repo_path));
-        }
-
-        // Try to clone from remotes
-        let repo_path = self.clone_from_remote(pattern)?;
-        Ok(repo_path)
-    }
-
     /// Drop the repositories matching a pattern from this workspace
     pub fn drop(&self, pattern: &RepoPattern, delete: bool, force: bool) -> Result<DropReport> {
         debug!("Drop requested for pattern: {:?}", pattern);
@@ -1295,24 +1154,6 @@ impl Workspace {
     }
 
     /// Attempt to clone a repository from configured remotes or infer the clone URL
-    fn clone_from_remote(&self, pattern: &RepoPattern) -> Result<PathBuf> {
-        // Try to infer the git URL from the pattern
-        // Pattern could be:
-        // - github.com/user/repo (with provider)
-        // - user/repo (without provider, check configured remotes)
-        if let Some((provider, repo_path)) = pattern.provider_and_path() {
-            // Has provider like github.com/user/repo
-            let clone_url = format!("https://{}/{}", provider, repo_path);
-            let dest_path = self.repo_path(pattern)?;
-
-            self.clone_into(&clone_url, &dest_path)?;
-            return Ok(dest_path);
-        }
-
-        // No provider specified, would need to check configured remotes
-        bail!("No provider specified. Use full path like github.com/user/repo")
-    }
-
     /// Check if a repository exists in the library
     pub fn library_contains(&self, repo_path: &str) -> bool {
         std::fs::metadata(format!("{}/{}", self.library_path(), repo_path)).is_ok()
@@ -2534,97 +2375,6 @@ mod tests {
 
         let repos = find_git_repositories(root);
         assert_eq!(repos, vec![kept]);
-    }
-
-    #[test]
-    fn test_find_submodules_parses_multiple_entries() {
-        let temp_dir = TempDir::new().unwrap();
-        let repo = temp_dir.path();
-        fs::write(
-            repo.join(".gitmodules"),
-            "[submodule \"first\"]\n\
-             \tpath = libs/first\n\
-             \turl = https://example.com/first.git\n\
-             [submodule \"second\"]\n\
-             \tpath = libs/second\n\
-             \turl = https://example.com/second.git\n",
-        )
-        .unwrap();
-        // Only the first submodule is checked out
-        fs::create_dir_all(repo.join("libs/first/.git")).unwrap();
-
-        let submodules = find_submodules_in_repo(repo).unwrap();
-        assert_eq!(submodules.len(), 2);
-
-        let first = &submodules[0];
-        assert_eq!(first.path, PathBuf::from("libs/first"));
-        assert!(first.initialized);
-
-        let second = &submodules[1];
-        assert_eq!(second.path, PathBuf::from("libs/second"));
-        assert!(!second.initialized);
-    }
-
-    #[test]
-    fn test_find_submodules_missing_file_is_empty() {
-        let temp_dir = TempDir::new().unwrap();
-        assert!(find_submodules_in_repo(temp_dir.path()).unwrap().is_empty());
-    }
-
-    /// `.gitmodules` ships with the repo, so a cloned repo gets to say what is
-    /// in it. A declared path that leaves the repo aims everything workset
-    /// does to that row — the size walk, the status and diff git calls, the
-    /// shell Enter opens — at a directory the repo doesn't own, and an
-    /// absolute one replaces the parent's path entirely when joined.
-    #[test]
-    fn find_submodules_skips_paths_that_leave_the_repo() {
-        let temp_dir = TempDir::new().unwrap();
-        let repo = temp_dir.path().join("repo");
-        fs::create_dir_all(temp_dir.path().join("outside")).unwrap();
-        fs::create_dir_all(repo.join("libs/good/.git")).unwrap();
-
-        fs::write(
-            repo.join(".gitmodules"),
-            "[submodule \"absolute\"]\n\tpath = /\n\
-             [submodule \"parent\"]\n\tpath = ../outside\n\
-             [submodule \"buried-parent\"]\n\tpath = libs/../../outside\n\
-             [submodule \"empty\"]\n\tpath =\n\
-             [submodule \"self\"]\n\tpath = .\n\
-             [submodule \"good\"]\n\tpath = libs/good\n",
-        )
-        .unwrap();
-
-        let submodules = find_submodules_in_repo(&repo).unwrap();
-        let paths: Vec<_> = submodules.iter().map(|s| s.path.clone()).collect();
-        assert_eq!(paths, vec![PathBuf::from("libs/good")]);
-        assert!(submodules[0].initialized);
-    }
-
-    /// A symlink in the worktree spells out as a plain relative path while
-    /// pointing anywhere at all, so a lexical check alone doesn't settle where
-    /// a declared submodule path lands.
-    #[cfg(unix)]
-    #[test]
-    fn find_submodules_skips_paths_that_leave_the_repo_through_a_symlink() {
-        let temp_dir = TempDir::new().unwrap();
-        let repo = temp_dir.path().join("repo");
-        fs::create_dir_all(repo.join("libs")).unwrap();
-        fs::create_dir_all(temp_dir.path().join("outside/repo/.git")).unwrap();
-        std::os::unix::fs::symlink(temp_dir.path().join("outside"), repo.join("linked")).unwrap();
-
-        fs::write(
-            repo.join(".gitmodules"),
-            "[submodule \"linked\"]\n\tpath = linked/repo\n\
-             [submodule \"uninitialized\"]\n\tpath = libs/later\n",
-        )
-        .unwrap();
-
-        // The link is refused, while a submodule that simply isn't checked out
-        // yet has no link to follow and is kept
-        let submodules = find_submodules_in_repo(&repo).unwrap();
-        let paths: Vec<_> = submodules.iter().map(|s| s.path.clone()).collect();
-        assert_eq!(paths, vec![PathBuf::from("libs/later")]);
-        assert!(!submodules[0].initialized);
     }
 
     #[test]

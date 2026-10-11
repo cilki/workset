@@ -11,8 +11,9 @@
 //! leaves alone is the working tree and — with the default fetch refspec —
 //! `refs/heads/*`.
 //!
-//! All network operations shell out to the `git` CLI (consistent with the
-//! existing `gh`/`glab` shell-outs).
+//! All network operations shell out to the `git` CLI, so a fetch gets the
+//! user's own git configuration — credential helpers, ssh keys, insteadOf
+//! rewrites — rather than a second implementation of it.
 
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;

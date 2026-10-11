@@ -5,13 +5,11 @@ use super::tree::{
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 #[derive(PartialEq)]
 pub enum AppMode {
     Normal,
     Search,
-    CloneRepo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -27,14 +25,6 @@ impl Section {
             Section::Library => Section::Workspace,
         }
     }
-}
-
-/// A clone running in the background, shown as a temporary repo row in the
-/// workspace tree until the real repo appears (or the failure expires)
-struct PendingClone {
-    display_name: String,
-    status: RepoOperationStatus,
-    failed_at: Option<Instant>,
 }
 
 pub struct App {
@@ -62,11 +52,6 @@ pub struct App {
     pub help_visible: bool,
     /// Pre-rasterized logo for the help overlay; None renders text-only help
     pub help_image: Option<ratatui_image::protocol::StatefulProtocol>,
-    pub clone_repo_input: String,
-    pub clone_repo_suggestions: Vec<String>,
-    pub clone_repo_state: TreeState,
-    pub suggestions_loading: bool,
-    pending_clones: Vec<PendingClone>,
     /// Sync status per repo display name (Fetching or SyncFailed), overlaid on
     /// the repo rows so it survives background data refreshes
     sync_statuses: std::collections::HashMap<String, RepoOperationStatus>,
@@ -106,11 +91,6 @@ impl App {
             mode: AppMode::Normal,
             help_visible: false,
             help_image: None,
-            clone_repo_input: String::new(),
-            clone_repo_suggestions: Vec::new(),
-            clone_repo_state: TreeState::new(),
-            suggestions_loading: false,
-            pending_clones: Vec::new(),
             sync_statuses: std::collections::HashMap::new(),
             sync_outcomes: std::collections::HashMap::new(),
             fetching: std::collections::HashSet::new(),
@@ -162,10 +142,8 @@ impl App {
         );
     }
 
-    /// The workspace repos with transient statuses applied: pending clones get
-    /// their status overlaid on existing rows (cloning creates the directory
-    /// right away) or a synthetic placeholder entry, and repos with an active
-    /// sync get their sync status shown
+    /// The workspace repos with transient statuses applied: a repo with an
+    /// active sync gets its sync status shown
     fn workspace_repos_with_overlays(&self) -> Vec<RepoInfo> {
         let mut repos = self.workspace_repos_list.clone();
         for repo in &mut repos {
@@ -176,24 +154,6 @@ impl App {
                 )
             {
                 repo.operation_status = status.clone();
-            }
-        }
-        for pending in &self.pending_clones {
-            if let Some(repo) = repos
-                .iter_mut()
-                .find(|r| r.display_name == pending.display_name)
-            {
-                repo.operation_status = pending.status.clone();
-            } else {
-                repos.push(RepoInfo {
-                    path: PathBuf::from(format!(
-                        "{}/{}",
-                        self.workspace_path, pending.display_name
-                    )),
-                    display_name: pending.display_name.clone(),
-                    operation_status: pending.status.clone(),
-                    ..Default::default()
-                });
             }
         }
         repos
@@ -214,49 +174,6 @@ impl App {
         match previous {
             Some((section, index, path)) => self.restore_selection(section, index, &path),
             None => self.select_first_available(),
-        }
-    }
-
-    /// Show a temporary "cloning..." row for the given repo pattern
-    pub fn add_pending_clone(&mut self, display_name: String) {
-        self.pending_clones
-            .retain(|p| p.display_name != display_name);
-        self.pending_clones.push(PendingClone {
-            display_name,
-            status: RepoOperationStatus::Cloning,
-            failed_at: None,
-        });
-        self.rebuild_preserving_selection();
-    }
-
-    /// Resolve a pending clone: drop the row on success (the refresh brings in
-    /// the real repo), or mark it failed so the error shows on the row
-    pub fn finish_pending_clone(&mut self, display_name: &str, error: Option<String>) {
-        match error {
-            None => self
-                .pending_clones
-                .retain(|p| p.display_name != display_name),
-            Some(err) => {
-                if let Some(pending) = self
-                    .pending_clones
-                    .iter_mut()
-                    .find(|p| p.display_name == display_name)
-                {
-                    pending.status = RepoOperationStatus::Failed(err);
-                    pending.failed_at = Some(Instant::now());
-                }
-            }
-        }
-        self.rebuild_preserving_selection();
-    }
-
-    /// Remove failed clone rows older than `ttl` so they don't linger forever
-    pub fn expire_failed_clones(&mut self, ttl: Duration) {
-        let before = self.pending_clones.len();
-        self.pending_clones
-            .retain(|p| p.failed_at.is_none_or(|at| at.elapsed() < ttl));
-        if self.pending_clones.len() != before {
-            self.rebuild_preserving_selection();
         }
     }
 
@@ -403,16 +320,6 @@ impl App {
         }
     }
 
-    /// Clone-dialog suggestions filtered by the current input
-    pub fn filtered_suggestions(&self) -> Vec<&str> {
-        let input = self.clone_repo_input.to_lowercase();
-        self.clone_repo_suggestions
-            .iter()
-            .filter(|s| s.to_lowercase().contains(&input))
-            .map(|s| s.as_str())
-            .collect()
-    }
-
     /// Mark a repo's row with the status of an operation running right now.
     /// Only the rendered trees are touched, so the mark lasts until the next
     /// rebuild — which is all `run_repo_operation` needs: it draws each step
@@ -468,8 +375,7 @@ impl App {
     }
 
     /// Path of the selected repo if background sync should fetch it: a
-    /// workspace repo that isn't a submodule (submodules sync through their
-    /// parent repo; library repos are never fetched)
+    /// workspace repo (library repos are never fetched)
     pub fn selected_syncable_repo_path(&self) -> Option<PathBuf> {
         if self.active_section != Section::Workspace {
             return None;
@@ -477,7 +383,6 @@ impl App {
         self.selected_node()?
             .repo_info
             .as_ref()
-            .filter(|r| !r.is_submodule)
             .map(|r| r.path.clone())
     }
 
@@ -553,13 +458,6 @@ mod tests {
 
     fn selected_path(app: &App) -> Option<String> {
         app.selected_position().map(|(_, _, path)| path)
-    }
-
-    fn visible_workspace_paths(app: &App) -> Vec<String> {
-        flatten_trees(&app.workspace_tree)
-            .iter()
-            .map(|(_, _, _, p)| p.clone())
-            .collect()
     }
 
     fn workspace_repo_info(app: &App, name: &str) -> Option<RepoInfo> {
@@ -652,50 +550,6 @@ mod tests {
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
         assert_eq!(info.status, Some(crate::RepoStatus::Unpushed));
         assert_eq!(info.modification_time, Some(time));
-    }
-
-    #[test]
-    fn pending_clone_appears_and_resolves() {
-        let mut app = App::new(
-            "workspace".to_string(),
-            vec![repo("github.com/foo/app")],
-            Vec::new(),
-        );
-
-        app.add_pending_clone("github.com/nosuch/thing".to_string());
-        let names = visible_workspace_paths(&app);
-        assert!(
-            names.contains(&"github.com/nosuch/thing".to_string()),
-            "placeholder missing: {:?}",
-            names
-        );
-
-        // Cloning creates the directory immediately, so a rescan finds a real
-        // repo mid-clone; the cloning status must stay on the row
-        app.update_repos(
-            vec![repo("github.com/foo/app"), repo("github.com/nosuch/thing")],
-            Vec::new(),
-        );
-        let status = flatten_trees(&app.workspace_tree)
-            .iter()
-            .find(|(_, _, _, p)| p == "github.com/nosuch/thing")
-            .and_then(|(node, _, _, _)| node.repo_info.as_ref())
-            .map(|r| r.operation_status.clone());
-        assert!(matches!(status, Some(RepoOperationStatus::Cloning)));
-
-        // Failure keeps the row so the error is visible
-        app.finish_pending_clone("github.com/nosuch/thing", Some("boom".to_string()));
-        assert!(visible_workspace_paths(&app).contains(&"github.com/nosuch/thing".to_string()));
-
-        // Expiry removes the overlay (the row survives here because the repo
-        // landed on disk above)
-        app.expire_failed_clones(Duration::from_secs(0));
-        let status = flatten_trees(&app.workspace_tree)
-            .iter()
-            .find(|(_, _, _, p)| p == "github.com/nosuch/thing")
-            .and_then(|(node, _, _, _)| node.repo_info.as_ref())
-            .map(|r| r.operation_status.clone());
-        assert!(matches!(status, Some(RepoOperationStatus::None)));
     }
 
     #[test]

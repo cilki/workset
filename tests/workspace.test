@@ -38,7 +38,7 @@ testInit() {
 
 ## Commands that need a workspace say so and fail outside one
 testCommandsOutsideWorkspaceFail() {
-	for command in list status drop; do
+	for command in list drop; do
 		output=$(workset $command 2>&1) && exit 1
 		echo "$output" | grep "Not in a workspace"
 	done
@@ -128,7 +128,6 @@ testDropRefusesRepoItCannotRead() {
 	echo "uncommitted work" >opaque-repo/scratch.txt
 
 	workset list | grep -- "opaque-repo - ✗ unreadable"
-	workset status | grep -- "✗ 1 workset can't read"
 
 	output=$(workset drop opaque-repo 2>&1) && exit 1
 	echo "$output" | grep -- "opaque-repo - ⚠ kept (unreadable repository"
@@ -328,12 +327,12 @@ testArgumentlessCommandsRejectExtraArguments() {
 	newWorkspace
 	createRepo repo1
 
-	for command in init list ls status; do
+	for command in init list ls; do
 		output=$(workset $command extra 2>&1) && exit 1
 		echo "$output" | grep "Unrecognized argument: extra"
 	done
 
-	output=$(workset status --oops 2>&1) && exit 1
+	output=$(workset list --oops 2>&1) && exit 1
 	echo "$output" | grep "Unrecognized argument: --oops"
 }
 
@@ -693,7 +692,7 @@ testRestoreEmptiesLibraryEntry() {
 
 	workset restore moved
 	[ ! -e .workset/moved ]
-	workset status | grep "0 repository(ies) in library"
+	workset list | grep "0 repository(ies)"
 }
 
 ## Git config, including custom keys and remote URLs, survives a
@@ -753,13 +752,12 @@ testListSortsRepos() {
 	createRepo github.com/a/two
 	createRepo github.com/a/one
 
-	cat >expected <<-'EOF'
-		github.com/a/one
-		github.com/a/two
-		github.com/b/one
-		gitlab.com/a/one
-		gitlab.com/b/two
-	EOF
+	printf '%s\n' \
+		github.com/a/one \
+		github.com/a/two \
+		github.com/b/one \
+		gitlab.com/a/one \
+		gitlab.com/b/two >expected
 	workset list | sed -n 's/^  \([^ ]*\) - .*/\1/p' >actual
 	diff expected actual
 }
@@ -778,7 +776,7 @@ testOutputIntoClosedPipeIsQuiet() {
 	# prints fails for certain rather than only when the output outgrows the
 	# pipe buffer. Only workset's stderr is collected: capturing the whole
 	# pipeline's would collect the test runner's own command trace with it.
-	for command in list ls status; do
+	for command in list ls; do
 		{ sleep 1; workset $command 2>stderr.txt; } | true
 		[ ! -s stderr.txt ]
 	done
@@ -792,7 +790,6 @@ testListDetachedHeadRepo() {
 	git -C detached-repo checkout -q --detach HEAD
 
 	workset list | grep -- "detached-repo - ✓ clean"
-	workset status | grep "✓ 1 clean"
 
 	workset drop detached-repo | grep -- "detached-repo - ✓ dropped"
 	workset restore detached-repo
@@ -814,28 +811,24 @@ testListFromSubdirectory() {
 	echo "$output" | grep "projects/sub-repo2"
 }
 
-## Status summarizes the workspace and its library
-testStatusSummary() {
+## Listing ends with what the library is holding, which is where the repos
+## that aren't in the working set are
+testListReportsLibraryCount() {
 	newWorkspace
 	createRepo repo1
 	createRepo repo2
 
-	output=$(workset status)
+	workset list | grep "^Library (.*/.workset): 0 repository(ies)$"
 
-	echo "$output" | grep "^Workspace: "
-	echo "$output" | grep "^Library: "
-	echo "$output" | grep "Active repositories: 2"
-}
+	workset drop repo1
+	workset list | grep "^Library (.*/.workset): 1 repository(ies)$"
 
-## Status is workspace-wide, regardless of the current directory
-testStatusFromSubdirectory() {
-	newWorkspace
-	createRepo root-repo
-	createRepo projects/sub-repo1
-	createRepo projects/sub-repo2
-
-	cd projects
-	workset status | grep "Active repositories: 3"
+	# An empty working set is where the count matters most, so it is still
+	# reported when there is nothing else to list
+	workset drop repo2
+	output=$(workset list)
+	echo "$output" | grep "^No repositories found in workspace "
+	echo "$output" | grep "2 repository(ies)$"
 }
 
 ## --help prints the usage text and works outside any workspace

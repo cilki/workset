@@ -56,7 +56,6 @@ enum Action {
     OpenShell(PathBuf),
     DropToLibrary(Vec<String>),
     RestoreFromLibrary(Vec<String>),
-    CloneRepo(String),
     RefreshData,
 }
 
@@ -68,7 +67,7 @@ enum LoadEvent {
         workspace: Vec<RepoInfo>,
         library: Vec<RepoInfo>,
     },
-    Workspace(Vec<RepoInfo>),
+    Workspace(RepoInfo),
     Library(RepoInfo),
 }
 
@@ -128,13 +127,13 @@ impl RepoLoader {
                     merge_discovered(&mut self.library, library);
                     received = true;
                 }
-                Ok(LoadEvent::Workspace(infos)) => {
-                    replace_scanned(&mut self.workspace, infos);
+                Ok(LoadEvent::Workspace(info)) => {
+                    replace_scanned(&mut self.workspace, info);
                     self.done += 1;
                     received = true;
                 }
                 Ok(LoadEvent::Library(info)) => {
-                    replace_scanned(&mut self.library, vec![info]);
+                    replace_scanned(&mut self.library, info);
                     self.done += 1;
                     received = true;
                 }
@@ -172,12 +171,9 @@ impl RepoLoader {
 
 /// Reconcile seeded placeholder rows with the freshly enumerated repo set:
 /// rows that no longer exist are dropped, newly appeared repos get a
-/// placeholder. Submodule rows are kept as-is; they ride along with their
-/// parent's scan.
+/// placeholder.
 fn merge_discovered(rows: &mut Vec<RepoInfo>, discovered: Vec<RepoInfo>) {
-    rows.retain(|row| {
-        row.is_submodule || display_names(&discovered).any(|name| name == row.display_name)
-    });
+    rows.retain(|row| display_names(&discovered).any(|name| name == row.display_name));
     for repo in discovered {
         if !display_names(rows).any(|name| name == repo.display_name) {
             rows.push(repo);
@@ -185,13 +181,11 @@ fn merge_discovered(rows: &mut Vec<RepoInfo>, discovered: Vec<RepoInfo>) {
     }
 }
 
-/// Replace the rows a worker just produced, so each repo stays listed exactly
-/// once: the placeholder it had goes, the scanned row takes its place. A
-/// workspace repo's scan also yields a row per submodule, each replacing any
-/// seeded row for that submodule.
-fn replace_scanned(rows: &mut Vec<RepoInfo>, scanned: Vec<RepoInfo>) {
-    rows.retain(|row| !display_names(&scanned).any(|name| name == row.display_name));
-    rows.extend(scanned);
+/// Replace the row a worker just produced, so each repo stays listed exactly
+/// once: the placeholder it had goes, the scanned row takes its place.
+fn replace_scanned(rows: &mut Vec<RepoInfo>, scanned: RepoInfo) {
+    rows.retain(|row| row.display_name != scanned.display_name);
+    rows.push(scanned);
 }
 
 /// The display names of the given rows, which are what identifies a repo
@@ -378,10 +372,6 @@ impl SyncManager {
 /// Handles to work running on background threads, drained by the event loop
 struct BackgroundTasks {
     loader: Option<RepoLoader>,
-    suggestions: Option<mpsc::Receiver<Vec<String>>>,
-    /// Delivers the error (if any) once the background clone of the given
-    /// repo pattern finishes
-    clone_result: Option<(String, mpsc::Receiver<Option<String>>)>,
     /// Delivers the file watcher once its (potentially slow) recursive
     /// registration of the workspace tree completes
     watcher: Option<mpsc::Receiver<Result<FileWatcher, notify::Error>>>,
@@ -506,8 +496,6 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
 
         let mut background = BackgroundTasks {
             loader: Some(RepoLoader::start(workspace, Vec::new(), Vec::new(), true)),
-            suggestions: None,
-            clone_result: None,
             watcher: Some(watcher_rx),
             sync: SyncManager::new(workspace.path.clone()),
             details: DetailsLoader::new(),
@@ -593,21 +581,6 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         |repo_path| workspace.restore_from_library(repo_path),
                     )?;
                     background.reload(&app, workspace);
-                }
-                Action::CloneRepo(repo_pattern) => {
-                    // Show a placeholder repo row while the clone runs
-                    app.add_pending_clone(repo_pattern.clone());
-
-                    // Clone on a background thread; the file watcher picks up
-                    // the new repo and triggers a refresh when it lands
-                    let (tx, rx) = mpsc::channel();
-                    background.clone_result = Some((repo_pattern.clone(), rx));
-                    let workspace = workspace.clone();
-                    std::thread::spawn(move || {
-                        let Ok(pattern) = repo_pattern.parse::<RepoPattern>();
-                        let error = workspace.open(&pattern).err().map(|e| e.to_string());
-                        let _ = tx.send(error);
-                    });
                 }
                 Action::RefreshData => {
                     // Filesystem changed - reload repository data in the background
@@ -724,23 +697,6 @@ fn run_app<B: ratatui::backend::Backend>(
         background.details.poll(app);
         background.details.note_selection(app);
         background.details.pump(app);
-        poll_suggestions(app, background);
-        if let Some((pattern, rx)) = &background.clone_result {
-            match rx.try_recv() {
-                Ok(error) => {
-                    let pattern = pattern.clone();
-                    app.finish_pending_clone(&pattern, error);
-                    background.clone_result = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let pattern = pattern.clone();
-                    app.finish_pending_clone(&pattern, Some("clone interrupted".to_string()));
-                    background.clone_result = None;
-                }
-            }
-        }
-        app.expire_failed_clones(Duration::from_secs(5));
 
         terminal
             .draw(|f| ui(f, app))
@@ -801,25 +757,6 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                     KeyCode::Right | KeyCode::Left => {
                         app.toggle_expand();
-                    }
-                    KeyCode::Char('c') => {
-                        // Clone repo dialog; suggestions arrive from a
-                        // background thread since gh/glab may hit the network
-                        app.mode = AppMode::CloneRepo;
-                        app.clone_repo_input.clear();
-                        app.clone_repo_suggestions.clear();
-                        app.clone_repo_state.select(None);
-                        app.suggestions_loading = true;
-
-                        let (tx, rx) = mpsc::channel();
-                        background.suggestions = Some(rx);
-                        std::thread::spawn(move || {
-                            let mut suggestions = get_github_suggestions();
-                            suggestions.extend(get_gitlab_suggestions());
-                            suggestions.sort();
-                            suggestions.dedup();
-                            let _ = tx.send(suggestions);
-                        });
                     }
                     KeyCode::Esc => {
                         // Return None to exit - cleanup happens in the outer loop
@@ -888,102 +825,13 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 },
-                AppMode::CloneRepo => match code {
-                    KeyCode::Esc => {
-                        app.mode = AppMode::Normal;
-                        app.clone_repo_input.clear();
-                    }
-                    KeyCode::Enter => {
-                        // Use selected suggestion or manual input
-                        let repo = app
-                            .clone_repo_state
-                            .selected()
-                            .and_then(|idx| {
-                                app.filtered_suggestions().get(idx).map(|s| s.to_string())
-                            })
-                            .unwrap_or_else(|| app.clone_repo_input.clone());
-
-                        if !repo.is_empty() {
-                            app.mode = AppMode::Normal;
-                            return Ok(Action::CloneRepo(repo));
-                        }
-                    }
-                    KeyCode::Down => {
-                        let len = app.filtered_suggestions().len();
-                        if len > 0 {
-                            let next = match app.clone_repo_state.selected() {
-                                Some(i) if i + 1 >= len => 0,
-                                Some(i) => i + 1,
-                                None => 0,
-                            };
-                            app.clone_repo_state.select(Some(next));
-                        }
-                    }
-                    KeyCode::Up => {
-                        let len = app.filtered_suggestions().len();
-                        if len > 0 {
-                            let prev = match app.clone_repo_state.selected() {
-                                Some(0) => len - 1,
-                                Some(i) => i - 1,
-                                None => 0,
-                            };
-                            app.clone_repo_state.select(Some(prev));
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        app.clone_repo_input.push(c);
-                        app.clone_repo_state.select(Some(0));
-                    }
-                    KeyCode::Backspace => {
-                        app.clone_repo_input.pop();
-                    }
-                    _ => {}
-                },
             }
-        }
-    }
-}
-
-/// Apply clone-dialog suggestions once the background fetch completes
-fn poll_suggestions(app: &mut App, background: &mut BackgroundTasks) {
-    let Some(rx) = &background.suggestions else {
-        return;
-    };
-    match rx.try_recv() {
-        Ok(mut suggestions) => {
-            // Filter out repos that already exist in workspace or library
-            let existing_repos: std::collections::HashSet<String> = app
-                .get_flattened_workspace()
-                .iter()
-                .chain(app.get_flattened_library().iter())
-                .filter_map(|(node, _, _, _)| {
-                    node.repo_info.as_ref().map(|r| r.display_name.clone())
-                })
-                .collect();
-            suggestions.retain(|s| !existing_repos.contains(s));
-
-            app.clone_repo_suggestions = suggestions;
-            if !app.clone_repo_suggestions.is_empty() && app.clone_repo_state.selected().is_none() {
-                app.clone_repo_state.select(Some(0));
-            }
-            app.suggestions_loading = false;
-            background.suggestions = None;
-        }
-        Err(mpsc::TryRecvError::Empty) => {}
-        Err(mpsc::TryRecvError::Disconnected) => {
-            app.suggestions_loading = false;
-            background.suggestions = None;
         }
     }
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
     app.single_panel = f.area().width < SINGLE_PANEL_THRESHOLD;
-
-    if app.mode == AppMode::CloneRepo {
-        render_clone_repo_dialog(f, app);
-        return;
-    }
 
     // Split vertically into rows; the search box appears while search mode is
     // active or a filter is applied
@@ -1075,7 +923,6 @@ fn help_bindings(app: &App) -> Vec<(&'static str, Color, &'static str)> {
     if app.active_section == Section::Workspace {
         bindings.push(("d", Color::Yellow, "drop"));
     }
-    bindings.push(("c", Color::Magenta, "clone"));
     bindings.push(("/", Color::Yellow, "search"));
     bindings.push(("?", Color::Cyan, "help"));
     bindings.push(("Esc", Color::Red, "quit"));
@@ -1424,17 +1271,7 @@ fn tree_list_item<'a>(
 
     // Add expand/collapse indicator
     if !node.children.is_empty() {
-        let is_git_submodule = node
-            .repo_info
-            .as_ref()
-            .map(|r| r.is_submodule)
-            .unwrap_or(false);
-        let indicator = match (is_git_submodule, node.expanded) {
-            (true, true) => "◇ ",
-            (true, false) => "◆ ",
-            (false, true) => "▼ ",
-            (false, false) => "▶ ",
-        };
+        let indicator = if node.expanded { "▼ " } else { "▶ " };
         spans.push(Span::styled(indicator, Style::default().fg(Color::Cyan)));
     } else if depth > 0 {
         spans.push(Span::raw("  "));
@@ -1442,30 +1279,17 @@ fn tree_list_item<'a>(
 
     // Add status icon for repos only
     if show_status_icons && let Some(ref repo) = node.repo_info {
-        if repo.is_submodule {
-            // Submodule indicator
-            if repo.submodule_initialized {
-                spans.push(Span::styled("S ", Style::default().fg(Color::Magenta)));
-            } else {
-                spans.push(Span::styled("S ", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(
-                    "(uninit) ",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-        } else {
-            let (icon, color) = match repo.status {
-                // Not scanned yet (includes placeholder rows for clones)
-                None => ("· ", Color::DarkGray),
-                Some(crate::RepoStatus::Clean) => ("✓ ", Color::Green),
-                Some(crate::RepoStatus::Dirty) => ("* ", Color::Yellow),
-                Some(crate::RepoStatus::Unpushed) => ("↑ ", Color::Yellow),
-                Some(crate::RepoStatus::NoCommits) => ("· ", Color::DarkGray),
-                // Not "empty": workset couldn't read this repo at all
-                Some(crate::RepoStatus::Unknown) => ("? ", Color::Red),
-            };
-            spans.push(Span::styled(icon, Style::default().fg(color)));
-        }
+        let (icon, color) = match repo.status {
+            // Not scanned yet
+            None => ("· ", Color::DarkGray),
+            Some(crate::RepoStatus::Clean) => ("✓ ", Color::Green),
+            Some(crate::RepoStatus::Dirty) => ("* ", Color::Yellow),
+            Some(crate::RepoStatus::Unpushed) => ("↑ ", Color::Yellow),
+            Some(crate::RepoStatus::NoCommits) => ("· ", Color::DarkGray),
+            // Not "empty": workset couldn't read this repo at all
+            Some(crate::RepoStatus::Unknown) => ("? ", Color::Red),
+        };
+        spans.push(Span::styled(icon, Style::default().fg(color)));
     }
 
     // Add name with search highlighting
@@ -1500,7 +1324,6 @@ fn tree_list_item<'a>(
             RepoOperationStatus::Scanning => ("scanning".to_string(), Color::DarkGray),
             RepoOperationStatus::Fetching => ("fetching".to_string(), Color::DarkGray),
             RepoOperationStatus::SyncFailed(err) => (format!("sync failed: {}", err), Color::Red),
-            RepoOperationStatus::Cloning => ("cloning...".to_string(), Color::Magenta),
             RepoOperationStatus::Dropping => ("dropping...".to_string(), Color::Yellow),
             RepoOperationStatus::Restoring => ("restoring...".to_string(), Color::Cyan),
             RepoOperationStatus::Success => ("done".to_string(), Color::Green),
@@ -1516,82 +1339,6 @@ fn tree_list_item<'a>(
     }
 
     ListItem::new(Line::from(spans))
-}
-
-fn render_clone_repo_dialog(f: &mut Frame, app: &App) {
-    // Create a centered dialog
-    let area = f.area();
-    let dialog_width = area.width.min(80);
-    let dialog_height = area.height.min(20);
-
-    let dialog_area = Rect {
-        x: (area.width - dialog_width) / 2,
-        y: (area.height - dialog_height) / 2,
-        width: dialog_width,
-        height: dialog_height,
-    };
-
-    // Clear the background
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title("Clone Repository")
-        .style(Style::default().bg(Color::Black));
-    f.render_widget(block, dialog_area);
-
-    // Split into input and suggestions
-    let inner = dialog_area.inner(ratatui::layout::Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Input box
-            Constraint::Min(0),    // Suggestions
-        ])
-        .split(inner);
-
-    // Input box
-    let input_text = format!("{}_", app.clone_repo_input);
-    let input = Paragraph::new(input_text)
-        .style(Style::default().fg(Color::Yellow))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Repository (e.g. github.com/user/repo)"),
-        );
-    f.render_widget(input, chunks[0]);
-
-    // Suggestions list
-    let filtered_suggestions = app.filtered_suggestions();
-    let suggestion_items: Vec<ListItem> = filtered_suggestions
-        .iter()
-        .map(|s| ListItem::new(*s))
-        .collect();
-
-    let suggestions_title = if app.suggestions_loading {
-        format!("Suggestions ({}) - loading...", filtered_suggestions.len())
-    } else {
-        format!("Suggestions ({})", filtered_suggestions.len())
-    };
-    let suggestions = List::new(suggestion_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(suggestions_title),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ");
-
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(app.clone_repo_state.selected());
-    f.render_stateful_widget(suggestions, chunks[1], &mut state);
 }
 
 /// Render right-aligned metadata (status or size) with padding
@@ -1690,9 +1437,8 @@ fn workspace_display_name(workspace_path: &str, path: &Path) -> String {
         .to_string()
 }
 
-/// Fill in a discovered workspace repo's status and modification time, and
-/// return it followed by a row for each of its submodules
-fn scan_workspace_repo(mut repo: RepoInfo) -> Vec<RepoInfo> {
+/// Fill in a discovered workspace repo's status and modification time
+fn scan_workspace_repo(mut repo: RepoInfo) -> RepoInfo {
     // Check repo status and get modification time in a single repo open for performance
     let (status, modification_time) = crate::check_repo_status_and_modification_time(&repo.path)
         .unwrap_or((crate::RepoStatus::Unknown, None));
@@ -1700,31 +1446,7 @@ fn scan_workspace_repo(mut repo: RepoInfo) -> Vec<RepoInfo> {
     repo.modification_time = modification_time;
     repo.operation_status = RepoOperationStatus::None;
     // Size not computed for workspace repos to save time
-
-    let path = repo.path.clone();
-    let display_name = repo.display_name.clone();
-    let mut infos = vec![repo];
-
-    // Find and add submodules
-    for submodule in crate::find_submodules_in_repo(&path).unwrap_or_default() {
-        let submodule_display_name = if display_name.is_empty() {
-            submodule.path.display().to_string()
-        } else {
-            format!("{}/{}", display_name, submodule.path.display())
-        };
-
-        infos.push(RepoInfo {
-            path: path.join(&submodule.path),
-            display_name: submodule_display_name,
-            status: Some(crate::RepoStatus::Clean), // Submodule status computed separately
-            is_submodule: true,
-            submodule_initialized: submodule.initialized,
-            parent_repo_path: Some(path.clone()),
-            ..Default::default()
-        });
-    }
-
-    infos
+    repo
 }
 
 /// Fill in a discovered library repo's metadata
@@ -1822,83 +1544,6 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     });
 }
 
-/// Get the configured GitHub hostname from gh CLI
-fn get_github_hostname() -> String {
-    if let Ok(output) = std::process::Command::new("gh")
-        .args(["auth", "status", "--active", "--json", "hosts"])
-        .output()
-        && output.status.success()
-        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-        && let Some(hosts) = json.get("hosts").and_then(|h| h.as_object())
-        && let Some(hostname) = hosts.keys().next()
-    {
-        return hostname.clone();
-    }
-    // Default to github.com if we can't determine the hostname
-    "github.com".to_string()
-}
-
-/// Fetch repository suggestions from GitHub CLI for TUI autocomplete
-fn get_github_suggestions() -> Vec<String> {
-    if let Ok(output) = std::process::Command::new("gh")
-        .args([
-            "repo",
-            "list",
-            "--limit",
-            "100",
-            "--json",
-            "nameWithOwner",
-            "-q",
-            ".[].nameWithOwner",
-        ])
-        .output()
-        && output.status.success()
-    {
-        let hostname = get_github_hostname();
-        return String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(|line| format!("{}/{}", hostname, line.trim()))
-            .collect();
-    }
-    Vec::new()
-}
-
-/// Get the configured GitLab hostname from glab CLI
-fn get_gitlab_hostname() -> String {
-    if let Ok(output) = std::process::Command::new("glab")
-        .args(["config", "get", "host"])
-        .output()
-        && output.status.success()
-    {
-        let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !hostname.is_empty() {
-            return hostname;
-        }
-    }
-    // Default to gitlab.com if we can't determine the hostname
-    "gitlab.com".to_string()
-}
-
-/// Fetch repository suggestions from GitLab CLI for TUI autocomplete
-fn get_gitlab_suggestions() -> Vec<String> {
-    if let Ok(output) = std::process::Command::new("glab")
-        .args(["repo", "list", "--all", "--per-page", "100"])
-        .output()
-        && output.status.success()
-    {
-        let hostname = get_gitlab_hostname();
-        return String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                // glab output format is: "namespace/project"
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                parts.first().map(|repo| format!("{}/{}", hostname, repo))
-            })
-            .collect();
-    }
-    Vec::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1925,13 +1570,8 @@ mod tests {
         std::fs::create_dir_all(&repo_path).unwrap();
         gix::init(&repo_path).unwrap();
         std::fs::write(repo_path.join("notes.txt"), "unfinished").unwrap();
-        std::fs::write(
-            repo_path.join(".gitmodules"),
-            "[submodule \"dep\"]\n\tpath = vendor/dep\n\turl = https://example.com/dep.git\n",
-        )
-        .unwrap();
 
-        let scanned = scan_workspace_repo(RepoInfo {
+        let repo = scan_workspace_repo(RepoInfo {
             path: repo_path.clone(),
             display_name: "work/app".to_string(),
             tree_path: Some("github.com/fossable/app".to_string()),
@@ -1939,47 +1579,10 @@ mod tests {
             ..Default::default()
         });
 
-        let repo = &scanned[0];
         assert_eq!(repo.display_name, "work/app");
         assert_eq!(repo.tree_path.as_deref(), Some("github.com/fossable/app"));
         assert_eq!(repo.status, Some(crate::RepoStatus::Dirty));
         assert_eq!(repo.operation_status, RepoOperationStatus::None);
-
-        // Submodules ride along with their parent's scan
-        let submodule = &scanned[1];
-        assert_eq!(submodule.display_name, "work/app/vendor/dep");
-        assert!(submodule.is_submodule);
-        assert_eq!(submodule.parent_repo_path.as_deref(), Some(&*repo_path));
-    }
-
-    /// A submodule row's path is its parent's joined with whatever
-    /// `.gitmodules` declares, and that file comes from the repo — so a cloned
-    /// repo could hand the scan a path outside itself. Everything the TUI does
-    /// to a row works from this path: the size walk, the git calls behind the
-    /// info panel, the shell Enter opens. An absolute path is the worst of it,
-    /// since joining replaces the parent's path outright.
-    #[test]
-    fn scanning_a_repo_yields_no_row_outside_it() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo_path = temp.path().join("work/app");
-        std::fs::create_dir_all(&repo_path).unwrap();
-        gix::init(&repo_path).unwrap();
-        std::fs::write(
-            repo_path.join(".gitmodules"),
-            "[submodule \"root\"]\n\tpath = /\n\turl = https://example.com/a.git\n\
-             [submodule \"up\"]\n\tpath = ../../..\n\turl = https://example.com/b.git\n",
-        )
-        .unwrap();
-
-        let scanned = scan_workspace_repo(RepoInfo {
-            path: repo_path.clone(),
-            display_name: "work/app".to_string(),
-            ..Default::default()
-        });
-
-        // Only the repo itself, and nothing claiming to be a submodule of it
-        assert_eq!(scanned.len(), 1, "expected no submodule rows");
-        assert_eq!(scanned[0].path, repo_path);
     }
 
     /// Every repo discovery announces comes back scanned exactly once, from
@@ -2011,7 +1614,7 @@ mod tests {
                 LoadEvent::Discovered { workspace, library } => {
                     discovered = workspace.into_iter().chain(library).collect()
                 }
-                LoadEvent::Workspace(infos) => scanned_workspace.extend(infos),
+                LoadEvent::Workspace(info) => scanned_workspace.push(info),
                 LoadEvent::Library(info) => scanned_library.push(info),
             }
         }

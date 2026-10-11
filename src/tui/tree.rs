@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct TreeState {
     /// Currently selected item index (in flattened view)
@@ -29,7 +29,6 @@ pub enum RepoOperationStatus {
     Fetching,
     /// The last fetch failed
     SyncFailed(String),
-    Cloning,
     Dropping,
     Restoring,
     Success,
@@ -52,12 +51,6 @@ pub struct RepoInfo {
     pub size_bytes: Option<u64>,
     /// Current operation status
     pub operation_status: RepoOperationStatus,
-    /// Whether this repo is a submodule
-    pub is_submodule: bool,
-    /// Whether this submodule is initialized (checked out)
-    pub submodule_initialized: bool,
-    /// Path to parent repository (for submodules)
-    pub parent_repo_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -148,13 +141,9 @@ impl TreeNode {
 }
 
 /// Build a tree structure from a flat list of repos
-pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
-    // Separate regular repos from submodules
-    let (submodules, regular_repos): (Vec<_>, Vec<_>) =
-        repos.drain(..).partition(|r| r.is_submodule);
-
-    // Sort regular repos by modification time (most recent first)
-    let mut sorted_repos = regular_repos;
+pub fn build_tree(repos: Vec<RepoInfo>) -> Vec<TreeNode> {
+    // Sort repos by modification time (most recent first)
+    let mut sorted_repos = repos;
     sorted_repos.sort_by(|a, b| {
         match (a.modification_time, b.modification_time) {
             (Some(a_time), Some(b_time)) => b_time.cmp(&a_time), // Most recent first
@@ -166,7 +155,7 @@ pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
 
     let mut root_nodes: Vec<TreeNode> = Vec::new();
 
-    // Build tree from regular repos, grouped by remote URL when known. Two
+    // Build the tree, grouping repos by remote URL when known. Two
     // clones of the same URL collide on the same node; the later one falls
     // back to its on-disk placement so both stay visible.
     for repo in sorted_repos {
@@ -178,11 +167,6 @@ pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
             let fallback = repo.display_name.clone();
             insert_repo_at(&mut root_nodes, &fallback, &repo);
         }
-    }
-
-    // Now insert submodules as children of their parent repos
-    for submodule in submodules {
-        insert_submodule_into_tree(&mut root_nodes, submodule);
     }
 
     root_nodes
@@ -226,49 +210,6 @@ fn insert_repo_at(root_nodes: &mut Vec<TreeNode>, path: &str, repo: &RepoInfo) -
         }
     }
     true
-}
-
-/// Helper function to insert a submodule into the tree as a child of its parent repo
-fn insert_submodule_into_tree(root_nodes: &mut [TreeNode], submodule: RepoInfo) {
-    let parent_path = match submodule.parent_repo_path.clone() {
-        Some(path) => path,
-        None => return, // Shouldn't happen, but skip if no parent
-    };
-
-    // Find the parent repo node and add the submodule as a child
-    if let Some(parent_node) = find_repo_node_by_path(root_nodes, &parent_path) {
-        let name = submodule
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&submodule.display_name)
-            .to_string();
-
-        parent_node.children.push(TreeNode {
-            name,
-            repo_info: Some(submodule),
-            children: Vec::new(),
-            expanded: false, // Submodules start collapsed
-        });
-    }
-}
-
-/// Recursively find a tree node by its repository path
-fn find_repo_node_by_path<'a>(nodes: &'a mut [TreeNode], path: &Path) -> Option<&'a mut TreeNode> {
-    for node in nodes {
-        // Check if this node matches
-        if let Some(ref repo_info) = node.repo_info
-            && repo_info.path == path
-        {
-            return Some(node);
-        }
-
-        // Recursively check children
-        if let Some(found) = find_repo_node_by_path(&mut node.children, path) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 /// Build library tree, excluding repos that exist in workspace

@@ -64,119 +64,9 @@ macro_rules! out {
     ($($arg:tt)*) => { crate::write_out(format_args!($($arg)*)) };
 }
 
-/// Clone repositories matching the pattern. Returns false when nothing was
-/// cloned, so the caller can exit non-zero.
-fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
-    use std::process::Command;
-
-    // Check if pattern is for mass cloning from github.com or gitlab.com
-    if let Some((provider, path)) = pattern.provider_and_path() {
-        // Check if this is a partial path for mass cloning
-        if (provider == "github.com" || provider == "gitlab.com") && !path.contains('/') {
-            // This is a user/org pattern like "github.com/user" - use gh/glab to mass clone
-            outln!("Fetching the repository list for {}/{}", provider, path);
-
-            // Get list of repos using gh/glab
-            let output = if provider == "github.com" {
-                Command::new("gh")
-                    .args([
-                        "repo",
-                        "list",
-                        path,
-                        "--json",
-                        "nameWithOwner",
-                        "--limit",
-                        "1000",
-                    ])
-                    .output()
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to run 'gh'. Is it installed? Error: {}", e)
-                    })?
-            } else {
-                Command::new("glab")
-                    .args(["repo", "list", path, "--page", "1", "--per-page", "100"])
-                    .output()
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to run 'glab'. Is it installed? Error: {}", e)
-                    })?
-            };
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("Failed to fetch repository list: {}", stderr);
-            }
-
-            // Parse the output
-            let repos = if provider == "github.com" {
-                // Parse JSON output from gh
-                let json_str = String::from_utf8(output.stdout)?;
-                let repos_json: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
-                repos_json
-                    .iter()
-                    .filter_map(|r| r["nameWithOwner"].as_str())
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-            } else {
-                // Parse glab output (simple list format)
-                String::from_utf8(output.stdout)?
-                    .lines()
-                    .map(|line| line.trim().to_string())
-                    .filter(|line| !line.is_empty())
-                    .collect::<Vec<_>>()
-            };
-
-            if repos.is_empty() {
-                eprintln!("No repositories found for {}/{}", provider, path);
-                return Ok(false);
-            }
-
-            outln!("Found {} repository(ies)", repos.len());
-
-            let mut cloned = 0;
-            let mut skipped = 0;
-            let mut failed = 0;
-
-            for repo in repos {
-                let Ok(repo_pattern) =
-                    format!("{}/{}", provider, repo).parse::<workset::RepoPattern>();
-
-                // Check if repo already exists in workspace
-                if workspace
-                    .repo_path(&repo_pattern)
-                    .is_ok_and(|repo_path| repo_path.exists())
-                {
-                    skipped += 1;
-                    continue;
-                }
-
-                // Clone the individual repo
-                match clone_single_repo(workspace, &repo_pattern) {
-                    Ok(true) => cloned += 1,
-                    Ok(false) => skipped += 1,
-                    Err(e) => {
-                        failed += 1;
-                        eprintln!("Failed to clone {}: {}", repo_pattern.full_path(), e);
-                    }
-                }
-            }
-
-            outln!(
-                "Cloned {} repository(ies), skipped {}, failed {}",
-                cloned,
-                skipped,
-                failed
-            );
-            return Ok(failed == 0);
-        }
-    }
-
-    // Not a mass clone pattern, just clone the single repo
-    clone_single_repo(workspace, pattern)
-}
-
-/// Clone a single repository. Returns false when the repo was not cloned
-/// because it is already in the workspace or the library.
-fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
+/// Clone a repository. Returns false when the repo was not cloned because it
+/// is already in the workspace or the library.
+fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
     let repo_path = workspace.repo_path(pattern)?;
 
     // Check if repo already exists in workspace
@@ -404,16 +294,13 @@ fn main() -> Result<ExitCode> {
   {cmd}workset{reset} restore <repo pattern>...
   {cmd}workset{reset} drop [repo pattern]... [--delete] [--force]
   {cmd}workset{reset} list
-  {cmd}workset{reset} status
 {dim}
   Without a subcommand, the interactive TUI opens; '?' shows its keybindings.{reset}
 
 {commands_header}
   {subcmd}init{reset}                                 Initialize a workspace in current directory
   {subcmd}clone{reset} {arg}<pattern>...{reset}                   Clone new repository(ies) to workspace
-{dim}                                       A clone URL, with or without '.git', works too
-                                       A provider/user pattern clones every repo that user
-                                       owns, which needs 'gh' or 'glab' logged in{reset}
+{dim}                                       A clone URL, with or without '.git', works too{reset}
   {subcmd}restore{reset} {arg}<pattern>...{reset}                 Restore repository(ies) from library
   {subcmd}drop{reset} {arg}[pattern]{reset} {arg}[--delete]{reset} {arg}[--force]{reset}  Drop repository(ies) from workspace
 {dim}                                       Several patterns can be given at once
@@ -423,13 +310,12 @@ fn main() -> Result<ExitCode> {
                                        With --force: drop despite uncommitted changes or
                                        unpushed commits{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
-  {subcmd}status{reset}                               Show workspace summary and statistics
+{dim}                                       Ends with how many repos the library holds{reset}
 
 {examples_header}
   {cmd}workset init{reset}                              Initialize workspace here
   {cmd}workset clone github.com/user/repo{reset}        Clone a new repository
   {cmd}workset clone git@github.com:user/repo{reset}    Same repo, named by its clone URL
-  {cmd}workset clone github.com/user{reset}             Clone all repos from github.com/user
   {cmd}workset restore repo{reset}                      Restore every library repo matching 'repo'
   {cmd}workset drop ./repo{reset}                       Drop repo (save to library)
   {cmd}workset drop github.com{reset}                   Drop every repo under github.com
@@ -533,7 +419,7 @@ fn main() -> Result<ExitCode> {
                 } else {
                     for_each_pattern(&patterns, "clone", |requested| {
                         let Ok(pattern) = requested.parse::<workset::RepoPattern>();
-                        clone_repos(&workspace, &pattern)
+                        clone_repo(&workspace, &pattern)
                     })
                 }
             }
@@ -562,12 +448,6 @@ fn main() -> Result<ExitCode> {
                 let workspace = require_workspace!(maybe_workspace);
                 no_patterns!(args);
                 list_workspace_status(&workspace)?;
-                true
-            }
-            "status" => {
-                let workspace = require_workspace!(maybe_workspace);
-                no_patterns!(args);
-                show_workspace_summary(&workspace)?;
                 true
             }
             _ => {
@@ -666,101 +546,56 @@ fn report_drop(report: &workset::DropReport, delete: bool) {
     }
 }
 
-/// List all repositories in the workspace with their status
+/// List all repositories in the workspace with their status, followed by how
+/// many repos the library is holding
 fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     let repos = workset::find_git_repositories(Path::new(&workspace.path));
 
     if repos.is_empty() {
-        outln!("No repositories found in workspace");
-        return Ok(());
-    }
+        outln!("No repositories found in workspace ({})", workspace.path);
+    } else {
+        outln!("Repositories in workspace ({}):", workspace.path);
+        outln!();
 
-    outln!("Repositories in workspace ({}):", workspace.path);
-    outln!();
+        let statuses = workset::scan_repos(&repos, |repo| workset::check_repo_status(repo));
 
-    let statuses = workset::scan_repos(&repos, |repo| workset::check_repo_status(repo));
+        for (repo, status) in repos.iter().zip(statuses) {
+            let repo_name = workspace.relative_name(repo);
 
-    for (repo, status) in repos.iter().zip(statuses) {
-        let repo_name = workspace.relative_name(repo);
+            let status_str = match status {
+                Ok(workset::RepoStatus::Clean) => "✓ clean",
+                Ok(workset::RepoStatus::Dirty) => "⚠ modified",
+                Ok(workset::RepoStatus::Unpushed) => "⚠ unpushed",
+                Ok(workset::RepoStatus::NoCommits) => "⚠ no commits",
+                Ok(workset::RepoStatus::Unknown) => "✗ unreadable",
+                Err(_) => "✗ error",
+            };
 
-        let status_str = match status {
-            Ok(workset::RepoStatus::Clean) => "✓ clean",
-            Ok(workset::RepoStatus::Dirty) => "⚠ modified",
-            Ok(workset::RepoStatus::Unpushed) => "⚠ unpushed",
-            Ok(workset::RepoStatus::NoCommits) => "⚠ no commits",
-            Ok(workset::RepoStatus::Unknown) => "✗ unreadable",
-            Err(_) => "✗ error",
-        };
-
-        outln!("  {} - {}", repo_name, status_str);
-    }
-
-    Ok(())
-}
-
-/// Show a summary of the workspace
-fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
-    outln!("Workspace: {}", workspace.path);
-    outln!();
-
-    // Show library information
-    outln!("Library: {}", workspace.library_path());
-    if let Ok(repos) = workspace.list_library() {
-        outln!("  {} repository(ies) in library", repos.len());
-    }
-
-    // Count repositories in workspace
-    outln!();
-    let repos = workset::find_git_repositories(Path::new(&workspace.path));
-    outln!("Active repositories: {}", repos.len());
-
-    let mut clean = 0;
-    let mut modified = 0;
-    let mut unpushed = 0;
-    let mut no_commits = 0;
-    let mut unreadable = 0;
-
-    for status in workset::scan_repos(&repos, |repo| workset::check_repo_status(repo)) {
-        match status {
-            Ok(workset::RepoStatus::Clean) => clean += 1,
-            Ok(workset::RepoStatus::Dirty) => modified += 1,
-            Ok(workset::RepoStatus::Unpushed) => unpushed += 1,
-            Ok(workset::RepoStatus::NoCommits) => no_commits += 1,
-            Ok(workset::RepoStatus::Unknown) => unreadable += 1,
-            Err(_) => unreadable += 1,
+            outln!("  {} - {}", repo_name, status_str);
         }
     }
 
-    if clean > 0 {
-        outln!("  ✓ {} clean", clean);
-    }
-    if modified > 0 {
-        outln!("  ⚠ {} with uncommitted changes", modified);
-    }
-    if unpushed > 0 {
-        outln!("  ⚠ {} with unpushed commits", unpushed);
-    }
-    if no_commits > 0 {
-        outln!("  ⚠ {} with no commits", no_commits);
-    }
-    if unreadable > 0 {
-        outln!("  ✗ {} workset can't read", unreadable);
+    // The repos that aren't here are in the library, so what it holds belongs
+    // in the command that reports on the working set. A library that can't be
+    // read is left unmentioned rather than failing the listing.
+    if let Ok(library) = workspace.list_library() {
+        outln!();
+        outln!(
+            "Library ({}): {} repository(ies)",
+            workspace.library_path(),
+            library.len()
+        );
     }
 
     Ok(())
 }
 
-/// Subcommands offered for completion, each with the one-line description
-/// that shells able to show one (fish) put next to it. Which table applies
-/// depends on whether there is a workspace: `init` is what makes one, and
-/// everything else needs one to already exist.
 const SUBCOMMANDS: &[(&str, &str)] = &[
     ("clone", "Clone new repository(ies) to workspace"),
     ("restore", "Restore repository(ies) from library"),
     ("drop", "Drop one or more repositories"),
     ("list", "List all repositories with their status"),
     ("ls", "List all repositories with their status"),
-    ("status", "Show workspace summary and statistics"),
 ];
 const INIT_SUBCOMMAND: &[(&str, &str)] = &[("init", "Initialize a workspace in current directory")];
 
@@ -979,7 +814,7 @@ mod tests {
             .collect()
     }
 
-    const ALL_SUBCOMMANDS: [&str; 6] = ["clone", "restore", "drop", "list", "ls", "status"];
+    const ALL_SUBCOMMANDS: [&str; 5] = ["clone", "restore", "drop", "list", "ls"];
 
     #[test]
     fn the_first_word_completes_to_a_subcommand() {

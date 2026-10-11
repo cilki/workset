@@ -26,7 +26,7 @@ fishComplete() {
 
 ## The subcommands offered inside a workspace
 subcommands() {
-	printf 'clone\nrestore\ndrop\nlist\nls\nstatus\n'
+	printf 'clone\nrestore\ndrop\nlist\nls\n'
 }
 
 ## The same subcommands with the descriptions fish expects
@@ -36,7 +36,6 @@ subcommandsWithDescriptions() {
 	printf 'drop\tDrop one or more repositories\n'
 	printf 'list\tList all repositories with their status\n'
 	printf 'ls\tList all repositories with their status\n'
-	printf 'status\tShow workspace summary and statistics\n'
 }
 
 ## The repos created by setupWorkspace, in completion order
