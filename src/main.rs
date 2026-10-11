@@ -336,6 +336,17 @@ fn main() -> Result<ExitCode> {
             dim = code(colors::DIM),
             reset = code(colors::RESET),
         );
+        // The emblem is drawn with the terminal's own graphics protocol where
+        // there is one, and in block characters where there isn't. Everywhere
+        // else -- a pipe, a file, `NO_COLOR`, a build without the TUI -- the
+        // help is the text below and nothing but, byte for byte as it has
+        // always been.
+        #[cfg(feature = "tui")]
+        if let Some(emblem) = cilki::terminal::banner(&cilki::emblem::WORKSET, 56, 7) {
+            out!("{}", emblem);
+            outln!();
+        }
+
         out!("{}", help);
 
         return Ok(ExitCode::SUCCESS);

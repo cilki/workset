@@ -427,39 +427,18 @@ fn detect_parent_shell() -> Option<String> {
     }
 }
 
-const WORKSET_LOGO_SVG: &[u8] = include_bytes!("../../assets/workset.svg");
-
-/// Rasterize the vendored logo SVG and prepare it for the terminal's graphics
-/// protocol. Must run while raw mode is active but before the event loop
-/// starts reading stdin, since the protocol query does a terminal roundtrip.
-/// Any failure just means the help overlay renders without a logo.
+/// Prepare the project emblem for the terminal's graphics protocol. Must run
+/// while raw mode is active but before the event loop starts reading stdin,
+/// since the protocol query does a terminal roundtrip. Any failure just means
+/// the help overlay renders without a logo.
 fn build_help_image() -> Option<StatefulProtocol> {
-    let tree =
-        resvg::usvg::Tree::from_data(WORKSET_LOGO_SVG, &resvg::usvg::Options::default()).ok()?;
-
-    // Rasterize at 3x for crispness, composited onto black to match the help
-    // overlay's background since the SVG itself is transparent
-    let scale = 3.0;
-    let width = (tree.size().width() * scale).ceil() as u32;
-    let height = (tree.size().height() * scale).ceil() as u32;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
-    pixmap.fill(resvg::tiny_skia::Color::from_rgba8(0, 0, 0, 255));
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
-
-    // tiny-skia pixels are premultiplied RGBA
-    let pixels = pixmap
-        .pixels()
-        .iter()
-        .flat_map(|pixel| {
-            let pixel = pixel.demultiply();
-            [pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]
-        })
-        .collect();
-    let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(width, height, pixels)?);
+    // Composited onto black to match the help overlay's background, since the
+    // emblem itself is transparent
+    let image = cilki::terminal::rasterize(
+        &cilki::emblem::WORKSET,
+        3.0,
+        Some((0, 0, 0)),
+    )?;
 
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     Some(picker.new_resize_protocol(image))
