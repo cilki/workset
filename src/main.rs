@@ -678,7 +678,7 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     outln!("Repositories in workspace ({}):", workspace.path);
     outln!();
 
-    let statuses = workset::scan_repos(&repos, workset::check_repo_status);
+    let statuses = workset::scan_repos(&repos, |repo| workset::check_repo_status(repo));
 
     for (repo, status) in repos.iter().zip(statuses) {
         let repo_name = workspace.relative_name(repo);
@@ -720,7 +720,7 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
     let mut no_commits = 0;
     let mut unreadable = 0;
 
-    for status in workset::scan_repos(&repos, workset::check_repo_status) {
+    for status in workset::scan_repos(&repos, |repo| workset::check_repo_status(repo)) {
         match status {
             Ok(workset::RepoStatus::Clean) => clean += 1,
             Ok(workset::RepoStatus::Dirty) => modified += 1,
@@ -922,7 +922,7 @@ fn complete_fish(maybe_workspace: Option<Workspace>) {
             // Completions run on every TAB press, so the per-repo worktree
             // walks behind these descriptions go to the whole machine at once
             let paths: Vec<PathBuf> = repos.iter().map(|(_, path)| path.clone()).collect();
-            let descriptions = workset::scan_repos(&paths, describe_workspace_repo);
+            let descriptions = workset::scan_repos(&paths, |repo| describe_workspace_repo(repo));
             for ((name, _), description) in repos.iter().zip(descriptions) {
                 outln!("{}\t{}", name, description);
             }

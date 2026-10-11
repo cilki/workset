@@ -548,6 +548,10 @@ fn live_linked_worktrees(git_dir: &Path) -> usize {
 /// Scan every repo in `repos` with `scan` on a pool of worker threads, and
 /// return what `scan` produced in the order the repos were given.
 ///
+/// A repo is whatever the caller needs to identify one — a path, or a row
+/// already carrying the name and tree position the UI gave it — so this is
+/// the one worker pool every repo scan in workset runs on.
+///
 /// Scanning a repo means walking its whole worktree: the index-to-worktree
 /// comparison every status check starts with stats each tracked file, and the
 /// directory walk that finds untracked files reads each directory. That is the
@@ -561,15 +565,16 @@ fn live_linked_worktrees(git_dir: &Path) -> usize {
 /// spreads a single repo's comparison over every core by default, which is
 /// right for the one-repo workspace and, with a worker per core, means cores²
 /// threads spawned for the work of one.
-pub fn scan_repos<T, F>(repos: &[PathBuf], scan: F) -> Vec<T>
+pub fn scan_repos<R, T, F>(repos: &[R], scan: F) -> Vec<T>
 where
-    F: Fn(&Path) -> T + Send + Sync,
+    R: Sync,
+    F: Fn(&R) -> T + Send + Sync,
     T: Send,
 {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let workers = cores.min(repos.len());
     if workers <= 1 {
-        return repos.iter().map(|repo| scan(repo)).collect();
+        return repos.iter().map(&scan).collect();
     }
 
     let next = std::sync::atomic::AtomicUsize::new(0);

@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1739,11 +1739,6 @@ fn scan_library_repo(mut repo: RepoInfo) -> RepoInfo {
 /// threads, streaming results to the UI thread. Runs on a background thread;
 /// exits early if the receiver is dropped.
 fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
-    enum ScanTask {
-        Workspace(RepoInfo),
-        Library(RepoInfo),
-    }
-
     let library_path = workspace.library_path();
 
     // Enumerate the repo set — and derive each row's tree path, which needs a
@@ -1762,8 +1757,10 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     // after another that open-per-repo is the whole of the wait before the
     // first paint, and it grows with the workspace and the library together,
     // so spread it over the cores the same way the status scan below is.
-    let workspace_tree_paths = crate::scan_repos(&workspace_paths, crate::remote_tree_path);
-    let library_tree_paths = crate::scan_repos(&library_paths, crate::remote_tree_path);
+    let workspace_tree_paths =
+        crate::scan_repos(&workspace_paths, |repo| crate::remote_tree_path(repo));
+    let library_tree_paths =
+        crate::scan_repos(&library_paths, |repo| crate::remote_tree_path(repo));
 
     let discovered_workspace: Vec<RepoInfo> = workspace_paths
         .into_iter()
@@ -1799,43 +1796,28 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
         return;
     }
 
-    let tasks: Mutex<Vec<ScanTask>> = Mutex::new(
-        discovered_workspace
-            .into_iter()
-            .map(ScanTask::Workspace)
-            .chain(discovered_library.into_iter().map(ScanTask::Library))
-            .collect(),
-    );
-
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let workers = cores.min(8);
-
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let tx = tx.clone();
-            let tasks = &tasks;
-            scope.spawn(move || {
-                // Each worker walks a repo of its own, so the cores are shared
-                // between the walks instead of each walk claiming all of them
-                crate::limit_status_walk_threads(cores / workers);
-                loop {
-                    let task = tasks.lock().unwrap().pop();
-                    let Some(task) = task else {
-                        break;
-                    };
-                    let event = match task {
-                        ScanTask::Workspace(repo) => {
-                            LoadEvent::Workspace(scan_workspace_repo(repo))
-                        }
-                        ScanTask::Library(repo) => LoadEvent::Library(scan_library_repo(repo)),
-                    };
-                    if tx.send(event).is_err() {
-                        break;
-                    }
-                }
-            });
+    // The status work runs on the same pool the two passes above used, which
+    // already gives each worker a repo of its own and limits that repo's
+    // status walk to the share of the cores the worker was given. The
+    // workspace goes first because it is the panel the user is looking at.
+    //
+    // A send that fails means the UI thread has gone — the user quit, or the
+    // view was rebuilt and this scan replaced — so the rest of the scan is
+    // work nobody will ever see.
+    let abandoned = AtomicBool::new(false);
+    let send = |event| {
+        if tx.send(event).is_err() {
+            abandoned.store(true, Ordering::Relaxed);
+        }
+    };
+    crate::scan_repos(&discovered_workspace, |repo| {
+        if !abandoned.load(Ordering::Relaxed) {
+            send(LoadEvent::Workspace(scan_workspace_repo(repo.clone())));
+        }
+    });
+    crate::scan_repos(&discovered_library, |repo| {
+        if !abandoned.load(Ordering::Relaxed) {
+            send(LoadEvent::Library(scan_library_repo(repo.clone())));
         }
     });
 }
