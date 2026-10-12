@@ -322,6 +322,18 @@ pub enum DropBlocker {
     /// that's gone.
     BorrowedGitDir,
 
+    /// `.git` is a symlink, which git accepts as a repository: the git
+    /// directory is whatever the link points at, which is not in this repo
+    /// and need not even be in the workspace.
+    ///
+    /// This is the same statement `BorrowedGitDir` makes — my git directory
+    /// lives elsewhere — written with a filesystem link instead of a
+    /// `gitdir:` file, and a drop has no more to work with here. A rename
+    /// moves the *link*, so the library would hold a pointer rather than the
+    /// repo, while everything the git directory holds stays where it is,
+    /// still shared with every other working tree pointing at it.
+    LinkedGitDir,
+
     /// The main worktree of this many live linked worktrees. Its git directory
     /// is the one they all point at, so moving it into the library (or
     /// deleting it) leaves every one of them pointing at a gitdir that isn't
@@ -335,6 +347,7 @@ impl DropBlocker {
         match self {
             Self::Outstanding(_) => "use --force to drop anyway",
             Self::BorrowedGitDir => "drop that repository instead",
+            Self::LinkedGitDir => "replace the link with the git directory it points at",
             Self::MainWorktree(1) => "remove it with 'git worktree remove' first",
             Self::MainWorktree(_) => "remove them with 'git worktree remove' first",
         }
@@ -350,6 +363,7 @@ impl std::fmt::Display for DropBlocker {
             // drop only ever blocks on the three statuses above
             Self::Outstanding(_) => f.write_str("outstanding changes"),
             Self::BorrowedGitDir => f.write_str("git directory belongs to another repository"),
+            Self::LinkedGitDir => f.write_str("git directory is a symlink to somewhere else"),
             Self::MainWorktree(1) => f.write_str("git directory shared with 1 linked worktree"),
             Self::MainWorktree(count) => {
                 write!(f, "git directory shared with {} linked worktrees", count)
@@ -386,6 +400,19 @@ impl DropReport {
 /// on its own: one half has no git directory and the other half's git
 /// directory is shared.
 fn worktree_blocker(repo: &Path) -> Option<DropBlocker> {
+    // What `.git` *is* decides whether there's a repo here the library can
+    // hold, so it is stat'd without following links: a symlink is not the
+    // directory it points at, and `is_file`/`is_dir` can't tell the two apart.
+    let git_path = repo.join(".git");
+    let Ok(git_kind) = std::fs::symlink_metadata(&git_path).map(|m| m.file_type()) else {
+        // Nothing there to classify, which `find_git_repositories` doesn't
+        // report, so the `.git` went away between the walk and now. Not a
+        // shape of repo to refuse — the drop runs into the same missing
+        // directory a moment later and says so — and refusing it here would
+        // name a blocker that isn't one.
+        return None;
+    };
+
     // A repo that owns its history has a `.git` directory. A linked worktree
     // and a submodule have a `.git` *file* holding `gitdir: <path>` instead,
     // and that path is inside the repository the git directory belongs to.
@@ -393,9 +420,30 @@ fn worktree_blocker(repo: &Path) -> Option<DropBlocker> {
     // file and fails with a bare ENOTDIR, which in a `workset drop` with no
     // pattern abandoned the whole request; `--delete` skips the library and
     // deletes the worktree while the owner keeps its registration.
-    let git_path = repo.join(".git");
-    if git_path.is_file() {
+    if git_kind.is_file() {
         return Some(DropBlocker::BorrowedGitDir);
+    }
+
+    // The third shape: `.git` is a symlink to a git directory, which git
+    // reads as an ordinary repository. Everything a drop does to a `.git`
+    // follows that link out of the repo — and, since the link may point
+    // anywhere, out of the workspace that `drop_repo`'s containment check
+    // just established:
+    //
+    //   * `store_in_library` writes `core.bare = true` into the *pointed-at*
+    //     git directory, which leaves every working tree using it with
+    //     "fatal: this operation must be run in a work tree"
+    //   * the rename that follows moves the link and not the directory, so
+    //     the library ends up holding a pointer to a git directory that is
+    //     still in use somewhere else, and `restore` hands back a worktree
+    //     wired to it rather than one of its own
+    //   * the worktree is then deleted, including anything `--force` was used
+    //     to discard, with nothing in the library that can bring it back
+    //
+    // A link is no more outstanding work than a `gitdir:` file is, so this is
+    // checked ahead of `force` as well.
+    if git_kind.is_symlink() {
+        return Some(DropBlocker::LinkedGitDir);
     }
 
     // The other half: the git directory under a main worktree is the one every
@@ -1649,6 +1697,61 @@ mod tests {
                 "only here"
             );
             assert!(worktree.join(".git").is_file());
+        }
+    }
+
+    /// A repo whose `.git` is a symlink is an ordinary repository to git, and
+    /// the git directory it names is not the repo's to give away: dropping it
+    /// wrote `core.bare = true` into a directory that may sit anywhere on the
+    /// machine — breaking every working tree that reads through it — moved the
+    /// link rather than the git directory into the library, and then deleted
+    /// the worktree, leaving nothing behind that a restore could rebuild.
+    #[cfg(unix)]
+    #[test]
+    fn drop_refuses_a_symlinked_git_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        // The git directory lives outside the workspace, as it does for a
+        // checkout that keeps its history on another disk — or for one that
+        // arrived as files with the link already in it
+        let git_dir = temp_dir.path().join("elsewhere/tool.git");
+        fs::create_dir_all(&git_dir).unwrap();
+        gix::init_bare(&git_dir).unwrap();
+        let config = git_dir.join("config");
+        let config_before = fs::read_to_string(&config).unwrap();
+
+        let repo = PathBuf::from(&workspace.path).join("tool");
+        fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(&git_dir, repo.join(".git")).unwrap();
+        fs::write(repo.join("notes.txt"), "only here").unwrap();
+
+        let pattern = "tool".parse::<RepoPattern>().unwrap();
+        // The link is not outstanding work the user can decide to discard, so
+        // `--force` doesn't get past it either
+        for (delete, force) in [(false, false), (false, true), (true, true)] {
+            let report = workspace.drop(&pattern, delete, force).unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(
+                report.skipped,
+                vec![("tool".to_string(), DropBlocker::LinkedGitDir)]
+            );
+            // The worktree, and the git directory the link points at, are
+            // exactly as they were
+            assert_eq!(
+                fs::read_to_string(repo.join("notes.txt")).unwrap(),
+                "only here"
+            );
+            assert!(
+                fs::symlink_metadata(repo.join(".git"))
+                    .unwrap()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read_to_string(&config).unwrap(), config_before);
+            assert!(!workspace.library_contains("tool"));
         }
     }
 

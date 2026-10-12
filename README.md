@@ -169,6 +169,18 @@ behind, which drops as usual:
   github.com/jqlang/jq - ✓ dropped
 ```
 
+A repo whose `.git` is a *symlink* stays put for the same reason. git reads one
+as an ordinary repository, but the git directory is wherever the link points —
+another disk, your home directory, anywhere — so there is nothing here the
+library can take: moving the link would store a pointer rather than the repo
+and leave its history where it is, still shared with whatever else reads
+through the same link.
+
+```sh
+❯ workset drop --force github.com/jqlang/jq
+  github.com/jqlang/jq - ⚠ kept (git directory is a symlink to somewhere else, replace the link with the git directory it points at)
+```
+
 Every command reports what it did and exits non-zero when it couldn't do all of
 it, so `workset` composes with other commands:
 
