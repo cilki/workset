@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
-cilki = { version = "0.2", path = "../cilki", features = ["project-workset"] }
+cilki = { version = "0.2", features = ["project-workset"] }
 crossterm = { version = "0.29", optional = true }
 fuzzy-matcher = { version = "0.3", optional = true }
 gix = { version = "0.89.0", features = [

@@ -337,6 +337,8 @@ dependencies = [
 [[package]]
 name = "cilki"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e758295f5a8977ecbe3a0cedb43cbbb03074ba9bf57352e220205398b0a99e7"
 dependencies = [
  "clap",
  "crossterm",
