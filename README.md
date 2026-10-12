@@ -3,7 +3,7 @@
 </p>
 
 ![License](https://img.shields.io/github/license/fossable/workset)
-![Build](https://github.com/fossable/workset/actions/workflows/test.yml/badge.svg)
+![Build](https://github.com/fossable/workset/actions/workflows/ci.yml/badge.svg)
 ![GitHub repo size](https://img.shields.io/github/repo-size/fossable/workset)
 ![Stars](https://img.shields.io/github/stars/fossable/workset?style=social)
 
@@ -138,6 +138,32 @@ checked out: a branch you left behind and a `git stash` hold commits that exist
 nowhere else just as much as `HEAD` does. A repo that was never pushed anywhere
 — no remote, or nothing fetched from one yet — has no published history to
 compare against, so it isn't measured this way at all.
+
+A submodule is half-kept. Its git directory lives under the parent's `.git`, so
+it travels into the library with everything else, but its checkout is part of
+the parent's working tree, which the drop deletes. A round trip therefore brings
+the submodule's history back and leaves its directory empty, and neither `list`
+nor `git status` in the parent points that out — both call the repo clean.
+`git submodule update` fills the directory in again from the git directory that
+came back, without fetching anything:
+
+```sh
+❯ git -C github.com/jqlang/jq submodule update --init
+Submodule path 'vendor/oniguruma': checked out '4ef89209a239c1aea328cf13c05a2807e5c146d1'
+
+❯ workset drop ./github.com/jqlang/jq
+  github.com/jqlang/jq - ✓ dropped
+❯ workset restore jq
+Restored github.com/jqlang/jq
+
+# The submodule's directory came back empty, and git calls it uninitialized
+❯ ls -A github.com/jqlang/jq/vendor/oniguruma
+❯ git -C github.com/jqlang/jq submodule status
+-4ef89209a239c1aea328cf13c05a2807e5c146d1 vendor/oniguruma
+
+❯ git -C github.com/jqlang/jq submodule update
+Submodule path 'vendor/oniguruma': checked out '4ef89209a239c1aea328cf13c05a2807e5c146d1'
+```
 
 A repository **workset** can't read at all is kept too, and reported as
 `✗ unreadable` by `list`. Not every repository git can write can be read by the
