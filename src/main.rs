@@ -20,7 +20,7 @@ mod colors {
 /// away. Used through [`outln!`] and [`out!`] for everything workset prints.
 ///
 /// Rust ignores SIGPIPE, so a reader that stops before workset is done writing
-/// — `workset list | head`, `workset status | grep -q`, a pager the user quits
+/// — `workset list | head`, `workset ls | grep -q`, a pager the user quits
 /// — doesn't kill the process; the next write fails with `BrokenPipe` instead.
 /// `println!` answers a failed write by panicking, so what the user got was a
 /// panic message and a backtrace note on stderr and exit 101, where every

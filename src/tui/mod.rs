@@ -764,7 +764,7 @@ fn run_app<B: ratatui::backend::Backend>(
 
             let code = match classify_key(&key) {
                 // Ctrl+C quits from any mode, including the help overlay and
-                // the search and clone prompts
+                // the search prompt
                 KeyBinding::Quit => return Ok(Action::None),
                 // Every other binding is the bare character, so a modified one
                 // is not it: Ctrl+D is not 'd' and must not drop the selection
