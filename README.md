@@ -132,6 +132,13 @@ Losing `target/` is usually the point — it's what makes a dropped repo cheap t
 keep. Losing an untracked-but-ignored `.env` is not, so keep anything you can't
 regenerate either committed or outside the repo.
 
+A commit no remote has makes the repo `⚠ unpushed`, and a drop keeps it where
+it is until you pass `--force`. Every ref counts, not just the branch you have
+checked out: a branch you left behind and a `git stash` hold commits that exist
+nowhere else just as much as `HEAD` does. A repo that was never pushed anywhere
+— no remote, or nothing fetched from one yet — has no published history to
+compare against, so it isn't measured this way at all.
+
 A repository **workset** can't read at all is kept too, and reported as
 `✗ unreadable` by `list`. Not every repository git can write can be read by the
 library **workset** uses, so rather than guess at what such a repo holds, it is

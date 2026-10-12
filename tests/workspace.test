@@ -178,6 +178,61 @@ testDropRefusesUnpushedRepo() {
 	[ ! -e .workset/unpushed-repo ]
 }
 
+## The branch that happens to be checked out says nothing about the rest of
+## them: a repo whose main is in sync still holds the only copy of every commit
+## on a branch nobody pushed, and --delete destroys it rather than storing it
+testDropRefusesUnpushedBranchBesideHead() {
+	newWorkspace
+	git init -q --bare "$PWD/../remote.git"
+	createRepo branchy 1
+	git -C branchy remote add origin "$PWD/../remote.git"
+	git -C branchy push -q -u origin main
+
+	git -C branchy checkout -q -b side
+	echo "only here" >branchy/side.txt
+	git -C branchy add side.txt
+	git -C branchy commit -q -m "only on side"
+	side=$(git -C branchy rev-parse side)
+	git -C branchy checkout -q main
+
+	workset list | grep -- "branchy - ⚠ unpushed"
+
+	for flags in "" "--delete"; do
+		output=$(workset drop $flags branchy 2>&1) && exit 1
+		echo "$output" | grep -- "branchy - ⚠ kept (unpushed commits"
+		[ "$(git -C branchy rev-parse side)" = "$side" ]
+	done
+
+	# Pushed, there is nothing here only, and the repo drops like any other
+	git -C branchy push -q origin side
+	workset list | grep -- "branchy - ✓ clean"
+	workset drop branchy | grep -- "branchy - ✓ dropped"
+}
+
+## A stash holds commits that are on no branch and no remote, and it leaves a
+## clean worktree behind, so nothing else about the repo gives it away
+testDropRefusesStashedWork() {
+	newWorkspace
+	git init -q --bare "$PWD/../remote.git"
+	createRepo stashed 1
+	git -C stashed remote add origin "$PWD/../remote.git"
+	git -C stashed push -q -u origin main
+
+	echo "work in progress" >stashed/file0.txt
+	git -C stashed stash push -q
+	[ -z "$(git -C stashed status --porcelain)" ]
+
+	output=$(workset drop --delete stashed 2>&1) && exit 1
+	echo "$output" | grep -- "stashed - ⚠ kept (unpushed commits"
+	[ -n "$(git -C stashed stash list)" ]
+
+	# A drop to the library keeps the stash, which is what a restore brings
+	# back, so --force is the way to say so
+	workset drop --force stashed | grep -- "stashed - ✓ dropped"
+	workset restore stashed
+	[ -n "$(git -C stashed stash list)" ]
+}
+
 ## A linked worktree ('git worktree add') has no git directory of its own, so
 ## there is nothing for the library to hold and no flag that changes that
 testDropRefusesLinkedWorktree() {

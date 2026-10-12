@@ -348,7 +348,11 @@ pub enum RepoStatus {
     /// uncommitted work is [`Dirty`](Self::Dirty), because that is the fact
     /// that matters to anything destructive.
     NoCommits,
-    /// Repository has unpushed commits (but is otherwise clean)
+    /// Repository holds commits no remote has (but is otherwise clean).
+    ///
+    /// Any ref counts, not just the checked-out branch: a branch `git
+    /// checkout` left behind, and a stash, hold commits that exist nowhere
+    /// else just as much as HEAD does.
     Unpushed,
     /// The repository couldn't be read, so what it holds is unknown. It may be
     /// full of work that exists nowhere else.
@@ -654,11 +658,18 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
         None => return Ok(RepoStatus::Unknown),
         Some(false) => {}
     }
+    // Which commits the repo holds that no remote does is a question about
+    // its refs, not about the one HEAD happens to point at, so it is asked
+    // before HEAD is looked at at all
+    match unpublished_work(&repo) {
+        Unpublished::Some => return Ok(RepoStatus::Unpushed),
+        Unpublished::Unreadable => return Ok(RepoStatus::Unknown),
+        Unpublished::None => {}
+    }
     Ok(match head_state(&repo) {
         HeadState::Unborn => RepoStatus::NoCommits,
         HeadState::Unreadable => RepoStatus::Unknown,
-        HeadState::Detached => RepoStatus::Clean,
-        HeadState::Branch(head_ref) => check_unpushed_status(&repo, head_ref),
+        HeadState::Detached | HeadState::Branch => RepoStatus::Clean,
     })
 }
 
@@ -685,15 +696,19 @@ pub fn check_repo_status_and_modification_time(
         return Ok((RepoStatus::Dirty, Some(commit_time.max(dirty_time))));
     }
 
-    let status = match head_state(&repo) {
-        HeadState::Unborn => {
-            // No commits and a clean worktree: no timestamp to report at all,
-            // so callers don't render a spurious "56y ago" from the UNIX epoch.
-            return Ok((RepoStatus::NoCommits, None));
-        }
-        HeadState::Unreadable => return Ok((RepoStatus::Unknown, None)),
-        HeadState::Detached => RepoStatus::Clean,
-        HeadState::Branch(head_ref) => check_unpushed_status(&repo, head_ref),
+    let status = match unpublished_work(&repo) {
+        Unpublished::Some => RepoStatus::Unpushed,
+        Unpublished::Unreadable => return Ok((RepoStatus::Unknown, None)),
+        Unpublished::None => match head_state(&repo) {
+            HeadState::Unborn => {
+                // No commits and a clean worktree: no timestamp to report at
+                // all, so callers don't render a spurious "56y ago" from the
+                // UNIX epoch.
+                return Ok((RepoStatus::NoCommits, None));
+            }
+            HeadState::Unreadable => return Ok((RepoStatus::Unknown, None)),
+            HeadState::Detached | HeadState::Branch => RepoStatus::Clean,
+        },
     };
     Ok((status, get_last_commit_time(&repo).ok()))
 }
@@ -714,9 +729,9 @@ fn open_repo(repo_path: &Path) -> Option<gix::Repository> {
 }
 
 /// Where a repository's HEAD points
-enum HeadState<'repo> {
-    /// At a branch, which may have an upstream to compare against
-    Branch(gix::Reference<'repo>),
+enum HeadState {
+    /// At a branch
+    Branch,
     /// Straight at a commit, as during a bisect, a rebase or after an
     /// explicit `git checkout --detach`. There is history, but no branch and
     /// therefore no upstream.
@@ -733,7 +748,7 @@ enum HeadState<'repo> {
 /// the two look alike through `try_into_referent` — it yields no reference
 /// either way — and calling a repo full of history "no commits" is a lie the
 /// status line, the summary counts and the TUI all repeat.
-fn head_state(repo: &gix::Repository) -> HeadState<'_> {
+fn head_state(repo: &gix::Repository) -> HeadState {
     let Ok(head) = repo.head() else {
         return HeadState::Unreadable;
     };
@@ -741,58 +756,109 @@ fn head_state(repo: &gix::Repository) -> HeadState<'_> {
         return HeadState::Unborn;
     }
     match head.try_into_referent() {
-        Some(head_ref) => HeadState::Branch(head_ref),
+        Some(_) => HeadState::Branch,
         None => HeadState::Detached,
     }
 }
 
-/// Classify a repository with no uncommitted changes as Clean or Unpushed
-fn check_unpushed_status(repo: &gix::Repository, head_ref: gix::Reference<'_>) -> RepoStatus {
-    let local_branch = head_ref.name();
-    let remote_ref_name =
-        match repo.branch_remote_tracking_ref_name(local_branch, gix::remote::Direction::Fetch) {
-            Some(Ok(name)) => name,
-            Some(Err(e)) => {
-                debug!(error = %e, "Failed to get remote tracking ref");
-                return RepoStatus::Clean;
-            }
-            None => {
-                debug!("No upstream branch configured");
-                return RepoStatus::Clean;
-            }
-        };
+/// What a repository holds that no remote of its own does
+enum Unpublished {
+    /// Nothing: every commit the repo holds is on a remote, or the repo has
+    /// no remote state to compare against
+    None,
+    /// At least one commit, so there is work here that exists nowhere else
+    Some,
+    /// The refs couldn't be read, so what the repo holds is unknown
+    Unreadable,
+}
 
-    // Try to find the remote ref
-    let has_unpushed = match repo.find_reference(remote_ref_name.as_ref()) {
-        Ok(remote_ref) => {
-            let local_commit = match head_ref.id().object() {
-                Ok(obj) => obj.id,
-                Err(e) => {
-                    warn!(error = %e, "Failed to get local commit");
-                    return RepoStatus::Clean;
-                }
-            };
-
-            let remote_commit = match remote_ref.id().object() {
-                Ok(obj) => obj.id,
-                Err(e) => {
-                    warn!(error = %e, "Failed to get remote commit");
-                    return RepoStatus::Clean;
-                }
-            };
-
-            local_commit != remote_commit
-        }
-        Err(_) => {
-            debug!("Remote ref not found, assuming no unpushed commits");
-            false
-        }
+/// Find out whether a repository holds commits that none of its remotes have:
+/// the work a `drop --delete` destroys, and the work a plain drop takes out of
+/// sight into the library.
+///
+/// Every local branch is asked about, not just the checked-out one. A branch
+/// `git checkout` left behind holds its commits just as firmly as HEAD's does,
+/// and nothing else in the workspace mentions them — which is how `drop
+/// --delete` used to report a repo clean and delete the only copy of a feature
+/// branch with it. The stash is included for the same reason: its commits hang
+/// off `refs/stash` and no branch at all.
+///
+/// Remote-tracking refs are what "no remote has it" is measured against, so a
+/// commit reachable from one of them is published, however far behind the ref
+/// is — a merged branch left pointing into history is not unpushed work. A
+/// repo with no remote-tracking refs at all (no remote, or a remote nothing
+/// was ever fetched from) has nothing to measure against, and reporting every
+/// local-only repo as unpushed would say nothing about any of them, so those
+/// report [`Unpublished::None`] as they always have.
+fn unpublished_work(repo: &gix::Repository) -> Unpublished {
+    let Ok(references) = repo.references() else {
+        // Refs that can't be read may name anything, and nothing may conclude
+        // from that the repo holds no work
+        return Unpublished::Unreadable;
+    };
+    let (Ok(remotes), Ok(locals)) = (references.remote_branches(), references.local_branches())
+    else {
+        return Unpublished::Unreadable;
     };
 
-    if has_unpushed {
-        RepoStatus::Unpushed
-    } else {
-        RepoStatus::Clean
+    // Everything the repo's remotes are known to hold. `refs/remotes/<remote>/HEAD`
+    // is symbolic and names another of these, so skipping it loses nothing.
+    let published: Vec<gix::ObjectId> = remotes
+        .filter_map(|reference| Some(reference.ok()?.try_id()?.detach()))
+        .collect();
+    if published.is_empty() {
+        debug!("No remote-tracking refs to compare against");
+        return Unpublished::None;
+    }
+
+    let mut local = Vec::new();
+    for reference in locals {
+        let Ok(reference) = reference else {
+            return Unpublished::Unreadable;
+        };
+        if let Some(id) = reference.try_id() {
+            local.push(id.detach());
+        }
+    }
+    // A stash is reachable from this ref and nothing else
+    if let Ok(stash) = repo.find_reference("refs/stash")
+        && let Some(id) = stash.try_id()
+    {
+        local.push(id.detach());
+    }
+    // A detached HEAD is a commit the repo holds like any other: mid-rebase,
+    // mid-bisect, or just committed onto without a branch
+    if let Ok(head) = repo.head_id() {
+        local.push(head.detach());
+    }
+
+    // The tip of a branch that was pushed is published along with all of its
+    // history, so the common case is settled without reading a commit
+    if local.iter().all(|id| published.contains(id)) {
+        return Unpublished::None;
+    }
+
+    // What's left needs the graph: a tip that isn't a remote's own tip may
+    // still be inside the history one of them holds. Hiding the published tips
+    // leaves the walk yielding exactly the commits that are reachable from a
+    // local ref and from no remote-tracking ref, so one commit out of it is
+    // enough of an answer.
+    let walk = repo
+        .rev_walk(local)
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ))
+        .with_hidden(published)
+        .all();
+    match walk.map(|mut walk| walk.next()) {
+        Ok(None) => Unpublished::None,
+        Ok(Some(Ok(_))) => Unpublished::Some,
+        // History that can't be walked can't vouch for anything in it, and a
+        // repo that may be holding the only copy of something is not clean
+        Ok(Some(Err(e))) | Err(e) => {
+            warn!(error = %e, "Failed to walk for unpublished commits");
+            Unpublished::Unreadable
+        }
     }
 }
 
@@ -2372,6 +2438,120 @@ mod tests {
         // Uncommitted work outranks where HEAD happens to point, so a drop
         // still refuses the repo
         assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+    }
+
+    /// A repo with one commit on `main`, pushed to a bare remote beside it,
+    /// so that `origin/main` is a real tracking ref
+    fn repo_with_a_remote(temp_dir: &Path, repo: &Path) {
+        git(temp_dir, &["init", "--quiet", "--bare", "remote.git"]);
+        repo_with_a_commit(repo);
+        fs::write(repo.join("file.txt"), "published\n").unwrap();
+        git(repo, &["add", "file.txt"]);
+        git(repo, &["commit", "--quiet", "-m", "published"]);
+        git(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &temp_dir.join("remote.git").to_string_lossy(),
+            ],
+        );
+        git(
+            repo,
+            &["push", "--quiet", "--set-upstream", "origin", "main"],
+        );
+    }
+
+    /// Whether a commit exists nowhere but this repo is a question about all
+    /// of its refs. Asking it of the checked-out branch alone called a repo
+    /// clean while a branch beside it — or a stash — held the only copy of
+    /// somebody's work.
+    #[test]
+    fn commits_on_any_ref_can_be_unpushed() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("repo");
+        repo_with_a_remote(temp_dir.path(), &repo);
+        let published = git(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+
+        // A branch HEAD doesn't point at, holding a commit no remote has
+        git(&repo, &["checkout", "--quiet", "-b", "side"]);
+        git(
+            &repo,
+            &["commit", "--quiet", "--allow-empty", "-m", "only on side"],
+        );
+        git(&repo, &["checkout", "--quiet", "main"]);
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Unpushed);
+        // Both ways in report the same repo the same way
+        let (status, _) = check_repo_status_and_modification_time(&repo).unwrap();
+        assert_eq!(status, RepoStatus::Unpushed);
+
+        // Pushing the branch is what makes the repo clean again
+        git(&repo, &["push", "--quiet", "origin", "side"]);
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+
+        // A branch left behind in published history is not unpushed work: its
+        // commits are on the remote, however far back the branch points
+        git(
+            &repo,
+            &["commit", "--quiet", "--allow-empty", "-m", "newer"],
+        );
+        git(&repo, &["push", "--quiet", "origin", "main"]);
+        git(&repo, &["branch", "merged", &published]);
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+
+        // A stash's commits hang off refs/stash and nothing else, so they are
+        // the only copy too — and it leaves a clean worktree behind, which is
+        // what hid it from the dirty check
+        fs::write(repo.join("file.txt"), "work in progress\n").unwrap();
+        git(&repo, &["stash", "push", "--quiet"]);
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Unpushed);
+        git(&repo, &["stash", "drop", "--quiet"]);
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+    }
+
+    /// `--delete` destroys the repo instead of storing it, so the only copy of
+    /// a branch nobody pushed goes with it. The drop gate exists to stop
+    /// exactly that, and the checked-out branch being in sync says nothing
+    /// about the rest of them.
+    #[test]
+    fn drop_refuses_a_repo_whose_other_branch_is_unpushed() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("repo");
+        repo_with_a_remote(temp_dir.path(), &repo);
+
+        git(&repo, &["checkout", "--quiet", "-b", "side"]);
+        fs::write(repo.join("side.txt"), "only here\n").unwrap();
+        git(&repo, &["add", "side.txt"]);
+        git(&repo, &["commit", "--quiet", "-m", "only on side"]);
+        let side = git(&repo, &["rev-parse", "side"]);
+        git(&repo, &["checkout", "--quiet", "main"]);
+
+        let pattern = "repo".parse::<RepoPattern>().unwrap();
+        for delete in [false, true] {
+            let report = workspace.drop(&pattern, delete, false).unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(
+                report.skipped,
+                vec![(
+                    "repo".to_string(),
+                    DropBlocker::Outstanding(RepoStatus::Unpushed)
+                )]
+            );
+            assert_eq!(git(&repo, &["rev-parse", "side"]), side);
+        }
+
+        // Having pushed it, there is nothing left here only, and the repo
+        // drops like any other
+        git(&repo, &["push", "--quiet", "origin", "side"]);
+        let report = workspace.drop(&pattern, false, false).unwrap();
+        assert_eq!(report.dropped, vec!["repo".to_string()]);
+        assert!(!repo.exists());
     }
 
     /// A repository whose config gix refuses to load, which is what
