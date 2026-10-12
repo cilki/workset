@@ -36,7 +36,8 @@ and `restore` place a repo at its full path under the workspace root, and `list`
 
 # A clone URL is a pattern too, so the URL a forge gives you can be pasted
 # straight in — scheme, credentials and the '.git' suffix are all dropped, and
-# every spelling below names that same github.com/jqlang/jq
+# every spelling below names that same github.com/jqlang/jq. Naming is all they
+# do: the fetch is over HTTPS whichever you paste (see "What clone can reach")
 ❯ workset clone https://github.com/jqlang/jq.git
 ❯ workset clone git@github.com:jqlang/jq.git
 
@@ -86,6 +87,55 @@ No repository in the workspace matches 'no-such-repo'
 1
 ```
 
+### What `clone` can reach
+
+A pattern names a repo by provider and path, and that is all `clone` takes from
+it: the URL it fetches is always `https://<provider>/<path>`. The SSH spelling
+is accepted as a way of writing the pattern, not as a choice of transport, so it
+fetches over HTTPS like every other spelling of the same repo — and a pattern
+with no provider in it names nothing to fetch from at all:
+
+```sh
+❯ workset clone git@github.com:jqlang/jq.git
+Cloning https://github.com/jqlang/jq
+Cloned github.com/jqlang/jq
+
+❯ workset clone jq
+Failed to clone 'jq': No provider specified. Use format like github.com/user/repo
+❯ echo $?
+1
+```
+
+The fetch also runs with your git configuration left out of it, so none of what
+you have set up for `git clone` applies: no `credential.helper`, no
+`url.<base>.insteadOf` rewrite. A repository that isn't readable anonymously
+therefore ends in a prompt for a username and password, and in anything
+non-interactive it ends in a failure:
+
+```sh
+❯ workset clone github.com/jqlang/private
+Cloning https://github.com/jqlang/private
+Failed to clone 'github.com/jqlang/private': Failed to obtain credentials: Couldn't obtain Username for https://github.com: ...
+❯ echo $?
+1
+```
+
+A failed clone leaves nothing behind — the directories it created on the way down
+are pruned again — and nothing stops you from fetching the repo yourself. A repo
+is in your working set because it sits at a path under the workspace root, not
+because `workset clone` put it there, so cloning into that path with git is how
+you use an SSH key, a credential helper, or a forge that needs either:
+
+```sh
+❯ git clone git@github.com:jqlang/jq github.com/jqlang/jq
+❯ workset list
+Repositories in workspace (/home/user/workspace):
+
+  github.com/jqlang/jq - ✓ clean
+
+Library (/home/user/workspace/.workset): 0 repository(ies)
+```
+
 ### What a drop keeps
 
 A drop stores the repository, not the directory: the repo's `.git` directory is
@@ -114,6 +164,8 @@ target/
 Repositories in workspace (/home/user/workspace):
 
   github.com/jqlang/jq - ✓ clean
+
+Library (/home/user/workspace/.workset): 0 repository(ies)
 
 ❯ workset drop ./github.com/jqlang/jq
   github.com/jqlang/jq - ✓ dropped
