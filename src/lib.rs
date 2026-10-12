@@ -456,10 +456,10 @@ const WORKERS_PER_CORE: usize = 2;
 /// Scanning a repo means walking its whole worktree: the index-to-worktree
 /// comparison every status check starts with stats each tracked file, and the
 /// directory walk that finds untracked files reads each directory. That is the
-/// bulk of the work behind `workset list`, `workset status` and the shell
-/// completions, and done one repo after another it takes the sum of every
-/// repo's walk while the rest of the machine idles. The walks don't depend on
-/// each other at all — each one reads one repo and writes nothing.
+/// bulk of the work behind `workset list`, the TUI and the shell completions,
+/// and done one repo after another it takes the sum of every repo's walk while
+/// the rest of the machine idles. The walks don't depend on each other at all
+/// — each one reads one repo and writes nothing.
 ///
 /// Each worker is also told how many threads it may use for its own walk, so
 /// the walks share the cores rather than each one claiming all of them: gix
@@ -1301,11 +1301,11 @@ impl Workspace {
                 // thrown away here, where only the yes or no is wanted. The
                 // stats git itself uses answer the same question for a
                 // fraction of the cost, and this walk is not a rare one: it
-                // runs before the TUI's first paint, on every `workset
-                // status`, before every restore, and on every TAB press
-                // through the shell completions. Its cost grows with the
-                // library, which is the part of a workspace this tool exists
-                // to let you grow.
+                // runs before the TUI's first paint, on every `workset list`,
+                // before every restore, and on every TAB press through the
+                // shell completions. Its cost grows with the library, which
+                // is the part of a workspace this tool exists to let you
+                // grow.
                 if is_git_dir(current_path) || current_path.join(".git").exists() {
                     // Get the relative path from the library base
                     if let Ok(rel_path) = current_path.strip_prefix(base_path) {
