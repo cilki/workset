@@ -179,6 +179,63 @@ Remove the key (`git config --unset core.worktree`) and the repo reads normally;
 a drop that takes it anyway, with `--force`, leaves the key behind rather than
 storing it, so what comes back out of the library reports on its own directory.
 
+For an unreadable repo, `--force` may be a one-way trip. The round trip above is
+only as good as what the library **workset** uses can read: a restore has to
+open the entry it moved out of the library and check out whatever `HEAD` points
+at, which is the reading that failed when the repo was still in the workspace.
+A repository using sha256 object ids is the clearest case — git writes it,
+**workset** never reads it, and so no restore of it succeeds.
+
+```sh
+❯ git init --object-format=sha256 github.com/jqlang/jq
+❯ git -C github.com/jqlang/jq commit -q --allow-empty -m "first"
+
+❯ workset list
+Repositories in workspace (/home/user/workspace):
+
+  github.com/jqlang/jq - ✗ unreadable
+
+Library (/home/user/workspace/.workset): 0 repository(ies)
+
+❯ workset drop github.com/jqlang/jq
+  github.com/jqlang/jq - ⚠ kept (unreadable repository, use --force to drop anyway)
+❯ echo $?
+1
+
+# --force stores it, and the drop reports success
+❯ workset drop --force github.com/jqlang/jq
+  github.com/jqlang/jq - ✓ dropped
+
+# ...but every restore of it fails from here on
+❯ workset restore jq
+Failed to restore github.com/jqlang/jq: Repository configuration could not be loaded
+❯ echo $?
+1
+```
+
+A failed restore leaves the library entry untouched, so nothing is lost —
+getting the repo back is just a job for `git` rather than for **workset**. The
+entry *is* the repo's git directory, kept bare, so moving it back and checking
+it out returns every branch, tag and stash that was dropped:
+
+```sh
+❯ mkdir -p github.com/jqlang/jq
+❯ mv .workset/github.com/jqlang/jq github.com/jqlang/jq/.git
+❯ git -C github.com/jqlang/jq config core.bare false
+❯ git -C github.com/jqlang/jq checkout -f
+```
+
+That recovery works whatever made the repo unreadable, but it isn't always
+needed, because not every `✗ unreadable` repo is stuck. The `core.worktree` repo
+above is the counter-example: the key that made it unreadable is the one a
+forced drop leaves behind, so what lands in the library *is* readable and the
+restore succeeds as usual. A repo using git's `reftable` ref storage
+fails like the sha256 one, stopping a step further along at
+`The reference at "HEAD" could not be decoded`. Which error you get says why
+**workset** couldn't read the repo, not whether it will come back, so a
+`--force` drop of an `✗ unreadable` repo is worth confirming with a restore
+before you count on it.
+
 ### What a drop won't touch at all
 
 A drop moves a git directory into the library and deletes the working tree
