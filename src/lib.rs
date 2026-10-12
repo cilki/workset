@@ -228,6 +228,64 @@ pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
     Ok(repo)
 }
 
+/// Rewrite `core.bare` in the given git directory's own config file. The
+/// library keeps its copies bare and a workspace checkout is not, so a repo
+/// is flipped on its way in and back on its way out.
+fn set_bare_in_config(git_dir: &Path, bare: bool) -> Result<()> {
+    let config_path = git_dir.join("config");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(&config_path, set_core_bare(&config, bare))?;
+    Ok(())
+}
+
+/// Check out the worktree a restored git directory describes, the way the
+/// final step of a clone does: build an index from what HEAD points at and
+/// write those files into `worktree`.
+///
+/// `git_dir` is the repository that just moved out of the library, and
+/// `worktree` the directory it now sits in.
+fn check_out_worktree(worktree: &Path, git_dir: &Path) -> Result<()> {
+    // The repo has to stop being bare before it has a worktree to check out
+    // into at all
+    set_bare_in_config(git_dir, false)?;
+
+    let repo = gix::open(worktree)?;
+    let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
+        bail!("{} has no worktree to check out into", worktree.display());
+    };
+
+    // An entry the library holds without any commits checks out nothing, and
+    // an empty worktree matches no index at all — not even the one the repo
+    // was carrying when it was dropped, which described files that aren't
+    // there.
+    let Some(head) = repo.head()?.try_peel_to_id()? else {
+        let _ = std::fs::remove_file(git_dir.join("index"));
+        return Ok(());
+    };
+
+    let tree = head.object()?.peel_to_tree()?.id;
+    let mut index = repo.index_from_tree(&tree)?;
+    let mut options =
+        repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    options.destination_is_initially_empty = true;
+
+    gix::worktree::state::checkout(
+        &mut index,
+        workdir,
+        repo.objects.clone().into_arc()?,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        &std::sync::atomic::AtomicBool::new(false),
+        options,
+    )?;
+
+    // The index is what tells every later status check that the worktree
+    // matches the commit it was checked out from; without it the whole
+    // worktree reads as untracked.
+    index.write(Default::default())?;
+    Ok(())
+}
+
 /// Tree-grouping path derived from a git remote URL, e.g.
 /// "git@github.com:fossable/workset.git" -> "github.com/fossable/workset".
 /// None for URLs without a host (local paths, file://).
@@ -1245,9 +1303,7 @@ impl Workspace {
         }
 
         // Set core.bare=true by modifying the config file directly
-        let config_path = std::path::Path::new(&source).join("config");
-        let config_content = std::fs::read_to_string(&config_path)?;
-        std::fs::write(&config_path, set_core_bare(&config_content, true))?;
+        set_bare_in_config(Path::new(&source), true)?;
 
         debug!(source = %source, dest = %dest, "Storing repository in library");
 
@@ -1276,6 +1332,14 @@ impl Workspace {
     /// library whole, so every local branch, tag, reflog and config key the
     /// repo had when it was dropped comes back with it.
     ///
+    /// The worktree around it is checked out from the git directory that just
+    /// arrived. It used to be cloned out of the library instead, and the
+    /// clone's own git directory thrown away again immediately — which meant
+    /// every restore wrote a second copy of the repo's whole object store to
+    /// disk and then deleted it, for nothing but the worktree the checkout at
+    /// the end of it produced. That copy is the bulk of what a restore costs,
+    /// and it grows with the repo's history rather than with its worktree.
+    ///
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
     pub fn restore_from_library(&self, relative_path: &str) -> Result<()> {
         let library_path = self.library_path();
@@ -1290,42 +1354,41 @@ impl Workspace {
             );
         }
 
-        // Cloning out of the library is what materializes the worktree; its
-        // git directory is thrown away again right below. A clone only
-        // creates a local branch for HEAD, so keeping it would silently drop
-        // every other branch (and any commit only reachable from one).
-        self.clone_into(&source.to_string_lossy(), &dest)?;
+        // A restore materializes a worktree where the workspace has none, so a
+        // path already holding something is not this repo's to write over —
+        // and the rollback below would take whatever is there with it. The
+        // clone this replaced refused a non-empty destination for the same
+        // reason.
+        if std::fs::read_dir(&dest).is_ok_and(|mut entries| entries.next().is_some()) {
+            bail!("{} already exists in the workspace", relative_path);
+        }
 
         let git_dir = dest.join(".git");
-        let discarded = dest.join(".git.workset-restore");
-        std::fs::rename(&git_dir, &discarded)?;
+        let root = PathBuf::from(&self.path);
+        std::fs::create_dir_all(&dest).map_err(|e| {
+            anyhow::anyhow!("Failed to create {} in the workspace: {}", relative_path, e)
+        })?;
+
+        // The git directory moves, rather than being copied: that is what
+        // keeps every branch, tag and reflog the repo had, and it is a rename
+        // within the workspace, so it costs nothing per object.
         if let Err(e) = std::fs::rename(&source, &git_dir) {
-            // Put the clone back so the worktree isn't left without a repo
-            let _ = std::fs::rename(&discarded, &git_dir);
-            return Err(anyhow::anyhow!(
-                "Failed to move repository out of the library: {}",
-                e
-            ));
+            prune_empty_dirs(&root, &dest);
+            bail!("Failed to move repository out of the library: {}", e);
         }
 
-        // The index the repo had when it was dropped describes the worktree as
-        // it was then, which the fresh checkout only matches if the drop was
-        // clean. The clone's index always matches what it just wrote, so adopt
-        // that one and let everything else come from the library. A library
-        // entry without commits checks out nothing and so has no index to
-        // adopt, in which case the empty worktree matches no index at all.
-        let checked_out_index = discarded.join("index");
-        if checked_out_index.exists() {
-            std::fs::rename(&checked_out_index, git_dir.join("index"))?;
-        } else {
-            let _ = std::fs::remove_file(git_dir.join("index"));
+        // Everything from here on writes inside the destination, so a failure
+        // puts the git directory back the way the library had it — bare, and
+        // under the library path — instead of leaving the repo in a
+        // half-restored workspace directory the library no longer holds a copy
+        // of.
+        if let Err(e) = check_out_worktree(&dest, &git_dir) {
+            let _ = set_bare_in_config(&git_dir, true);
+            let _ = std::fs::rename(&git_dir, &source);
+            let _ = std::fs::remove_dir_all(&dest);
+            prune_empty_dirs(&root, &dest);
+            return Err(e);
         }
-        std::fs::remove_dir_all(&discarded)?;
-
-        // The library keeps its copy bare; a workspace checkout is not
-        let config_path = git_dir.join("config");
-        let config = std::fs::read_to_string(&config_path)?;
-        std::fs::write(&config_path, set_core_bare(&config, false))?;
 
         Ok(())
     }
@@ -1927,6 +1990,99 @@ mod tests {
             fs::read_to_string(root.join("gitlab.com/notes.txt")).unwrap(),
             "mine"
         );
+    }
+
+    /// A restore has to put the worktree back as well as the git directory:
+    /// the library keeps the repo bare, so the files it tracks exist nowhere
+    /// until the restore writes them out. The index it writes has to describe
+    /// exactly what it wrote, too, or every later status check reads the whole
+    /// worktree as uncommitted work and `drop` refuses to take the repo back.
+    #[test]
+    fn restore_writes_the_worktree_and_an_index_that_matches_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        repo_with_a_commit(&repo);
+        fs::create_dir_all(repo.join("src/nested")).unwrap();
+        fs::write(repo.join("src/nested/one.txt"), "tracked\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "--quiet", "-m", "two"]);
+
+        // A commit only a second branch can reach, so the restore is held to
+        // bringing the whole git directory back rather than just HEAD's branch
+        git(&repo, &["checkout", "--quiet", "-b", "side"]);
+        git(
+            &repo,
+            &["commit", "--quiet", "--allow-empty", "-m", "on side"],
+        );
+        let side = git(&repo, &["rev-parse", "side"]);
+        git(&repo, &["checkout", "--quiet", "main"]);
+
+        let pattern = "github.com/user/project".parse::<RepoPattern>().unwrap();
+        let report = workspace.drop(&pattern, false, false).unwrap();
+        assert_eq!(report.dropped, vec!["github.com/user/project".to_string()]);
+        assert!(!repo.exists());
+
+        workspace
+            .restore_from_library("github.com/user/project")
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(repo.join("src/nested/one.txt")).unwrap(),
+            "tracked\n"
+        );
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(git(&repo, &["rev-parse", "side"]), side);
+        assert_eq!(git(&repo, &["config", "core.bare"]), "false");
+        // The library hands the repo over rather than keeping a stale copy
+        assert!(!workspace.library_contains("github.com/user/project"));
+    }
+
+    /// A restore that can't finish has to leave the repo where it found it.
+    /// The library entry is the only copy there is until the worktree exists,
+    /// so a half-built workspace directory with the library emptied out is the
+    /// repo lost.
+    #[test]
+    fn a_restore_that_cannot_check_out_leaves_the_repo_in_the_library() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        repo_with_a_commit(&repo);
+        workspace
+            .drop(
+                &"github.com/user/project".parse::<RepoPattern>().unwrap(),
+                false,
+                false,
+            )
+            .unwrap();
+
+        // HEAD's branch names a commit the object store doesn't hold, so there
+        // is no tree for the checkout to write
+        let entry = PathBuf::from(workspace.library_path()).join("github.com/user/project");
+        fs::write(
+            entry.join("refs/heads/main"),
+            "0000000000000000000000000000000000000001\n",
+        )
+        .unwrap();
+
+        assert!(
+            workspace
+                .restore_from_library("github.com/user/project")
+                .is_err()
+        );
+
+        // Nothing of the restore is left in the workspace, and the library is
+        // holding the repo the way it was before: whole, and bare
+        assert!(!PathBuf::from(&workspace.path).join("github.com").exists());
+        assert!(workspace.library_contains("github.com/user/project"));
+        assert!(entry.join("HEAD").is_file());
+        assert_eq!(git(&entry, &["config", "core.bare"]), "true");
     }
 
     /// The directories leading to a repo are made before the clone knows
