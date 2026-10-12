@@ -749,30 +749,83 @@ fn complete_bash(maybe_workspace: Option<Workspace>) {
     }
 }
 
+/// Whether `candidate` is one the shell can still display for what has been
+/// typed of the word.
+///
+/// fish narrows the candidate list itself, and the weakest match it will
+/// accept is a subsequence one: the typed characters appearing in order,
+/// anywhere in the candidate. So a candidate that doesn't even manage that is
+/// one fish will never put on screen, whatever we say about it.
+///
+/// Deliberately more generous than fish is — matching here only means the
+/// candidate *may* be displayed, and the cost of saying yes too often is a
+/// description nobody reads, while saying no too often would cost a candidate
+/// its description. Quoting characters are ignored for the same reason: the
+/// word arrives as the shell wrote it, and fish matches against the word it
+/// has already unquoted.
+fn shell_can_display(candidate: &str, typed: &str) -> bool {
+    // One pass over the candidate for the whole word: each typed character is
+    // looked for in what the previous one left, which is what makes the match
+    // a subsequence rather than a set of characters
+    let mut candidate = candidate.chars().flat_map(char::to_lowercase);
+    typed
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .flat_map(char::to_lowercase)
+        .all(|wanted| candidate.any(|c| c == wanted))
+}
+
+/// The lines fish is handed: the candidate word, and after a tab the
+/// description, where there is one.
+///
+/// A workspace repo's description is its status, which costs a walk of the
+/// repo's whole worktree — the most expensive thing workset does per repo, and
+/// completions run on every TAB press. So only the candidates fish can still
+/// display for what has been typed are described; the rest are offered
+/// unadorned, which is all fish would have shown of them anyway. The walks
+/// that are left go to the whole machine at once.
+fn fish_lines(current_word: &str, candidates: Completions) -> Vec<String> {
+    match candidates {
+        Completions::Subcommands(subcommands) => subcommands
+            .iter()
+            .map(|(name, description)| format!("{}\t{}", name, description))
+            .collect(),
+        Completions::Library(repos) => repos
+            .iter()
+            .map(|repo| format!("{}\tlibrary", repo))
+            .collect(),
+        Completions::Workspace(repos) => {
+            let paths: Vec<PathBuf> = repos
+                .iter()
+                .filter(|(name, _)| shell_can_display(name, current_word))
+                .map(|(_, path)| path.clone())
+                .collect();
+            let described: std::collections::HashMap<PathBuf, String> = paths
+                .iter()
+                .cloned()
+                .zip(workset::scan_repos(&paths, |repo| {
+                    describe_workspace_repo(repo)
+                }))
+                .collect();
+
+            repos
+                .iter()
+                .map(|(name, path)| match described.get(path) {
+                    Some(description) => format!("{}\t{}", name, description),
+                    None => name.clone(),
+                })
+                .collect()
+        }
+    }
+}
+
 /// Output dynamic completions for fish, which shows a description after a tab
 /// and narrows the list by the current token itself
 fn complete_fish(maybe_workspace: Option<Workspace>) {
     let (comp_line, comp_point) = completion_request();
-    match completions(maybe_workspace.as_ref(), &comp_line, comp_point).1 {
-        Completions::Subcommands(subcommands) => {
-            for (name, description) in subcommands {
-                outln!("{}\t{}", name, description);
-            }
-        }
-        Completions::Library(repos) => {
-            for repo in repos {
-                outln!("{}\tlibrary", repo);
-            }
-        }
-        Completions::Workspace(repos) => {
-            // Completions run on every TAB press, so the per-repo worktree
-            // walks behind these descriptions go to the whole machine at once
-            let paths: Vec<PathBuf> = repos.iter().map(|(_, path)| path.clone()).collect();
-            let descriptions = workset::scan_repos(&paths, |repo| describe_workspace_repo(repo));
-            for ((name, _), description) in repos.iter().zip(descriptions) {
-                outln!("{}\t{}", name, description);
-            }
-        }
+    let (current_word, candidates) = completions(maybe_workspace.as_ref(), &comp_line, comp_point);
+    for line in fish_lines(current_word, candidates) {
+        outln!("{}", line);
     }
 }
 
@@ -877,6 +930,74 @@ mod tests {
         }
         // For bash, a repo name is narrowed by its prefix like anything else
         assert!(offered_to_bash(Some(&workspace), "workset drop gitlab", None).is_empty());
+    }
+
+    /// Every candidate fish could display has to survive the pass that skips
+    /// the ones it can't: the test is what fish accepts, not what bash does,
+    /// so a word matching in the middle of a repo's path still counts.
+    #[test]
+    fn a_candidate_is_matched_the_way_fish_matches_it() {
+        for typed in [
+            "",                       // nothing typed yet: everything is offered
+            "github.com/user/alpha",  // the whole thing
+            "github",                 // a prefix
+            "user/alpha",             // a substring, which bash would not take
+            "ghalpha",                // a subsequence, fish's weakest match
+            "GitHub.com/User/Alpha",  // fish's matching is case-insensitive
+            "'github.com/user/alpha", // a word the shell is still quoting
+        ] {
+            assert!(
+                shell_can_display("github.com/user/alpha", typed),
+                "typed: {typed}"
+            );
+        }
+
+        // Characters fish can't find, or can't find in that order
+        for typed in ["gitlab", "alpha/user", "github.com/user/alpha2"] {
+            assert!(
+                !shell_can_display("github.com/user/alpha", typed),
+                "typed: {typed}"
+            );
+        }
+    }
+
+    /// The expensive half of a completion — a repo's status, which walks its
+    /// whole worktree — is only computed for the candidates fish can still
+    /// display. The candidates it can't must still be offered, just without a
+    /// description, because dropping one would stop the completion working.
+    #[test]
+    fn fish_offers_every_candidate_and_describes_the_ones_it_can_display() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = workspace(temp.path());
+
+        let lines = |line: &str| {
+            let (current_word, candidates) = completions(Some(&workspace), line, None);
+            fish_lines(current_word, candidates)
+        };
+
+        // The repo is freshly initialized, so its description is its status
+        assert_eq!(
+            lines("workset drop github"),
+            ["github.com/user/alpha\tno commits"]
+        );
+        // Nothing typed describes everything, as before
+        assert_eq!(
+            lines("workset drop "),
+            ["github.com/user/alpha\tno commits"]
+        );
+        // A word fish could never display this candidate for: still offered,
+        // but no worktree was walked for it
+        assert_eq!(lines("workset drop gitlab"), ["github.com/user/alpha"]);
+
+        // The other candidate sources describe themselves for free
+        assert_eq!(
+            lines("workset restore gitlab"),
+            ["github.com/user/stored\tlibrary"]
+        );
+        assert_eq!(
+            lines("workset l").first().unwrap(),
+            "clone\tClone new repository(ies) to workspace"
+        );
     }
 
     #[test]

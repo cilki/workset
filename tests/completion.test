@@ -211,6 +211,22 @@ testFishCompletePartialRepoToken() {
 	diff <(fishComplete "workset drop re" | cut -f1) <(repos)
 }
 
+## A repo's description is its status, which costs a walk of its whole
+## worktree, so only the repos fish can still display for the typed token get
+## one. The others are still offered -- fish, not workset, decides what ends up
+## on screen -- just without a description.
+testFishCompleteDescribesWhatCanBeDisplayed() {
+	setupWorkspace
+
+	output=$(fishComplete "workset drop repo1")
+
+	diff <(echo "$output" | cut -f1) <(repos)
+	# 'repo1' names no other repo, not even as a subsequence, so one
+	# description was computed and two walks were skipped
+	[ "$(echo "$output" | cut -s -f2 | wc -l)" -eq 1 ]
+	echo "$output" | grep -E "^repo1	(clean|dirty|unpushed|no commits)"
+}
+
 ## An unrecognized shell is an error
 testUnsupportedShell() {
 	! _ARGCOMPLETE_=zsh COMP_LINE="workset " workset 2>err.txt
