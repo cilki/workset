@@ -4,7 +4,7 @@ use super::tree::{
 };
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(PartialEq)]
 pub enum AppMode {
@@ -384,6 +384,33 @@ impl App {
             .repo_info
             .as_ref()
             .map(|r| r.path.clone())
+    }
+
+    /// Whether `path` is one of the repos in the working set, i.e. one of the
+    /// rows the workspace panel holds.
+    ///
+    /// Anything acting on a path that came from outside the repo lists — the
+    /// filesystem watcher, which reports every path under the workspace —
+    /// has to ask, because "somewhere in the workspace directory" is not the
+    /// same thing as "a repo workset manages". The working set is what
+    /// [`crate::find_git_repositories`] reports, and it deliberately stops at
+    /// the first repo on each branch of the walk: a git directory nested
+    /// inside another repo's worktree is that repo's content, not a repo of
+    /// ours, and a repo reached through a symlink lives somewhere the
+    /// workspace never contained.
+    ///
+    /// Compared on canonical paths where both ends resolve, so a workspace
+    /// reached through a symlink doesn't make every row fail to match a path
+    /// spelled the other way.
+    pub fn is_workspace_repo(&self, path: &Path) -> bool {
+        let canonical = std::fs::canonicalize(path);
+        self.workspace_repos_list.iter().any(|repo| {
+            repo.path == path
+                || match (&canonical, std::fs::canonicalize(&repo.path)) {
+                    (Ok(path), Ok(row)) => row == *path,
+                    _ => false,
+                }
+        })
     }
 
     /// Snapshot of the current repo lists, used to seed a background refresh

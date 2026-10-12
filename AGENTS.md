@@ -16,8 +16,11 @@ The TUI keeps remote state fresh in the background: a sync (fetch every
 remote, recompute the repo's status from the refreshed tracking refs) runs
 for the workspace repo the selection rests on — debounced, once per
 selection, with a per-repo cooldown so returning to a row doesn't
-immediately refetch — and for any repo whose `.git/refs/remotes` a push
-from another terminal updates. There is no whole-workspace sync: startup
+immediately refetch — and for any repo *in the working set* whose
+`.git/refs/remotes` a push from another terminal updates. A git directory
+the watcher sees that isn't one of those rows is never fetched: one nested
+in another repo's worktree is that repo's content, not a repo workset
+manages. There is no whole-workspace sync: startup
 and returning from the interactive shell are covered by the fetch of the
 then-selected row. Repo rows show "fetching" while a sync runs, and a fetch
 that fails reads `sync failed: fetch <remote>: ...`; when *every* remote

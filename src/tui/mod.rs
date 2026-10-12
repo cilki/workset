@@ -201,10 +201,10 @@ enum SyncEvent {
 }
 
 /// Schedules background jobs that fetch a repo's remotes and refresh its
-/// status — the repo the selection rests on, plus any repo whose tracking
-/// refs the watcher saw change. Jobs run on their own threads (up to
-/// `MAX_CONCURRENT_SYNCS`) and report back through a channel drained by the
-/// event loop.
+/// status — the repo the selection rests on, plus any repo in the working set
+/// whose tracking refs the watcher saw change. Jobs run on their own threads
+/// (up to `MAX_CONCURRENT_SYNCS`) and report back through a channel drained by
+/// the event loop.
 struct SyncManager {
     tx: mpsc::Sender<(PathBuf, SyncEvent)>,
     rx: mpsc::Receiver<(PathBuf, SyncEvent)>,
@@ -257,6 +257,28 @@ impl SyncManager {
         }
         if !self.queue.contains(&repo) {
             self.queue.push_back(repo);
+        }
+    }
+
+    /// Queue the repos a watcher signal named, after dropping the ones that
+    /// aren't in the working set.
+    ///
+    /// The watcher reports every path under the workspace directory, and a
+    /// `.git/refs/remotes` write anywhere below it looks like the push this
+    /// signal exists to notice. Git directories live below it that are not
+    /// repos workset manages, though — one nested in another repo's worktree
+    /// is that repo's content, carried along with everything else it brought
+    /// — and syncing one fetches every remote *it* names and hands its own
+    /// config and hooks to git, for a repo the user never put in the
+    /// workspace and that no row in the TUI shows. A repo arrives as files
+    /// often enough (a tarball, a shared directory, a copy someone handed
+    /// over) that what one carries is not the user's choice, so the fetch
+    /// stays on the working set the user can actually see.
+    fn request_watcher_syncs(&mut self, repos: Vec<PathBuf>, app: &App) {
+        for repo in repos {
+            if app.is_workspace_repo(&repo) {
+                self.request_sync(repo, true);
+            }
         }
     }
 
@@ -686,9 +708,9 @@ fn run_app<B: ratatui::backend::Backend>(
         // worktree changes trigger a reload unless one is already running
         if let Some(watcher) = file_watcher.as_mut() {
             let signals = watcher.poll();
-            for repo in signals.refs_changed {
-                background.sync.request_sync(repo, true);
-            }
+            background
+                .sync
+                .request_watcher_syncs(signals.refs_changed, app);
             if signals.refresh && background.loader.is_none() {
                 return Ok(Action::RefreshData);
             }
@@ -1939,6 +1961,33 @@ mod tests {
         // Explicit (non-watcher) requests ignore the cooldown
         mgr.request_sync(repo.clone(), false);
         assert_eq!(mgr.queue.len(), 1);
+    }
+
+    /// The watcher reports every path under the workspace directory, and a
+    /// repo's worktree can hold a git directory of its own — a vendored
+    /// checkout, a copy someone handed over, anything a repo that arrived as
+    /// files brought with it. The working set stops at the first repo on each
+    /// branch of the walk, so such a directory is never a row, and a fetch of
+    /// one would run its hooks and act on the remotes it names for a repo the
+    /// user never put in the workspace.
+    #[test]
+    fn watcher_signal_only_syncs_repos_in_the_working_set() {
+        let repo = PathBuf::from("ws/repo");
+        let nested = repo.join("vendor/thing");
+        let app = App::new(
+            "ws".to_string(),
+            vec![RepoInfo {
+                path: repo.clone(),
+                display_name: "repo".to_string(),
+                ..Default::default()
+            }],
+            Vec::new(),
+        );
+        let mut mgr = SyncManager::new("ws".to_string());
+
+        mgr.request_watcher_syncs(vec![nested, repo.clone()], &app);
+
+        assert_eq!(mgr.queue.iter().collect::<Vec<_>>(), vec![&repo]);
     }
 
     #[test]
