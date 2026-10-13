@@ -449,11 +449,32 @@ fn detect_parent_shell() -> Option<String> {
     }
 }
 
-/// Prepare the project emblem for the terminal's graphics protocol. Must run
-/// while raw mode is active but before the event loop starts reading stdin,
-/// since the protocol query does a terminal roundtrip. Any failure just means
-/// the help overlay renders without a logo.
-fn build_help_image() -> Option<StatefulProtocol> {
+/// Work out which graphics protocol the terminal speaks. Must run while raw
+/// mode is active but before the event loop starts reading stdin, since the
+/// capability query is a terminal roundtrip.
+fn graphics_picker() -> Picker {
+    // `Picker::from_query_stdio` writes the capability queries from a thread
+    // of its own and reads the answers straight off our stdin. The caller
+    // gives up after a second, but the thread it leaves behind is still
+    // blocked in `read`, so the next byte to arrive — the first key the user
+    // presses — is consumed by it instead of reaching the event loop. A
+    // terminal that answers nothing therefore costs a keystroke, and the
+    // first `?` or `Esc` after startup does nothing.
+    //
+    // Ask for the cursor position first: crossterm writes that request
+    // itself, bounds the wait, and queues any input it reads along the way
+    // rather than eating it. A terminal that won't answer that won't answer
+    // the capability queries either, and halfblocks is where those would have
+    // landed anyway — so nothing is lost by not asking.
+    if crossterm::cursor::position().is_err() {
+        return Picker::halfblocks();
+    }
+    Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+}
+
+/// Prepare the project emblem for the terminal's graphics protocol. Any
+/// failure just means the help overlay renders without a logo.
+fn build_help_image(picker: &Picker) -> Option<StatefulProtocol> {
     // Composited onto black to match the help overlay's background, since the
     // emblem itself is transparent
     let image = cilki::terminal::rasterize(
@@ -462,11 +483,15 @@ fn build_help_image() -> Option<StatefulProtocol> {
         Some((0, 0, 0)),
     )?;
 
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     Some(picker.new_resize_protocol(image))
 }
 
 pub fn run_tui(workspace: &Workspace) -> Result<()> {
+    // What the terminal can draw doesn't change while workset runs, and
+    // asking costs a roundtrip it may never answer, so it is asked once no
+    // matter how often the shell is opened and the terminal rebuilt around it
+    let mut graphics: Option<Picker> = None;
+
     loop {
         // Setup terminal FIRST so we can show progress
         enable_raw_mode()?;
@@ -478,9 +503,6 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         // Create app with empty data; repos stream in from the background loader
         let mut app = App::new(workspace.path.clone(), Vec::new(), Vec::new());
         app.loading_progress = Some("loading...".to_string());
-        // Query the graphics protocol now, before the event loop starts
-        // reading stdin
-        app.help_image = build_help_image();
 
         // Setup the debounced filesystem watcher on a background thread, since
         // recursively registering a large workspace can take a while and would
@@ -501,6 +523,21 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
             sync: SyncManager::new(workspace.path.clone()),
             details: DetailsLoader::new(),
         };
+
+        // The scan is already running and the first frame is on screen before
+        // anything is asked of the terminal: the graphics query waits for a
+        // reply some terminals never send, and waiting for it ahead of this
+        // held the scan back and left the screen blank for as long as it took
+        // to give up. The query still has to happen before the event loop
+        // reads stdin, since it reads the replies off stdin itself.
+        terminal
+            .draw(|f| ui(f, &mut app))
+            .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
+        let picker = graphics.get_or_insert_with(graphics_picker);
+        // Rebuilt each time around: the protocol carries the state of what is
+        // currently on screen, and leaving the alternate screen for a shell
+        // takes the image with it
+        app.help_image = build_help_image(picker);
 
         // Inner loop to handle actions without tearing down terminal
         loop {
