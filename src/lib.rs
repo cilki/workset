@@ -906,6 +906,33 @@ pub fn get_repo_modification_time(repo_path: &Path) -> Result<std::time::SystemT
     get_last_commit_time(&repo)
 }
 
+/// The point in time a commit timestamp of `seconds` relative to the epoch
+/// names, or None when this platform can't represent it.
+///
+/// A commit's time is *content*: a signed count of seconds written into the
+/// commit object by whoever made it, which git neither bounds nor checks
+/// against anything. A time before the epoch is what a wrong clock or an
+/// importer with a bad date leaves behind — and a repo that arrived as files
+/// (a tarball, a shared directory, a copy someone handed over) carries
+/// whatever its objects say, chosen by whoever assembled it.
+///
+/// So the conversion has to be total. Casting the seconds to `u64` and adding
+/// them to the epoch was not: every negative count turned into some 584
+/// billion years after 1970, which `SystemTime` cannot represent and refuses
+/// by panicking. One commit dated before 1970 anywhere in the workspace was
+/// then enough to take down everything that reports when a repo last changed
+/// — a shell completion exited 101 in the middle of a TAB, and the TUI's scan
+/// thread died with the panic printed over the alternate screen, so no row
+/// ever got a status.
+fn commit_time(seconds: i64) -> Option<std::time::SystemTime> {
+    let distance = std::time::Duration::from_secs(seconds.unsigned_abs());
+    if seconds < 0 {
+        std::time::SystemTime::UNIX_EPOCH.checked_sub(distance)
+    } else {
+        std::time::SystemTime::UNIX_EPOCH.checked_add(distance)
+    }
+}
+
 /// Get the last commit time using gix
 fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime> {
     if matches!(head_state(repo), HeadState::Unborn) {
@@ -917,7 +944,13 @@ fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime>
     let commit = repo.head_commit()?;
     let timestamp = commit.time()?.seconds;
 
-    Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
+    // A timestamp this machine has no point in time for is a time that can't
+    // be reported, which every caller already handles: the repo is listed
+    // without one rather than the whole listing going down with it
+    match commit_time(timestamp) {
+        Some(time) => Ok(time),
+        None => bail!("Commit is dated {} seconds from the epoch", timestamp),
+    }
 }
 
 /// Walk everything the repository holds that its last commit doesn't — staged
@@ -2444,6 +2477,94 @@ mod tests {
         let time = mod_time.expect("expected the detached commit's time");
         assert!(time > std::time::SystemTime::UNIX_EPOCH);
         assert_eq!(get_repo_modification_time(repo_path).unwrap(), time);
+    }
+
+    /// Every count of seconds a commit object can carry has to come out of the
+    /// conversion as a time or as nothing, because a commit's date is content
+    /// and the caller is a workspace listing that must not go down with it.
+    #[test]
+    fn a_commit_time_is_either_converted_or_declined() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        assert_eq!(commit_time(0), Some(UNIX_EPOCH));
+        assert_eq!(commit_time(1), Some(UNIX_EPOCH + Duration::from_secs(1)));
+        // The case that used to panic: seconds before the epoch, which are
+        // the dates in 1969 and earlier, not 584 billion years hence
+        assert_eq!(commit_time(-1), Some(UNIX_EPOCH - Duration::from_secs(1)));
+        assert_eq!(
+            commit_time(-2_208_988_800),
+            Some(UNIX_EPOCH - Duration::from_secs(2_208_988_800))
+        );
+
+        // And the extremes, wherever this platform's limit falls: a count it
+        // has no point in time for is declined, never mapped onto a date that
+        // isn't the one the commit claims
+        for seconds in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+            let converted: Option<SystemTime> = commit_time(seconds);
+            if let Some(time) = converted {
+                assert_eq!(
+                    (seconds < 0),
+                    time < UNIX_EPOCH,
+                    "{seconds} came out on the wrong side of the epoch"
+                );
+            }
+        }
+    }
+
+    /// Nothing stops a commit from being dated before the epoch: a wrong
+    /// clock, an importer with a bad date, or a repo that arrived as files
+    /// with whoever assembled it choosing what its objects say. Reporting when
+    /// such a repo last changed used to panic — a shell completion exited 101
+    /// in the middle of a TAB, and the TUI's scan thread died without giving
+    /// a single row a status — instead of reporting 1969.
+    #[test]
+    fn a_repo_whose_commit_predates_the_epoch_is_still_reported() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("repo");
+        repo_with_a_commit(&repo);
+
+        // `git commit` won't take a negative date, so the commit is written
+        // as an object directly — outside the worktree, which must stay clean
+        // for the status assertions below
+        let object = temp_dir.path().join("commit-object");
+        fs::write(
+            &object,
+            format!(
+                "tree {}\n\
+                 author workset <workset@example.com> -1 +0000\n\
+                 committer workset <workset@example.com> -1 +0000\n\
+                 \n\
+                 before the epoch\n",
+                git(&repo, &["rev-parse", "HEAD^{tree}"])
+            ),
+        )
+        .unwrap();
+        let commit = git(
+            &repo,
+            &[
+                "hash-object",
+                "-w",
+                "-t",
+                "commit",
+                "--literally",
+                &object.to_string_lossy(),
+            ],
+        );
+        git(&repo, &["update-ref", "HEAD", &commit]);
+
+        let dated = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(get_repo_modification_time(&repo).unwrap(), dated);
+        assert_eq!(
+            check_repo_status_and_modification_time(&repo).unwrap(),
+            (RepoStatus::Clean, Some(dated))
+        );
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+
+        // What the user sees of it is a date many years ago, which is what
+        // the commit says (the exact number grows with every year that
+        // passes, so only the unit is asserted)
+        let ago = format_time_ago(dated);
+        assert!(ago.ends_with('y'), "{ago}");
     }
 
     #[test]
