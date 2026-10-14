@@ -652,9 +652,9 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
     // worktree, and that work exists nowhere but here: no commit, no remote,
     // nothing the library would keep. Reporting it as NoCommits told `drop` it
     // was safe to move the git directory away and delete the worktree.
-    match worktree_is_dirty(&repo, repo_path) {
+    match has_uncommitted_work(&repo, repo_path) {
         Some(true) => return Ok(RepoStatus::Dirty),
-        // A worktree that couldn't be read is not a worktree without changes
+        // A status that couldn't be read is not a repo without changes
         None => return Ok(RepoStatus::Unknown),
         Some(false) => {}
     }
@@ -920,18 +920,19 @@ fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime>
     Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
 }
 
-/// Walk the repository's changed and untracked files in a single status pass,
+/// Walk everything the repository holds that its last commit doesn't — staged
+/// changes, unstaged changes and untracked files — in a single status pass,
 /// calling `visit` with the worktree path of each, or None when git reports a
 /// path this platform can't represent. Stops as soon as `visit` returns false,
-/// so callers that only need to know whether the worktree is dirty don't pay
+/// so callers that only need to know whether there is any such work don't pay
 /// for the rest of the walk.
 ///
 /// Returns false when the walk couldn't be completed, in which case `visit`
-/// never saw the changes the worktree may well hold. Callers must not read
-/// that as a clean worktree: that is what let `drop` delete work it couldn't
-/// see.
+/// never saw the changes the repo may well hold. Callers must not read that as
+/// a repo with nothing uncommitted: that is what let `drop` delete work it
+/// couldn't see.
 #[must_use]
-fn walk_worktree_changes(
+fn walk_uncommitted_changes(
     repo: &gix::Repository,
     repo_path: &Path,
     mut visit: impl FnMut(Option<PathBuf>) -> bool,
@@ -958,10 +959,19 @@ fn walk_worktree_changes(
         }),
     };
 
-    // Tracked changes and untracked files come from the same iterator
+    // Staged changes, unstaged changes and untracked files all come from the
+    // same iterator. The HEAD-to-index half is what `into_index_worktree_iter`
+    // leaves out, and leaving it out reported a repo whose only work was
+    // staged — `git add` and nothing more — as holding nothing uncommitted,
+    // which is exactly the work `drop --delete` destroys.
+    //
+    // Renames are not tracked across that half: a rename git would collapse
+    // into one entry is a deletion plus an addition either way, so the
+    // similarity detection would buy nothing but the time it costs.
     let iter = match platform
         .untracked_files(gix::status::UntrackedFiles::Files)
-        .into_index_worktree_iter(Vec::new())
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
+        .into_iter(Vec::new())
     {
         Ok(iter) => iter,
         Err(e) => {
@@ -989,15 +999,23 @@ fn walk_worktree_changes(
             }
         };
 
+        // Both halves of the status name a path relative to the worktree: the
+        // index-worktree half the entry it walked, the HEAD-index half the
+        // location of the staged change (the destination, for a rewrite).
+        let rela_path: &gix::bstr::BStr = match &item {
+            gix::status::Item::IndexWorktree(item) => item.rela_path(),
+            gix::status::Item::TreeIndex(change) => change.location(),
+        };
+
         // An entry whose path this platform can't represent is still a change,
-        // so hand it to `visit` unnamed rather than dropping it and risking a
-        // dirty worktree reported as clean
-        let path = match gix::path::from_bstr(item.rela_path()) {
+        // so hand it to `visit` unnamed rather than dropping it and risking
+        // uncommitted work reported as none
+        let path = match gix::path::from_bstr(rela_path) {
             Ok(rela_path) => Some(repo_path.join(rela_path)),
             Err(e) => {
                 warn!(
                     path = %repo_path.display(),
-                    rela_path = %item.rela_path(),
+                    rela_path = %rela_path,
                     error = %e,
                     "Changed file has a path that can't be represented"
                 );
@@ -1012,29 +1030,30 @@ fn walk_worktree_changes(
     true
 }
 
-/// Whether the worktree holds any uncommitted change or untracked file, or
-/// None when it couldn't be read and the answer is unknown
-fn worktree_is_dirty(repo: &gix::Repository, repo_path: &Path) -> Option<bool> {
+/// Whether the repo holds any staged change, unstaged change or untracked
+/// file, or None when it couldn't be read and the answer is unknown
+fn has_uncommitted_work(repo: &gix::Repository, repo_path: &Path) -> Option<bool> {
     let mut dirty = false;
-    let readable = walk_worktree_changes(repo, repo_path, |_| {
+    let readable = walk_uncommitted_changes(repo, repo_path, |_| {
         dirty = true;
         false
     });
     readable.then_some(dirty)
 }
 
-/// The most recent modification time among the changed and untracked files,
-/// or None when the worktree is clean. Files that can't be stat'd count as the
-/// UNIX epoch, so a dirty worktree always yields some time.
+/// The most recent modification time among the staged, changed and untracked
+/// files, or None when there is nothing uncommitted. Files that can't be
+/// stat'd — a staged deletion's, for one — count as the UNIX epoch, so a repo
+/// holding uncommitted work always yields some time.
 ///
-/// The flag is false when the worktree couldn't be read, in which case the
-/// time says nothing about what the worktree holds.
+/// The flag is false when the status couldn't be read, in which case the time
+/// says nothing about what the repo holds.
 fn dirty_files_time(
     repo: &gix::Repository,
     repo_path: &Path,
 ) -> (bool, Option<std::time::SystemTime>) {
     let mut latest = None;
-    let readable = walk_worktree_changes(repo, repo_path, |file_path| {
+    let readable = walk_uncommitted_changes(repo, repo_path, |file_path| {
         let modified = file_path
             .and_then(|file_path| {
                 std::fs::metadata(&file_path)
@@ -2438,6 +2457,136 @@ mod tests {
         // Uncommitted work outranks where HEAD happens to point, so a drop
         // still refuses the repo
         assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+    }
+
+    /// A repo with `tracked` committed on `main`, then `write` (if any)
+    /// created in the worktree and `stage` run to put the result in the index.
+    /// The worktree is left matching the index, which is the case that got
+    /// reported clean.
+    fn repo_with_staged_work(path: &Path, write: Option<&str>, stage: &[&str]) {
+        repo_with_a_commit(path);
+        fs::write(path.join("tracked"), "committed").unwrap();
+        git(path, &["add", "tracked"]);
+        git(path, &["commit", "--quiet", "-m", "tracked"]);
+        if let Some(write) = write {
+            fs::write(path.join(write), "staged").unwrap();
+        }
+        git(path, stage);
+    }
+
+    #[test]
+    fn staged_work_is_dirty_not_clean() {
+        // Every shape of staged change git reports in its left-hand column.
+        // Each one leaves the worktree matching the index, so the
+        // index-to-worktree comparison on its own sees nothing at all and
+        // called the repo clean — which told `drop --delete` it was free to
+        // destroy a repo whose only work had been `git add`ed.
+        //
+        // (what git calls it, the file to write first, how to stage it)
+        let staged: [(&str, Option<&str>, &[&str]); 3] = [
+            // `A ` — a file that exists in no commit
+            ("addition", Some("new.txt"), &["add", "new.txt"]),
+            // `M ` — a committed file changed and staged
+            ("modification", Some("tracked"), &["add", "tracked"]),
+            // `D ` — a committed file staged for removal
+            ("deletion", None, &["rm", "--quiet", "tracked"]),
+        ];
+
+        for (name, write, stage) in staged {
+            let temp_dir = TempDir::new().unwrap();
+            let repo_path = temp_dir.path();
+            repo_with_staged_work(repo_path, write, stage);
+
+            assert_eq!(
+                check_repo_status(repo_path).unwrap(),
+                RepoStatus::Dirty,
+                "a staged {name} is uncommitted work"
+            );
+
+            // The TUI reads the status through this second entry point, which
+            // walks the same changes to date the row, so it must agree
+            let (status, mod_time) = check_repo_status_and_modification_time(repo_path).unwrap();
+            assert_eq!(status, RepoStatus::Dirty, "staged {name}, with its time");
+            assert!(
+                mod_time.is_some(),
+                "a repo holding a staged {name} has a time to report"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_rename_is_dirty_without_rename_tracking() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        // `git mv` stages a deletion and an addition that git collapses into
+        // one `R ` entry. Rename tracking is switched off in the walk, so this
+        // arrives as the two halves — either way there is work here.
+        repo_with_staged_work(repo_path, None, &["mv", "tracked", "renamed"]);
+
+        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+    }
+
+    #[test]
+    fn commit_less_repo_with_only_staged_work_is_dirty() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        gix::init(repo_path).unwrap();
+        fs::write(repo_path.join("notes.txt"), "unfinished").unwrap();
+        git(repo_path, &["add", "notes.txt"]);
+
+        // Staging the file is what hid it: it stopped being untracked without
+        // becoming a commit, and there is no commit for it to differ from
+        // either. It exists in this one index and nowhere else.
+        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+    }
+
+    #[test]
+    fn a_genuinely_clean_repo_is_still_clean() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        repo_with_a_commit(repo_path);
+        fs::write(repo_path.join("tracked"), "committed").unwrap();
+        git(repo_path, &["add", "tracked"]);
+        git(repo_path, &["commit", "--quiet", "-m", "tracked"]);
+
+        // Reading HEAD against the index as well must not invent a change out
+        // of a committed file whose index entry matches the commit
+        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Clean);
+        let (status, _) = check_repo_status_and_modification_time(repo_path).unwrap();
+        assert_eq!(status, RepoStatus::Clean);
+    }
+
+    #[test]
+    fn drop_refuses_a_repo_whose_only_work_is_staged() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("staged");
+        repo_with_staged_work(&repo, Some("tracked"), &["add", "tracked"]);
+
+        let pattern = "staged".parse::<RepoPattern>().unwrap();
+
+        // `--delete` is the destructive one: it doesn't move the repo into the
+        // library, it unlinks it. A staged change lives in the index alone, so
+        // deleting the repo is the end of it.
+        for delete in [false, true] {
+            let report = workspace.drop(&pattern, delete, false).unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(
+                report.skipped,
+                vec![(
+                    "staged".to_string(),
+                    DropBlocker::Outstanding(RepoStatus::Dirty)
+                )]
+            );
+            assert_eq!(fs::read_to_string(repo.join("tracked")).unwrap(), "staged");
+        }
+
+        // --force is still how you say you meant it
+        let report = workspace.drop(&pattern, false, true).unwrap();
+        assert_eq!(report.dropped, vec!["staged".to_string()]);
     }
 
     /// A repo with one commit on `main`, pushed to a bare remote beside it,
