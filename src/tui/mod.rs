@@ -11,7 +11,7 @@ use metadata::{format_size, format_time_ago_verbose, get_repo_size};
 use tree::{RepoInfo, RepoOperationStatus, TreeNode};
 use watcher::FileWatcher;
 
-use crate::{RepoPattern, Workspace, find_git_repositories};
+use crate::{RepoPattern, Workspace};
 use anyhow::{Result, anyhow, bail};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -1507,7 +1507,7 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     // repo open — before any status work, so every row can render with a
     // "scanning" status right away. These rows are also the scan's task list,
     // so each repo is placed in the tree exactly once.
-    let workspace_paths = find_git_repositories(Path::new(&workspace.path));
+    let workspace_paths = workspace.repos();
     let library_names = workspace.list_library().unwrap_or_default();
     let library_paths: Vec<PathBuf> = library_names
         .iter()

@@ -173,6 +173,15 @@ pub fn find_git_repositories(path: &Path) -> Vec<PathBuf> {
         return Vec::new();
     }
 
+    find_git_repositories_below(path)
+}
+
+/// The repos under `path`, without `path` itself ever being one of them.
+///
+/// Same walk as [`find_git_repositories`], minus the test that stops it on
+/// the spot when the starting directory is a repo. Only the workspace root
+/// is searched this way: see [`Workspace::repos_under`].
+fn find_git_repositories_below(path: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
 
     // Otherwise, recursively search subdirectories. `read_dir` hands entries
@@ -1276,13 +1285,48 @@ impl Workspace {
         Ok(Path::new(&self.path).join(relative))
     }
 
+    /// Every repo in the working set: the repos the workspace holds, found by
+    /// walking it from the root.
+    pub fn repos(&self) -> Vec<PathBuf> {
+        self.repos_under(Path::new(&self.path))
+    }
+
+    /// The repos of the working set that live under `path`.
+    ///
+    /// The workspace root is never one of them, even when it holds a `.git`
+    /// of its own. A repo, to workset, is something it can drop into the
+    /// library and restore later, and the root is neither: dropping it would
+    /// mean moving the library inside itself, which is why
+    /// [`drop_repo`](Self::drop_repo) refuses it and why
+    /// [`resolve_pattern`](Self::resolve_pattern) won't name it. Counting it
+    /// as a repo anyway also hid every real one, because the walk stops at
+    /// the first `.git` on each branch and the root's sits above them all:
+    /// `workset list` in a workspace that was itself a git repo showed that
+    /// one nameless row and nothing else, and `workset drop` with no pattern
+    /// failed on it without dropping anything.
+    pub fn repos_under(&self, path: &Path) -> Vec<PathBuf> {
+        if self.is_root(path) {
+            find_git_repositories_below(path)
+        } else {
+            find_git_repositories(path)
+        }
+    }
+
+    /// Whether `path` is this workspace's root directory, compared on
+    /// canonical paths so the two spellings of a root reached through a
+    /// symlink are still the same directory.
+    fn is_root(&self, path: &Path) -> bool {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        canonical(path) == canonical(Path::new(&self.path))
+    }
+
     /// Search the workspace for local repos matching the given pattern.
     ///
     /// Patterns are always interpreted relative to the workspace root; see
     /// [`resolve_pattern`](Self::resolve_pattern) for turning a pattern the
     /// user typed relative to their current directory into one of these.
     pub fn search(&self, pattern: &RepoPattern) -> Result<Vec<PathBuf>> {
-        Ok(find_git_repositories(&self.repo_path(pattern)?))
+        Ok(self.repos_under(&self.repo_path(pattern)?))
     }
 
     /// Turn a pattern the user typed relative to `cwd` into one
@@ -1335,7 +1379,7 @@ impl Workspace {
 
         let cwd = std::env::current_dir()?;
         let mut report = DropReport::default();
-        for repo in find_git_repositories(&cwd) {
+        for repo in self.repos_under(&cwd) {
             self.drop_repo(&repo, delete, force, &mut report)?;
         }
         Ok(report)
@@ -1364,13 +1408,21 @@ impl Workspace {
         let root = std::fs::canonicalize(&self.path).unwrap_or_else(|_| PathBuf::from(&self.path));
         let relative = std::fs::canonicalize(repo)
             .ok()
-            .and_then(|resolved| Some(resolved.strip_prefix(&root).ok()?.to_path_buf()))
-            // An empty relative path is the workspace root itself, which is
-            // not a repo to drop even when it happens to contain a `.git`
-            .filter(|relative| !relative.as_os_str().is_empty());
+            .and_then(|resolved| Some(resolved.strip_prefix(&root).ok()?.to_path_buf()));
         let Some(relative) = relative else {
             bail!("{} is outside the workspace", repo.display());
         };
+        // An empty relative path is the workspace root itself, which is not a
+        // repo to drop even when it happens to contain a `.git`: the library
+        // it would be moved into lives inside it. Saying so beats the
+        // "outside the workspace" this used to report about the one directory
+        // that is unmistakably in it.
+        if relative.as_os_str().is_empty() {
+            bail!(
+                "{} is the workspace itself, not a repo in it",
+                repo.display()
+            );
+        }
         let relative_path = relative.to_string_lossy().to_string();
 
         // What a drop does is move a git directory into the library and delete
@@ -1870,6 +1922,94 @@ mod tests {
 
         // Nor was the repo smuggled into the workspace on the way out
         assert!(find_git_repositories(Path::new(&workspace.path)).is_empty());
+    }
+
+    /// `workset init` in a directory that is already a git repo — a checkout
+    /// of someone's `~/src`, a dotfiles repo, anything — used to leave the
+    /// tool blind: the walk stops at the first `.git` it finds on each branch,
+    /// and the root's sits above every repo in the workspace, so the working
+    /// set came back as the root alone and not one of the repos actually in
+    /// it.
+    #[test]
+    fn a_workspace_that_is_itself_a_repo_reports_the_repos_in_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let workspace = Workspace {
+            path: root.to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        gix::init(root).unwrap();
+
+        let one = root.join("github.com/user/one");
+        repo_with_a_commit(&one);
+        let two = root.join("github.com/user/two");
+        repo_with_a_commit(&two);
+
+        // The repos in the workspace, and only those: the root is a directory
+        // workset keeps repos in, not one of the repos it keeps
+        assert_eq!(workspace.repos(), vec![one.clone(), two.clone()]);
+
+        // The same walk backs every pattern that names the root, so
+        // `workset drop` with no pattern and `workset drop .` see them too
+        for pattern in ["", ".", "./"] {
+            assert_eq!(
+                workspace
+                    .search(&pattern.parse::<RepoPattern>().unwrap())
+                    .unwrap(),
+                vec![one.clone(), two.clone()],
+                "pattern {pattern:?}"
+            );
+        }
+        assert_eq!(workspace.repos_under(root), vec![one.clone(), two.clone()]);
+
+        // A repo below the root still ends the walk there, so a git directory
+        // inside one of them is that repo's content and not a row of its own
+        fs::create_dir_all(one.join("vendor/dep/.git")).unwrap();
+        assert_eq!(workspace.repos(), vec![one.clone(), two]);
+        assert_eq!(workspace.repos_under(&one), vec![one]);
+    }
+
+    /// Dropping "everything here" from the root of a workspace that is itself
+    /// a repo takes the repos in it and leaves the workspace standing. It used
+    /// to fail on the root with "outside the workspace" — the one directory
+    /// that is unmistakably inside it — and drop nothing at all.
+    #[test]
+    fn dropping_everything_leaves_a_workspace_that_is_itself_a_repo_standing() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let workspace = Workspace {
+            path: root.to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        repo_with_a_commit(root);
+        fs::write(root.join("notes.txt"), "the root's own content").unwrap();
+
+        let repo = root.join("github.com/user/one");
+        repo_with_a_commit(&repo);
+
+        let report = workspace
+            .drop(&".".parse::<RepoPattern>().unwrap(), false, false)
+            .unwrap();
+        assert_eq!(report.dropped, vec!["github.com/user/one".to_string()]);
+        assert!(report.skipped.is_empty());
+        assert!(!repo.exists());
+        assert_eq!(workspace.list_library().unwrap(), ["github.com/user/one"]);
+
+        // The workspace itself came through untouched: its git directory, the
+        // library the drop just wrote to, and the files it was tracking
+        assert!(root.join(".git").is_dir());
+        assert!(Path::new(&workspace.library_path()).is_dir());
+        assert!(root.join("notes.txt").exists());
+
+        // And it can't be dropped by naming it either, however it is spelled
+        for pattern in ["", ".", "./"] {
+            let report = workspace
+                .drop(&pattern.parse::<RepoPattern>().unwrap(), true, true)
+                .unwrap();
+            assert!(report.is_empty(), "pattern {pattern:?}: {report:?}");
+            assert!(root.join(".git").is_dir(), "pattern {pattern:?}");
+            assert!(root.join("notes.txt").exists(), "pattern {pattern:?}");
+        }
     }
 
     #[test]

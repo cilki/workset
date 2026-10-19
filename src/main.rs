@@ -150,11 +150,11 @@ fn for_each_pattern(
 /// Every repo checked out in the workspace, as its workspace-relative path
 /// paired with where it lives on disk, sorted by path.
 fn workspace_repos(workspace: &Workspace) -> Vec<(String, PathBuf)> {
-    let mut repos: Vec<(String, PathBuf)> =
-        workset::find_git_repositories(Path::new(&workspace.path))
-            .into_iter()
-            .map(|repo| (workspace.relative_name(&repo), repo))
-            .collect();
+    let mut repos: Vec<(String, PathBuf)> = workspace
+        .repos()
+        .into_iter()
+        .map(|repo| (workspace.relative_name(&repo), repo))
+        .collect();
     repos.sort();
     repos.dedup();
     repos
@@ -568,7 +568,7 @@ fn report_drop(report: &workset::DropReport, delete: bool) {
 /// List all repositories in the workspace with their status, followed by how
 /// many repos the library is holding
 fn list_workspace_status(workspace: &Workspace) -> Result<()> {
-    let repos = workset::find_git_repositories(Path::new(&workspace.path));
+    let repos = workspace.repos();
 
     if repos.is_empty() {
         outln!("No repositories found in workspace ({})", workspace.path);
