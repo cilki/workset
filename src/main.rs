@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 use tracing::level_filters::LevelFilter;
 use workset::Workspace;
 
@@ -775,15 +776,56 @@ fn shell_can_display(candidate: &str, typed: &str) -> bool {
         .all(|wanted| candidate.any(|c| c == wanted))
 }
 
+/// How long a completion may spend describing repos.
+///
+/// Describing one costs a walk of its whole worktree, and however well those
+/// walks are spread over the cores there are only so many cores: the time a
+/// TAB press takes grows with the workspace, with nothing bounding it, and
+/// the workspace is the part of this tool you are meant to be able to grow.
+/// A press that stops feeling instant is worse than a candidate without a
+/// description — which is what every candidate was before descriptions
+/// existed, and what the ones fish can't display already get.
+///
+/// Seventy-five milliseconds, because a key press stops feeling instant
+/// somewhere around a tenth of a second and the rest of that tenth goes on
+/// starting the process and enumerating the workspace. A workspace of a few
+/// dozen repos is described in full well inside it; the budget is what keeps
+/// the one holding hundreds from stalling the shell.
+const DESCRIBE_BUDGET: Duration = Duration::from_millis(75);
+
+/// Describe as many of `paths` as `budget` allows, keyed by path.
+///
+/// The walks run on every core, and each one is started only while there is
+/// budget left, so the cost of a completion is bounded by the budget however
+/// many repos the workspace holds. Which repos miss out is therefore decided
+/// by how long the ones before them took — a workspace small enough to
+/// describe inside the budget always describes all of it, and a workspace
+/// that isn't describes a prefix of it.
+fn describe_within(
+    paths: &[PathBuf],
+    budget: Duration,
+) -> std::collections::HashMap<PathBuf, String> {
+    let deadline = Instant::now() + budget;
+    paths
+        .iter()
+        .cloned()
+        .zip(workset::scan_repos(paths, |repo| {
+            (Instant::now() < deadline).then(|| describe_workspace_repo(repo))
+        }))
+        .filter_map(|(path, description)| Some((path, description?)))
+        .collect()
+}
+
 /// The lines fish is handed: the candidate word, and after a tab the
 /// description, where there is one.
 ///
 /// A workspace repo's description is its status, which costs a walk of the
 /// repo's whole worktree — the most expensive thing workset does per repo, and
 /// completions run on every TAB press. So only the candidates fish can still
-/// display for what has been typed are described; the rest are offered
-/// unadorned, which is all fish would have shown of them anyway. The walks
-/// that are left go to the whole machine at once.
+/// display for what has been typed are described, and only for as long as a
+/// keystroke may take; the rest are offered unadorned, which is all fish would
+/// have shown of them anyway. The walks that are left go to the whole machine
+/// at once.
 fn fish_lines(current_word: &str, candidates: Completions) -> Vec<String> {
     match candidates {
         Completions::Subcommands(subcommands) => subcommands
@@ -800,13 +842,7 @@ fn fish_lines(current_word: &str, candidates: Completions) -> Vec<String> {
                 .filter(|(name, _)| shell_can_display(name, current_word))
                 .map(|(_, path)| path.clone())
                 .collect();
-            let described: std::collections::HashMap<PathBuf, String> = paths
-                .iter()
-                .cloned()
-                .zip(workset::scan_repos(&paths, |repo| {
-                    describe_workspace_repo(repo)
-                }))
-                .collect();
+            let described = describe_within(&paths, DESCRIBE_BUDGET);
 
             repos
                 .iter()
@@ -998,6 +1034,48 @@ mod tests {
             lines("workset l").first().unwrap(),
             "clone\tClone new repository(ies) to workspace"
         );
+    }
+
+    /// Describing a repo walks its worktree, so a workspace big enough turns
+    /// a TAB press into a stall that grows with it. The budget stops the
+    /// walks instead of the candidates: a repo left undescribed is still
+    /// offered, exactly as one fish couldn't display for the typed word is.
+    #[test]
+    fn describing_stops_at_the_budget_but_offering_does_not() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let workspace = Workspace {
+            path: root.to_string_lossy().to_string(),
+        };
+        let paths: Vec<PathBuf> = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|name| {
+                let path = root.join(name);
+                std::fs::create_dir_all(&path).unwrap();
+                gix::init(&path).unwrap();
+                path
+            })
+            .collect();
+
+        // No time to describe anything: every repo keeps its candidate and
+        // none of them is walked
+        assert!(describe_within(&paths, Duration::ZERO).is_empty());
+
+        // Given the time, every one of them is described
+        let described = describe_within(&paths, Duration::from_secs(60));
+        assert_eq!(described.len(), paths.len());
+        for path in &paths {
+            assert_eq!(described.get(path).map(String::as_str), Some("no commits"));
+        }
+
+        // A completion run against the real budget still offers all three,
+        // described or not
+        let (current_word, candidates) = completions(Some(&workspace), "workset drop ", None);
+        let offered: Vec<String> = fish_lines(current_word, candidates)
+            .into_iter()
+            .map(|line| line.split('\t').next().unwrap().to_string())
+            .collect();
+        assert_eq!(offered, ["alpha", "beta", "gamma"]);
     }
 
     #[test]
