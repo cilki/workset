@@ -94,6 +94,29 @@ impl FromStr for RepoPattern {
 }
 
 impl RepoPattern {
+    /// A pattern that names a path verbatim, for callers that already hold a
+    /// workspace-relative path rather than something the user typed.
+    ///
+    /// Parsing is the wrong way to build one of those. [`FromStr`] reads its
+    /// input as a clone URL — it strips a `.git` suffix, drops everything
+    /// before `://`, drops the userinfo before an `@`, and turns the `:` of
+    /// `host:owner` into a `/` — so a directory whose *name* happens to be
+    /// URL-shaped comes back out as a different path. `github.com/user/repo.git`
+    /// becomes `github.com/user/repo`, `evil@github.com/thing` becomes
+    /// `github.com/thing`, and `host:owner` becomes `host/owner`. Those are all
+    /// legal directory names, and a `drop` that rewrites one moves (or, with
+    /// `--delete`, removes) a repo the user never named.
+    ///
+    /// The path still goes through [`Workspace::repo_path`] before anything is
+    /// touched, so a verbatim pattern is no more able to escape the workspace
+    /// than a parsed one.
+    pub fn from_relative_path(path: &str) -> Self {
+        Self {
+            provider: None,
+            path: path.to_string(),
+        }
+    }
+
     /// Get the provider and path as a tuple if provider exists
     pub fn provider_and_path(&self) -> Option<(&str, &str)> {
         self.provider
@@ -1262,16 +1285,22 @@ impl Workspace {
         Ok(find_git_repositories(&self.repo_path(pattern)?))
     }
 
-    /// Rewrite a pattern that names a path under `cwd` into a workspace-relative
-    /// one.
+    /// Turn a pattern the user typed relative to `cwd` into one
+    /// [`search`](Self::search) can use.
     ///
     /// The CLI documents patterns as relative to the current directory
     /// (`workset drop ./repo`), but [`search`](Self::search) only ever looks
     /// workspace-relative, so `./repo` — and a bare `repo` — matched nothing
-    /// whenever the current directory wasn't the workspace root. Patterns that
-    /// don't name an existing path inside the workspace are returned unchanged,
-    /// so a full workspace-relative pattern keeps working from any directory.
-    pub fn resolve_pattern(&self, cwd: &Path, pattern: &str) -> String {
+    /// whenever the current directory wasn't the workspace root.
+    ///
+    /// A pattern that names an existing path inside the workspace is that
+    /// path, and comes back as a verbatim one
+    /// ([`RepoPattern::from_relative_path`]) — the directory is already
+    /// located, so there is nothing left to interpret and re-reading it as a
+    /// clone URL would only rename it. Anything else is a pattern in the
+    /// `[provider]/<path>` sense and is parsed, so a pasted clone URL still
+    /// names the repo it was cloned into.
+    pub fn resolve_pattern(&self, cwd: &Path, pattern: &str) -> RepoPattern {
         let resolved = Path::new(&self.path)
             .canonicalize()
             .and_then(|root| Ok((root, cwd.join(pattern).canonicalize()?)))
@@ -1282,7 +1311,11 @@ impl Workspace {
                 (!relative.as_os_str().is_empty()).then(|| relative.display().to_string())
             });
 
-        resolved.unwrap_or_else(|| pattern.to_string())
+        match resolved {
+            Some(relative) => RepoPattern::from_relative_path(&relative),
+            // Infallible
+            None => pattern.parse().unwrap(),
+        }
     }
 
     /// Drop the repositories matching a pattern from this workspace
@@ -1667,26 +1700,93 @@ mod tests {
         // From the repo's parent, both the documented './repo' form and a bare
         // name resolve to the repo's workspace-relative path
         assert_eq!(
-            workspace.resolve_pattern(&parent, "./project"),
+            workspace.resolve_pattern(&parent, "./project").full_path(),
             "github.com/user/project"
         );
         assert_eq!(
-            workspace.resolve_pattern(&parent, "project"),
+            workspace.resolve_pattern(&parent, "project").full_path(),
             "github.com/user/project"
         );
 
         // A full workspace-relative pattern names nothing under the parent, so
         // it is left alone and still matches from there
         assert_eq!(
-            workspace.resolve_pattern(&parent, "github.com/user/project"),
+            workspace
+                .resolve_pattern(&parent, "github.com/user/project")
+                .full_path(),
             "github.com/user/project"
         );
 
         // From the workspace root, a workspace-relative pattern is unchanged
         assert_eq!(
-            workspace.resolve_pattern(temp_dir.path(), "github.com/user/project"),
+            workspace
+                .resolve_pattern(temp_dir.path(), "github.com/user/project")
+                .full_path(),
             "github.com/user/project"
         );
+    }
+
+    /// A directory name is not a URL, however much it looks like one. Parsing
+    /// one as a clone URL renames it — `.git` comes off the end, the userinfo
+    /// before an '@' goes, and the ':' of `host:owner` turns into a '/' — and
+    /// `drop` then moves or deletes whatever the rewritten name happens to
+    /// land on instead of the repo the user named.
+    #[test]
+    fn a_pattern_that_names_a_directory_is_not_read_as_a_url() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().to_string_lossy().to_string(),
+        };
+        let root = temp_dir.path();
+
+        for name in [
+            "github.com/user/repo.git",
+            "evil@github.com/thing",
+            "host:owner",
+        ] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            assert_eq!(
+                workspace.resolve_pattern(root, name).full_path(),
+                name,
+                "resolving {name}"
+            );
+        }
+
+        // What the parse would have turned each of them into: real
+        // directories, so resolving them still has to reach them and not the
+        // URL-shaped neighbours above
+        for name in ["github.com/user/repo", "github.com/thing", "host/owner"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            assert_eq!(
+                workspace.resolve_pattern(root, name).full_path(),
+                name,
+                "resolving {name}"
+            );
+        }
+    }
+
+    /// A clone URL is still a pattern: `clone` takes the one a forge hands
+    /// out, so the repo it put in the workspace has to be reachable by the
+    /// same spelling afterwards.
+    #[test]
+    fn a_pattern_that_names_nothing_on_disk_is_still_read_as_a_url() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().to_string_lossy().to_string(),
+        };
+        let root = temp_dir.path();
+
+        for url in [
+            "https://github.com/jqlang/jq.git",
+            "git@github.com:jqlang/jq.git",
+            "github.com/jqlang/jq.git",
+        ] {
+            assert_eq!(
+                workspace.resolve_pattern(root, url).full_path(),
+                "github.com/jqlang/jq",
+                "resolving {url}"
+            );
+        }
     }
 
     #[test]
@@ -1700,13 +1800,19 @@ mod tests {
         fs::create_dir_all(temp_dir.path().join("outside")).unwrap();
 
         // Nonexistent paths can't be resolved, so the pattern passes through
-        assert_eq!(workspace.resolve_pattern(&root, "missing"), "missing");
+        assert_eq!(
+            workspace.resolve_pattern(&root, "missing").full_path(),
+            "missing"
+        );
 
         // Neither are paths that escape the workspace
-        assert_eq!(workspace.resolve_pattern(&root, "../outside"), "../outside");
+        assert_eq!(
+            workspace.resolve_pattern(&root, "../outside").full_path(),
+            "../outside"
+        );
 
         // Nor the workspace root itself, which names no repo
-        assert_eq!(workspace.resolve_pattern(&root, "."), ".");
+        assert_eq!(workspace.resolve_pattern(&root, ".").full_path(), ".");
     }
 
     #[test]
@@ -2451,6 +2557,41 @@ mod tests {
         git(path, &["config", "user.name", "workset"]);
         git(path, &["config", "user.email", "workset@example.com"]);
         git(path, &["commit", "--quiet", "--allow-empty", "-m", "one"]);
+    }
+
+    /// The whole way through: a drop of a URL-shaped directory name takes that
+    /// directory and leaves the repo whose name the parse would have produced
+    /// where it is. Getting this wrong is destructive — the repo that was not
+    /// named loses its worktree, and with `--delete` loses everything.
+    #[test]
+    fn drop_takes_the_url_shaped_directory_it_was_given() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        let root = PathBuf::from(&workspace.path);
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        // Each pair is (what the user names, what parsing it would reach)
+        for (named, bystander) in [
+            ("github.com/user/repo.git", "github.com/user/repo"),
+            ("evil@github.com/thing", "github.com/thing"),
+            ("host:owner", "host/owner"),
+        ] {
+            repo_with_a_commit(&root.join(named));
+            repo_with_a_commit(&root.join(bystander));
+
+            let pattern = workspace.resolve_pattern(&root, named);
+            let report = workspace.drop(&pattern, false, false).unwrap();
+
+            assert_eq!(report.dropped, vec![named.to_string()], "dropping {named}");
+            assert!(!root.join(named).exists(), "{named} should be gone");
+            assert!(
+                root.join(bystander).join(".git").is_dir(),
+                "{bystander} should have been left alone"
+            );
+            assert!(workspace.library_contains(named));
+        }
     }
 
     #[test]

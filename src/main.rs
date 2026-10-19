@@ -172,12 +172,22 @@ fn workspace_matches(workspace: &Workspace, pattern: &str) -> Vec<String> {
 
 /// Restore repositories from library matching the pattern. Returns false when
 /// nothing was restored, so the caller can exit non-zero.
-fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
+fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
     // Get all repos from library
     let library_repos = workspace.list_library()?;
 
-    // Filter repos that match the pattern
-    let pattern_str = pattern.full_path();
+    // A pattern that is exactly one of the library's entries names that entry
+    // and nothing else. Parsing it would read it as a clone URL instead, and a
+    // repo whose path happens to be URL-shaped — one ending in ".git", or
+    // holding an '@' or a ':' — comes back out spelled differently, so the
+    // repo the user just dropped could no longer be restored by the name the
+    // drop reported.
+    let pattern_str = if library_repos.iter().any(|repo| repo == requested) {
+        requested.to_string()
+    } else {
+        let Ok(pattern) = requested.parse::<workset::RepoPattern>();
+        pattern.full_path()
+    };
     let matching_repos: Vec<String> = library_repos
         .iter()
         .filter(|repo| repo.contains(&pattern_str))
@@ -444,8 +454,7 @@ fn main() -> Result<ExitCode> {
                     false
                 } else {
                     for_each_pattern(&patterns, "restore", |requested| {
-                        let Ok(pattern) = requested.parse::<workset::RepoPattern>();
-                        restore_repos(&workspace, &pattern)
+                        restore_repos(&workspace, requested)
                     })
                 }
             }
@@ -531,9 +540,7 @@ fn drop_repos(
     let cwd = std::env::current_dir()?;
 
     Ok(for_each_pattern(patterns, "drop", |requested| {
-        let Ok(pattern) = workspace
-            .resolve_pattern(&cwd, requested)
-            .parse::<workset::RepoPattern>();
+        let pattern = workspace.resolve_pattern(&cwd, requested);
 
         let report = workspace.drop(&pattern, delete, force)?;
         report_drop(&report, delete);

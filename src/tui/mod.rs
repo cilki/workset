@@ -595,8 +595,10 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         &repo_paths,
                         RepoOperationStatus::Dropping,
                         |repo_path| {
-                            // Tree paths are already workspace-relative
-                            let Ok(pattern) = repo_path.parse::<RepoPattern>();
+                            // Tree paths are already workspace-relative paths,
+                            // so they name their repo verbatim rather than
+                            // being read as a clone URL
+                            let pattern = RepoPattern::from_relative_path(repo_path);
                             // A repo left in place (uncommitted or unpushed
                             // changes) is a failure as far as the UI is
                             // concerned, so the row says why instead of

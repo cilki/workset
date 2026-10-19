@@ -568,6 +568,37 @@ testDropLocalNameEndingInGit() {
 	[ -f mirror.git/file0.txt ]
 }
 
+## A directory that exists is named by its path, not by what that path would
+## mean as a clone URL. Reading it as one strips a '.git' suffix, drops the
+## userinfo before an '@' and turns the ':' of `host:owner` into a '/', so the
+## drop landed on whichever repo the rewritten spelling happened to name --
+## moving a repo the user never asked about into the library, and with
+## --delete removing it outright.
+testDropTakesTheUrlShapedDirectoryItWasGiven() {
+	newWorkspace
+	createRepo github.com/user/repo
+	createRepo github.com/user/repo.git
+	createRepo github.com/thing
+	createRepo evil@github.com/thing
+	createRepo host/owner
+	createRepo host:owner
+
+	for named in github.com/user/repo.git evil@github.com/thing host:owner; do
+		workset drop "$named" | grep -- "$named - ✓ dropped"
+		[ ! -e "$named" ]
+		[ -d ".workset/$named" ]
+
+		# And the name the drop reported is the one a restore answers to
+		workset restore "$named" | grep "^Restored $named\$"
+		[ -f "$named/file0.txt" ]
+	done
+
+	# The repos each rewritten spelling would have reached never moved
+	[ -f github.com/user/repo/file0.txt ]
+	[ -f github.com/thing/file0.txt ]
+	[ -f host/owner/file0.txt ]
+}
+
 ## A repo sits at the path its remote dictates, so the directories above it
 ## are workset's bookkeeping and go when the repo does. Without this a
 ## workspace emptied of every repo still held a directory tree naming each one.
