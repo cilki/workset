@@ -102,20 +102,52 @@ fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<b
     }
 }
 
-/// The free arguments a subcommand was given, or the first flag-like argument
-/// nobody recognized.
+/// Why an argument a subcommand was given can't be taken for a repo pattern.
+#[derive(Debug, PartialEq, Eq)]
+enum BadArg {
+    /// A flag-like argument nobody recognized
+    Unrecognized(String),
+    /// The empty string, which names no repo at all
+    Empty,
+}
+
+impl std::fmt::Display for BadArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unrecognized(arg) => write!(f, "Unrecognized argument: {}", arg),
+            Self::Empty => write!(f, "Empty repository pattern"),
+        }
+    }
+}
+
+/// The free arguments a subcommand was given, or the first one that can't be a
+/// repo pattern.
 ///
 /// pico-args leaves whatever it didn't parse on the command line, so without
 /// looking at the leftovers a mistyped `--delet` is silently taken as a repo
 /// pattern and reported as a repo that doesn't exist, and every pattern after
 /// the first is thrown away without a word.
-fn free_args(args: pico_args::Arguments) -> std::result::Result<Vec<String>, String> {
+///
+/// An empty argument is rejected for the same reason, and it is the more
+/// dangerous of the two: it names no repo, but `drop` resolves a pattern
+/// against the current directory before anything else, and the current
+/// directory is what the empty string resolves to — so `workset drop ""` took
+/// the entire working set, and `workset drop --delete ""` destroyed it. That is
+/// what `workset drop "$repo"` does when the variable is unset, which is
+/// exactly when the user meant to name one repo and named none. Restoring is no
+/// better off: every library path contains the empty string, so `workset
+/// restore ""` checked the whole library back out. A pattern that was given has
+/// to name something; the bare `workset drop` is how you ask for everything
+/// under the current directory.
+fn free_args(args: pico_args::Arguments) -> std::result::Result<Vec<String>, BadArg> {
     args.finish()
         .into_iter()
         .map(|arg| {
             let arg = arg.to_string_lossy().into_owned();
             if arg.starts_with('-') {
-                Err(arg)
+                Err(BadArg::Unrecognized(arg))
+            } else if arg.is_empty() {
+                Err(BadArg::Empty)
             } else {
                 Ok(arg)
             }
@@ -381,15 +413,17 @@ fn main() -> Result<ExitCode> {
     }
 
     // Take the repo patterns a subcommand was given, or report the first
-    // argument nobody recognized and give up: an unrecognized flag taken as a
-    // pattern would be reported as a repo that doesn't exist, and for `drop` it
-    // could name a repo to consume that the user never asked for.
+    // argument that isn't one and give up: an unrecognized flag taken as a
+    // pattern would be reported as a repo that doesn't exist, and for `drop`
+    // both it and an empty argument could name a repo to consume that the user
+    // never asked for. Nothing is attempted when any argument is refused, so a
+    // request the user didn't mean takes no repo with it.
     macro_rules! patterns {
         ($args:expr) => {
             match free_args($args) {
                 Ok(patterns) => patterns,
-                Err(unexpected) => {
-                    eprintln!("Unrecognized argument: {}", unexpected);
+                Err(bad) => {
+                    eprintln!("{}", bad);
                     eprintln!("Run 'workset --help' for usage information");
                     return Ok(ExitCode::FAILURE);
                 }
@@ -919,6 +953,60 @@ mod tests {
             .filter(|value| value.starts_with(current_word))
             .map(|value| value.to_string())
             .collect()
+    }
+
+    /// The free arguments of a command line, as the subcommands get them
+    fn args_of(args: &[&str]) -> std::result::Result<Vec<String>, BadArg> {
+        free_args(pico_args::Arguments::from_vec(
+            args.iter().map(std::ffi::OsString::from).collect(),
+        ))
+    }
+
+    /// The empty string names no repo, so it is refused rather than resolved.
+    /// `drop` resolves a pattern against the current directory, which is what
+    /// the empty string resolves to, so taking it meant taking every repo
+    /// under the cwd — and with `--delete`, destroying them. Scripts hand it
+    /// over by accident all the time: `workset drop "$repo"` with `repo`
+    /// unset.
+    #[test]
+    fn an_empty_argument_is_not_a_pattern() {
+        assert_eq!(args_of(&[""]), Err(BadArg::Empty));
+        // Refused wherever it appears, and the patterns around it are not
+        // acted on: half a request the user didn't make is still not theirs
+        assert_eq!(args_of(&["repo", ""]), Err(BadArg::Empty));
+        assert_eq!(args_of(&["", "repo"]), Err(BadArg::Empty));
+        assert_eq!(
+            BadArg::Empty.to_string(),
+            "Empty repository pattern".to_string()
+        );
+    }
+
+    /// A flag nobody parsed is still reported as the argument it is, by name
+    #[test]
+    fn an_unparsed_flag_is_reported_by_name() {
+        assert_eq!(
+            args_of(&["--delet", "repo"]),
+            Err(BadArg::Unrecognized("--delet".to_string()))
+        );
+        assert_eq!(
+            BadArg::Unrecognized("--delet".to_string()).to_string(),
+            "Unrecognized argument: --delet".to_string()
+        );
+    }
+
+    /// Everything that does name a repo comes through untouched, in order, and
+    /// no pattern at all stays no pattern at all — which is how the bare
+    /// `workset drop` asks for every repo under the current directory
+    #[test]
+    fn repo_patterns_come_through_in_order() {
+        assert_eq!(args_of(&[]), Ok(Vec::new()));
+        assert_eq!(
+            args_of(&["github.com/user/repo", "./other"]),
+            Ok(vec![
+                "github.com/user/repo".to_string(),
+                "./other".to_string()
+            ])
+        );
     }
 
     const ALL_SUBCOMMANDS: [&str; 5] = ["clone", "restore", "drop", "list", "ls"];

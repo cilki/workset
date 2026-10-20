@@ -377,6 +377,57 @@ testCloneAndRestoreRejectMistypedFlag() {
 	echo "$output" | grep "Unrecognized argument: --oops"
 }
 
+## An empty pattern names no repo, so a drop that is handed one refuses the
+## whole request. A pattern is resolved against the current directory, which is
+## what the empty string resolves to, so taking it meant dropping every repo
+## under the cwd -- which is what `workset drop "$repo"` does when the variable
+## is unset, and `--delete` made that permanent.
+testDropRejectsEmptyPattern() {
+	newWorkspace
+	createRepo github.com/user/one
+	createRepo github.com/user/two
+
+	# What an unset variable expands to at the call site
+	repo=""
+
+	for flags in "" "--delete" "--force" "--delete --force"; do
+		output=$(workset drop $flags "$repo" 2>&1) && exit 1
+		echo "$output" | grep "Empty repository pattern"
+
+		[ -d github.com/user/one/.git ]
+		[ -d github.com/user/two/.git ]
+		[ ! -e .workset/github.com ]
+	done
+
+	# A real pattern alongside the empty one is not acted on either: the
+	# request isn't the one the user made, so none of it runs
+	output=$(workset drop github.com/user/one "" 2>&1) && exit 1
+	echo "$output" | grep "Empty repository pattern"
+	[ -d github.com/user/one/.git ]
+
+	# And the bare drop is still how you ask for everything under the cwd
+	workset drop | grep -- "github.com/user/one - ✓ dropped"
+	[ -d .workset/github.com/user/one ]
+}
+
+## Clone and restore refuse an empty pattern too: every library path contains
+## the empty string, so restoring it checked the whole library back out
+testCloneAndRestoreRejectEmptyPattern() {
+	newWorkspace
+	createRepo github.com/user/one
+	createRepo github.com/user/two
+	workset drop github.com >/dev/null
+
+	output=$(workset restore "" 2>&1) && exit 1
+	echo "$output" | grep "Empty repository pattern"
+	[ ! -e github.com ]
+	[ -d .workset/github.com/user/one ]
+	[ -d .workset/github.com/user/two ]
+
+	output=$(workset clone "" 2>&1) && exit 1
+	echo "$output" | grep "Empty repository pattern"
+}
+
 ## The commands that take no pattern say so instead of ignoring one
 testArgumentlessCommandsRejectExtraArguments() {
 	newWorkspace
