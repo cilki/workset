@@ -24,6 +24,21 @@ fishComplete() {
 	_ARGCOMPLETE_=fish COMP_LINE="$1" workset
 }
 
+## Run a bash completion request for line $1 through the completion script
+## this repo ships, leaving the candidates in COMPREPLY exactly as a TAB press
+## in the user's shell would. The script is what turns the binary's output into
+## the suggestion list, so what it does to a candidate on the way is only
+## observable here.
+bashCompleteThroughScript() {
+	source "$(dirname "$0")/../completions/workset.bash"
+
+	COMP_LINE="$1"
+	COMP_POINT="${2:-${#1}}"
+	COMP_TYPE=9
+	COMP_KEY=9
+	_workset_complete workset
+}
+
 ## The subcommands offered inside a workspace
 subcommands() {
 	printf 'clone\nrestore\ndrop\nlist\nls\n'
@@ -225,6 +240,40 @@ testFishCompleteDescribesWhatCanBeDisplayed() {
 	# description was computed and two walks were skipped
 	[ "$(echo "$output" | cut -s -f2 | wc -l)" -eq 1 ]
 	echo "$output" | grep -E "^repo1	(clean|dirty|unpushed|no commits)"
+}
+
+## The shipped script hands bash the candidates the binary printed
+testBashScriptOffersRepos() {
+	setupWorkspace
+
+	bashCompleteThroughScript "workset drop "
+
+	diff <(printf '%s\n' "${COMPREPLY[@]}") <(repos)
+}
+
+## A repo path is a directory name, not something the user typed, so a glob
+## character in one must not be expanded against the directory the completion
+## runs in. A repo named '*' used to replace itself with every entry of the
+## workspace, and the entries that are not repos are still taken as patterns:
+## `workset drop subdir` drops everything under subdir.
+testBashScriptDoesNotGlobRepoNames() {
+	setupWorkspace
+	mkdir '*'
+	git -C '*' init -q -b main
+
+	bashCompleteThroughScript "workset drop "
+
+	diff <(printf '%s\n' "${COMPREPLY[@]}") <(printf '*\n'; repos)
+}
+
+## Nothing to suggest leaves the array empty rather than holding one empty
+## candidate, so bash falls back to the filenames `-o default` asks for
+testBashScriptOffersNothingForAnUnknownRepo() {
+	setupWorkspace
+
+	bashCompleteThroughScript "workset drop zzz"
+
+	[ "${#COMPREPLY[@]}" -eq 0 ]
 }
 
 ## An unrecognized shell is an error
