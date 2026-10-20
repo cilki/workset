@@ -263,10 +263,57 @@ pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
 /// Rewrite `core.bare` in the given git directory's own config file. The
 /// library keeps its copies bare and a workspace checkout is not, so a repo
 /// is flipped on its way in and back on its way out.
+///
+/// The new text is written to a file of its own and renamed over `config`,
+/// rather than written where `config` currently points.
+///
+/// `.git` is part of whatever a repo was when it arrived — a tarball, a shared
+/// directory, a copy someone handed over — so `config` need not be a file of
+/// the repo's own. A symlink there is read and written straight through, and a
+/// hard link shares its bytes with everything else linked to it, so an
+/// in-place write landed on a file anywhere the user could write: `workset
+/// drop` appended `[core] bare = true` to it, and the `workset restore` that
+/// followed rewrote it again with `bare = false`. Pointed at the user's
+/// `~/.gitconfig` that is `core.bare = true` set globally, which leaves every
+/// non-bare repository on the machine answering "this operation must be run in
+/// a work tree". A link is also the one write a drop makes that
+/// [`Workspace::drop_repo`]'s containment check can't see, because the path it
+/// resolves names the link and not its target.
+///
+/// A rename replaces the directory entry, so neither kind of link is followed
+/// and nothing outside the git directory is touched. The repo keeps the config
+/// it was reading — the text that comes back is what was there, plus the
+/// `core.bare` change — as a file of its own; a link that was deliberate is
+/// severed, which is what moving a git directory into the library would do to
+/// a relative one anyway.
+///
+/// It also makes the rewrite atomic: a drop interrupted partway through can no
+/// longer leave the repo it is about to move into the library holding a
+/// truncated config, which is where its remotes are.
 fn set_bare_in_config(git_dir: &Path, bare: bool) -> Result<()> {
+    use std::io::Write;
+
     let config_path = git_dir.join("config");
     let config = std::fs::read_to_string(&config_path)?;
-    std::fs::write(&config_path, set_core_bare(&config, bare))?;
+    let updated = set_core_bare(&config, bare);
+
+    // Created exclusively, so the write can't be aimed somewhere else by a
+    // link planted under this name either. `remove_file` clears a stale one
+    // left by an interrupted drop — and takes the link itself, never whatever
+    // it points at.
+    let temp_path = git_dir.join("config.workset-new");
+    let _ = std::fs::remove_file(&temp_path);
+    let write = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .and_then(|mut file| file.write_all(updated.as_bytes()))
+        .and_then(|()| std::fs::rename(&temp_path, &config_path));
+    if let Err(e) = write {
+        // Nothing reads this file but the rename that was meant to consume it
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -2179,6 +2226,76 @@ mod tests {
             );
             assert_eq!(fs::read_to_string(&config).unwrap(), config_before);
             assert!(!workspace.library_contains("tool"));
+        }
+    }
+
+    /// `.git` is part of whatever a repo was when it arrived, so `.git/config`
+    /// need not be a file of the repo's own. Written in place, the `core.bare`
+    /// flip a drop makes went straight through a symlink — and through the
+    /// bytes a hard link shares — and rewrote a file anywhere the user can
+    /// write: `[core] bare = true` appended on the way into the library, and
+    /// `bare = false` on the way back out. Aimed at the user's `~/.gitconfig`
+    /// that sets `core.bare` globally, which leaves every non-bare repository
+    /// on the machine refusing to work.
+    ///
+    /// `drop_repo`'s containment check can't catch this one: the path it
+    /// resolves is the link's, and the link is inside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn a_drop_does_not_write_through_a_linked_config() {
+        for hard in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let workspace = Workspace {
+                path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            };
+            fs::create_dir_all(workspace.library_path()).unwrap();
+            let repo = PathBuf::from(&workspace.path).join("tool");
+            repo_with_a_commit(&repo);
+
+            // A file of the user's own, which is what `.git/config` names
+            let victim = temp_dir.path().join("gitconfig");
+            fs::write(&victim, "[core]\n\tpager = less\n").unwrap();
+            let victim_before = fs::read_to_string(&victim).unwrap();
+
+            let config = repo.join(".git/config");
+            fs::remove_file(&config).unwrap();
+            if hard {
+                fs::hard_link(&victim, &config).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&victim, &config).unwrap();
+            }
+
+            let pattern = "tool".parse::<RepoPattern>().unwrap();
+            let report = workspace.drop(&pattern, false, false).unwrap();
+            assert_eq!(report.dropped, vec!["tool".to_string()], "hard: {hard}");
+            assert_eq!(
+                fs::read_to_string(&victim).unwrap(),
+                victim_before,
+                "the drop wrote through the link (hard: {hard})"
+            );
+
+            // The repo still reads the config it was reading, as a file of its
+            // own: the entry the library holds is bare, and nothing but this
+            // git directory was written to say so
+            let entry = PathBuf::from(workspace.library_path()).join("tool");
+            let stored = entry.join("config");
+            assert!(fs::symlink_metadata(&stored).unwrap().file_type().is_file());
+            assert!(
+                fs::read_to_string(&stored)
+                    .unwrap()
+                    .contains("pager = less")
+            );
+            assert_eq!(git(&entry, &["config", "core.bare"]), "true");
+
+            // And the way back out leaves it alone just the same
+            workspace.restore_from_library("tool").unwrap();
+            assert_eq!(
+                fs::read_to_string(&victim).unwrap(),
+                victim_before,
+                "the restore wrote through the link (hard: {hard})"
+            );
+            assert_eq!(git(&repo, &["config", "core.bare"]), "false");
+            assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
         }
     }
 
