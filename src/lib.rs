@@ -238,6 +238,54 @@ fn set_core_bare(config: &str, bare: bool) -> String {
     }
 }
 
+/// Return the config text with every `worktree` entry removed from its
+/// `[core]` sections.
+///
+/// `core.worktree` names the directory a git directory keeps its worktree in,
+/// and git honours it over the directory the `.git` is sitting in. workset's
+/// model leaves no room for that: a repo in the workspace *is* the directory
+/// holding its `.git`, which is the path a drop moves into the library and a
+/// restore checks back out. A library entry that carried the key aimed the
+/// restore's checkout wherever the key pointed — the repo's tracked files were
+/// written to an absolute path outside the workspace, and the directory the
+/// restore had just made in the workspace was left empty — and `.git` is part
+/// of whatever a repo was when it arrived, so the key need not be one the user
+/// ever set.
+///
+/// Removing it costs the repo nothing a drop hadn't already taken: a relative
+/// path no longer resolves once the git directory lives in the library, and an
+/// absolute one names the worktree the drop just deleted.
+fn strip_core_worktree(config: &str) -> String {
+    let mut kept = String::with_capacity(config.len());
+    let mut in_core = false;
+    // A value ending in '\' continues on the next line, so a dropped entry
+    // has to take its continuation lines with it rather than leave them
+    // behind as config of their own
+    let mut continuing = false;
+
+    for line in config.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if continuing {
+            continuing = trimmed.ends_with('\\');
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            // Section names are case-insensitive, and `core` takes no
+            // subsection, so a `[core "..."]` header is some other section
+            in_core = trimmed.eq_ignore_ascii_case("[core]");
+        } else if in_core {
+            let key = trimmed.split('=').next().unwrap_or_default().trim();
+            if key.eq_ignore_ascii_case("worktree") {
+                continuing = trimmed.ends_with('\\');
+                continue;
+            }
+        }
+        kept.push_str(line);
+    }
+
+    kept
+}
+
 /// Clone a repository (from a remote URL or a local path) into the given
 /// destination directory, creating parent directories as needed
 pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
@@ -260,9 +308,11 @@ pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
     Ok(repo)
 }
 
-/// Rewrite `core.bare` in the given git directory's own config file. The
-/// library keeps its copies bare and a workspace checkout is not, so a repo
-/// is flipped on its way in and back on its way out.
+/// Rewrite `core.bare` in the given git directory's own config file, dropping
+/// any `core.worktree` along with it. The library keeps its copies bare and a
+/// workspace checkout is not, so a repo is flipped on its way in and back on
+/// its way out; see [`strip_core_worktree`] for why a worktree the config
+/// names is no longer the repo's to keep by then.
 ///
 /// The new text is written to a file of its own and renamed over `config`,
 /// rather than written where `config` currently points.
@@ -291,17 +341,36 @@ pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
 /// longer leave the repo it is about to move into the library holding a
 /// truncated config, which is where its remotes are.
 fn set_bare_in_config(git_dir: &Path, bare: bool) -> Result<()> {
+    rewrite_config(git_dir, "config", |config| {
+        set_core_bare(&strip_core_worktree(config), bare)
+    })?;
+
+    // `extensions.worktreeConfig` splits a repository's config in two, and the
+    // second file carries `core.worktree` just as well as the first — so it
+    // has to lose the key too, or the repo that comes back out of the library
+    // still names a worktree somewhere else and every status check after the
+    // restore reads that directory instead of the one in the workspace.
+    if git_dir.join("config.worktree").is_file() {
+        rewrite_config(git_dir, "config.worktree", strip_core_worktree)?;
+    }
+    Ok(())
+}
+
+/// Replace one of the git directory's config files with `rewrite` applied to
+/// its text; see [`set_bare_in_config`] for why the write goes through a
+/// rename rather than landing on the existing file.
+fn rewrite_config(git_dir: &Path, name: &str, rewrite: impl FnOnce(&str) -> String) -> Result<()> {
     use std::io::Write;
 
-    let config_path = git_dir.join("config");
+    let config_path = git_dir.join(name);
     let config = std::fs::read_to_string(&config_path)?;
-    let updated = set_core_bare(&config, bare);
+    let updated = rewrite(&config);
 
     // Created exclusively, so the write can't be aimed somewhere else by a
     // link planted under this name either. `remove_file` clears a stale one
     // left by an interrupted drop — and takes the link itself, never whatever
     // it points at.
-    let temp_path = git_dir.join("config.workset-new");
+    let temp_path = git_dir.join(format!("{}.workset-new", name));
     let _ = std::fs::remove_file(&temp_path);
     let write = std::fs::OpenOptions::new()
         .write(true)
@@ -328,10 +397,16 @@ fn check_out_worktree(worktree: &Path, git_dir: &Path) -> Result<()> {
     // into at all
     set_bare_in_config(git_dir, false)?;
 
-    let repo = gix::open(worktree)?;
-    let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
+    // Opened in isolation, and written into `worktree` rather than into
+    // whatever the repository answers that its worktree is. `core.worktree`
+    // in the repo's own config, a `config.worktree` beside it, or a
+    // `GIT_WORK_TREE` in the environment each name a directory of their own,
+    // and this checkout has exactly one directory it may write to: the one
+    // the restore just made for the repo inside the workspace.
+    let repo = gix::open_opts(worktree, gix::open::Options::isolated())?;
+    if repo.workdir().is_none() {
         bail!("{} has no worktree to check out into", worktree.display());
-    };
+    }
 
     // An entry the library holds without any commits checks out nothing, and
     // an empty worktree matches no index at all — not even the one the repo
@@ -350,7 +425,7 @@ fn check_out_worktree(worktree: &Path, git_dir: &Path) -> Result<()> {
 
     gix::worktree::state::checkout(
         &mut index,
-        workdir,
+        worktree.to_owned(),
         repo.objects.clone().into_arc()?,
         &gix::progress::Discard,
         &gix::progress::Discard,
@@ -1762,6 +1837,56 @@ mod tests {
         assert!(updated.contains("filemode = true"));
     }
 
+    /// `core.worktree` points git at a worktree of its own choosing, which a
+    /// repo in the workspace does not get to have, so the key goes whenever
+    /// the config is rewritten — whatever case it is spelled in, and wherever
+    /// in the `[core]` section it sits. A `worktree` key in some *other*
+    /// section is that section's business and stays.
+    #[test]
+    fn strip_core_worktree_removes_only_the_core_entry() {
+        let config = concat!(
+            "[core]\n",
+            "\trepositoryformatversion = 0\n",
+            "\tworktree = /outside\n",
+            "\tfilemode = true\n",
+            "[CORE]\n",
+            "\tWorkTree=/outside/again\n",
+            "[core \"sub\"]\n",
+            "\tworktree = /kept/subsection\n",
+            "[submodule \"x\"]\n",
+            "\tworktree = /kept/other-section\n",
+        );
+        let stripped = strip_core_worktree(config);
+
+        assert!(!stripped.contains("/outside"));
+        assert!(stripped.contains("\trepositoryformatversion = 0\n"));
+        assert!(stripped.contains("\tfilemode = true\n"));
+        assert!(stripped.contains("[CORE]\n"));
+        assert!(stripped.contains("/kept/subsection"));
+        assert!(stripped.contains("/kept/other-section"));
+    }
+
+    /// A git config value ending in a backslash continues on the next line, so
+    /// dropping the entry has to drop the rest of the value with it. Left
+    /// behind, the continuation lines read as config of their own — and the
+    /// first of them is a path, which git rejects as a bad config line and
+    /// which would make the repo unopenable.
+    #[test]
+    fn strip_core_worktree_takes_a_continued_value_whole() {
+        let config = "[core]\n\tworktree = /outside/one\\\n/two\\\n/three\n\tfilemode = true\n";
+        let stripped = strip_core_worktree(config);
+
+        assert_eq!(stripped, "[core]\n\tfilemode = true\n");
+    }
+
+    /// A config with nothing to strip comes back byte for byte, trailing
+    /// newline included: the rewrite is only meant to remove the one key.
+    #[test]
+    fn strip_core_worktree_leaves_an_innocent_config_alone() {
+        let config = "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = x\n";
+        assert_eq!(strip_core_worktree(config), config);
+    }
+
     #[test]
     fn set_core_bare_appends_missing_core_section() {
         let config = "[user]\n\tname = example\n";
@@ -2520,6 +2645,133 @@ mod tests {
         assert_eq!(git(&repo, &["config", "core.bare"]), "false");
         // The library hands the repo over rather than keeping a stale copy
         assert!(!workspace.library_contains("github.com/user/project"));
+    }
+
+    /// A restore writes files, and where it writes them must not be up to the
+    /// repository being restored. `core.worktree` names a worktree directory
+    /// of git's own choosing and git honours it over the directory the `.git`
+    /// sits in, so a library entry carrying the key sent the checkout's files
+    /// to an absolute path anywhere the user could write — a dotfile
+    /// directory, a `bin` on PATH, an autostart directory — and left the
+    /// workspace directory the restore had just made standing empty. `.git` is
+    /// part of whatever a repo was when it arrived (a tarball, a shared
+    /// directory, a copy someone handed over), so the key need not be one the
+    /// user ever set.
+    #[test]
+    fn restore_ignores_a_worktree_the_library_entrys_config_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        repo_with_a_commit(&repo);
+        fs::write(repo.join("payload.sh"), "echo pwned\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "--quiet", "-m", "two"]);
+
+        workspace
+            .drop(
+                &"github.com/user/project".parse::<RepoPattern>().unwrap(),
+                false,
+                false,
+            )
+            .unwrap();
+
+        // Written straight into the library entry's config, the way a repo
+        // that arrived with it would carry it
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let entry = PathBuf::from(workspace.library_path()).join("github.com/user/project");
+        let mut config = fs::read_to_string(entry.join("config")).unwrap();
+        config.push_str(&format!("\n[core]\n\tworktree = {}\n", outside.display()));
+        fs::write(entry.join("config"), config).unwrap();
+
+        workspace
+            .restore_from_library("github.com/user/project")
+            .unwrap();
+
+        // The repo is checked out where the workspace put it, and the
+        // directory the config named was never touched
+        assert_eq!(
+            fs::read_to_string(repo.join("payload.sh")).unwrap(),
+            "echo pwned\n"
+        );
+        assert!(!outside.join("payload.sh").exists());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+        // And the restored repo no longer carries the key, so the git and gix
+        // calls that come after the restore — the status scan, the info
+        // panel's line count, a later drop — read the worktree in the
+        // workspace rather than the one the config named
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        let query = ["config", "--default", "", "--get", "core.worktree"];
+        assert_eq!(
+            git(&repo, &query),
+            "",
+            "the restored repo kept core.worktree"
+        );
+    }
+
+    /// Removing `core.worktree` from the config is not on its own enough to
+    /// settle where a restore writes: a repo with `extensions.worktreeConfig`
+    /// set keeps a second config file, `config.worktree`, beside the first,
+    /// and the `core.worktree` in *that* one redirects the checkout just the
+    /// same. Rather than chase every file and environment variable that can
+    /// name a worktree, the checkout is given the one directory it is allowed
+    /// to write to.
+    #[test]
+    fn restore_ignores_a_worktree_the_entrys_worktree_config_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        repo_with_a_commit(&repo);
+        fs::write(repo.join("payload.sh"), "echo pwned\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "--quiet", "-m", "two"]);
+
+        workspace
+            .drop(
+                &"github.com/user/project".parse::<RepoPattern>().unwrap(),
+                false,
+                false,
+            )
+            .unwrap();
+
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let entry = PathBuf::from(workspace.library_path()).join("github.com/user/project");
+        let mut config = fs::read_to_string(entry.join("config")).unwrap();
+        config.push_str("\n[extensions]\n\tworktreeConfig = true\n");
+        fs::write(entry.join("config"), config).unwrap();
+        fs::write(
+            entry.join("config.worktree"),
+            format!("[core]\n\tworktree = {}\n", outside.display()),
+        )
+        .unwrap();
+
+        workspace
+            .restore_from_library("github.com/user/project")
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(repo.join("payload.sh")).unwrap(),
+            "echo pwned\n"
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+        // The per-worktree config loses the key as well, so the status checks
+        // that follow the restore read the worktree in the workspace
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        let query = ["config", "--default", "", "--get", "core.worktree"];
+        assert_eq!(
+            git(&repo, &query),
+            "",
+            "the restored repo kept core.worktree"
+        );
     }
 
     /// A restore that can't finish has to leave the repo where it found it.
