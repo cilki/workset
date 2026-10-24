@@ -1508,7 +1508,7 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     // "scanning" status right away. These rows are also the scan's task list,
     // so each repo is placed in the tree exactly once.
     let workspace_paths = workspace.repos();
-    let library_names = workspace.list_library().unwrap_or_default();
+    let library_names = workspace.list_library();
     let library_paths: Vec<PathBuf> = library_names
         .iter()
         .map(|repo_path| PathBuf::from(&library_path).join(repo_path))

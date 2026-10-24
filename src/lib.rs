@@ -858,6 +858,32 @@ pub fn limit_status_walk_threads(threads: usize) {
     STATUS_WALK_THREADS.set(threads);
 }
 
+/// The status of a repo whose worktree is known to hold nothing uncommitted:
+/// whether it holds commits no remote does, and failing that what HEAD says
+/// about its history.
+///
+/// Both entry points below answer the worktree question first, and in
+/// different ways — [`check_repo_status`] stops at the first change it finds,
+/// [`check_repo_status_and_modification_time`] walks them all so it can date
+/// the row — but what they do with a clean worktree is the same ladder. It is
+/// written once because `drop` consumes a repo on the strength of these three
+/// statuses, and two copies of that decision are two chances for them to
+/// disagree about when a repo is safe to take.
+fn clean_worktree_status(repo: &gix::Repository) -> RepoStatus {
+    // Which commits the repo holds that no remote does is a question about
+    // its refs, not about the one HEAD happens to point at, so it is asked
+    // before HEAD is looked at at all
+    match unpublished_work(repo) {
+        Unpublished::Some => RepoStatus::Unpushed,
+        Unpublished::Unreadable => RepoStatus::Unknown,
+        Unpublished::None => match head_state(repo) {
+            HeadState::Unborn => RepoStatus::NoCommits,
+            HeadState::Unreadable => RepoStatus::Unknown,
+            HeadState::Detached | HeadState::Branch => RepoStatus::Clean,
+        },
+    }
+}
+
 /// Check repository status (commits, changes, unpushed) in a single pass
 pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
     let Some(repo) = open_repo(repo_path) else {
@@ -868,24 +894,11 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
     // worktree, and that work exists nowhere but here: no commit, no remote,
     // nothing the library would keep. Reporting it as NoCommits told `drop` it
     // was safe to move the git directory away and delete the worktree.
-    match has_uncommitted_work(&repo, repo_path) {
-        Some(true) => return Ok(RepoStatus::Dirty),
+    Ok(match has_uncommitted_work(&repo, repo_path) {
+        Some(true) => RepoStatus::Dirty,
         // A status that couldn't be read is not a repo without changes
-        None => return Ok(RepoStatus::Unknown),
-        Some(false) => {}
-    }
-    // Which commits the repo holds that no remote does is a question about
-    // its refs, not about the one HEAD happens to point at, so it is asked
-    // before HEAD is looked at at all
-    match unpublished_work(&repo) {
-        Unpublished::Some => return Ok(RepoStatus::Unpushed),
-        Unpublished::Unreadable => return Ok(RepoStatus::Unknown),
-        Unpublished::None => {}
-    }
-    Ok(match head_state(&repo) {
-        HeadState::Unborn => RepoStatus::NoCommits,
-        HeadState::Unreadable => RepoStatus::Unknown,
-        HeadState::Detached | HeadState::Branch => RepoStatus::Clean,
+        None => RepoStatus::Unknown,
+        Some(false) => clean_worktree_status(&repo),
     })
 }
 
@@ -912,21 +925,15 @@ pub fn check_repo_status_and_modification_time(
         return Ok((RepoStatus::Dirty, Some(commit_time.max(dirty_time))));
     }
 
-    let status = match unpublished_work(&repo) {
-        Unpublished::Some => RepoStatus::Unpushed,
-        Unpublished::Unreadable => return Ok((RepoStatus::Unknown, None)),
-        Unpublished::None => match head_state(&repo) {
-            HeadState::Unborn => {
-                // No commits and a clean worktree: no timestamp to report at
-                // all, so callers don't render a spurious "56y ago" from the
-                // UNIX epoch.
-                return Ok((RepoStatus::NoCommits, None));
-            }
-            HeadState::Unreadable => return Ok((RepoStatus::Unknown, None)),
-            HeadState::Detached | HeadState::Branch => RepoStatus::Clean,
-        },
+    let status = clean_worktree_status(&repo);
+    // A repo with no commits — and one whose refs couldn't be read at all —
+    // has no timestamp to report, so callers don't render a spurious "56y
+    // ago" from the UNIX epoch.
+    let time = match status {
+        RepoStatus::Clean | RepoStatus::Unpushed => get_last_commit_time(&repo).ok(),
+        RepoStatus::Dirty | RepoStatus::NoCommits | RepoStatus::Unknown => None,
     };
-    Ok((status, get_last_commit_time(&repo).ok()))
+    Ok((status, time))
 }
 
 /// Open a repository, logging and returning None when it can't be opened
@@ -1780,17 +1787,22 @@ impl Workspace {
         Ok(())
     }
 
-    /// List all repositories in the library
-    pub fn list_library(&self) -> Result<Vec<String>> {
+    /// List all repositories in the library, by workspace-relative path.
+    ///
+    /// The walk reports whatever it could reach, the way the workspace walk
+    /// in [`find_git_repositories`] does: a library that isn't there yet
+    /// yields nothing, and a directory inside one that can't be read is
+    /// skipped rather than failing the listing. So there is no error to
+    /// return, and returning one anyway meant every caller had to invent its
+    /// own story for a failure that could not happen — `restore` abandoned
+    /// the whole request, `list` silently left the library line out, the TUI
+    /// and the completions substituted an empty library.
+    pub fn list_library(&self) -> Vec<String> {
         let library_path = self.library_path();
-        if !Path::new(&library_path).exists() {
-            return Ok(Vec::new());
-        }
-
         let mut repos = Vec::new();
 
         // Recursively find all git repositories in the library
-        fn find_repos(base_path: &str, current_path: &Path, repos: &mut Vec<String>) -> Result<()> {
+        fn find_repos(base_path: &str, current_path: &Path, repos: &mut Vec<String>) {
             if current_path.is_dir() {
                 // Is this directory a repository? `gix::open` answers by
                 // building a whole Repository — locating the git directory,
@@ -1812,25 +1824,24 @@ impl Workspace {
                             repos.push(repo_path);
                         }
                     }
-                    return Ok(()); // Don't recurse into git repos
+                    return; // Don't recurse into git repos
                 }
 
                 // Recursively search subdirectories
                 if let Ok(entries) = std::fs::read_dir(current_path) {
                     for entry in entries.filter_map(|e| e.ok()) {
                         let path = entry.path();
-                        find_repos(base_path, &path, repos)?;
+                        find_repos(base_path, &path, repos);
                     }
                 }
             }
-            Ok(())
         }
 
-        find_repos(&library_path, Path::new(&library_path), &mut repos)?;
+        find_repos(&library_path, Path::new(&library_path), &mut repos);
 
         debug!(count = repos.len(), "Found repositories in library");
         repos.sort();
-        Ok(repos)
+        repos
     }
 }
 
@@ -2287,7 +2298,7 @@ mod tests {
         assert_eq!(report.dropped, vec!["github.com/user/one".to_string()]);
         assert!(report.skipped.is_empty());
         assert!(!repo.exists());
-        assert_eq!(workspace.list_library().unwrap(), ["github.com/user/one"]);
+        assert_eq!(workspace.list_library(), ["github.com/user/one"]);
 
         // The workspace itself came through untouched: its git directory, the
         // library the drop just wrote to, and the files it was tracking
@@ -3812,7 +3823,7 @@ mod tests {
         fs::create_dir_all(entry.join("objects/decoy/.git")).unwrap();
 
         assert_eq!(
-            workspace.list_library().unwrap(),
+            workspace.list_library(),
             vec!["github.com/a/one", "github.com/a/two", "gitlab.com/b/two"]
         );
     }
@@ -3832,10 +3843,7 @@ mod tests {
         gix::init(&entry).unwrap();
         fs::write(entry.join("tracked.txt"), "hello").unwrap();
 
-        assert_eq!(
-            workspace.list_library().unwrap(),
-            vec!["github.com/user/repo"]
-        );
+        assert_eq!(workspace.list_library(), vec!["github.com/user/repo"]);
     }
 
     /// A dropped repo lives on in the library as a bare git directory, and the

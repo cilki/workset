@@ -214,7 +214,7 @@ fn workspace_matches(workspace: &Workspace, pattern: &str) -> Vec<String> {
 /// nothing was restored, so the caller can exit non-zero.
 fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
     // Get all repos from library
-    let library_repos = workspace.list_library()?;
+    let library_repos = workspace.list_library();
 
     // A pattern that is exactly one of the library's entries names that entry
     // and nothing else. Parsing it would read it as a clone URL instead, and a
@@ -658,16 +658,13 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     }
 
     // The repos that aren't here are in the library, so what it holds belongs
-    // in the command that reports on the working set. A library that can't be
-    // read is left unmentioned rather than failing the listing.
-    if let Ok(library) = workspace.list_library() {
-        outln!();
-        outln!(
-            "Library ({}): {} repository(ies)",
-            quote_path(&workspace.library_path()),
-            library.len()
-        );
-    }
+    // in the command that reports on the working set.
+    outln!();
+    outln!(
+        "Library ({}): {} repository(ies)",
+        quote_path(&workspace.library_path()),
+        workspace.list_library().len()
+    );
 
     Ok(())
 }
@@ -757,7 +754,7 @@ fn completions<'line>(
             // `restore` names repos the library holds; every other subcommand
             // names repos that are checked out
             Some(workspace) if words.get(1) == Some(&"restore") => {
-                Completions::Library(workspace.list_library().unwrap_or_default())
+                Completions::Library(workspace.list_library())
             }
             Some(workspace) => Completions::Workspace(workspace_repos(workspace)),
             None => Completions::Workspace(Vec::new()),
