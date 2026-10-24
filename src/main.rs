@@ -694,6 +694,53 @@ enum Completions {
 }
 
 impl Completions {
+    /// The same candidates with the ones no shell can be handed left out.
+    ///
+    /// Both completion protocols are line-oriented: bash reads our output
+    /// with `mapfile -t`, fish splits the command substitution on newlines,
+    /// and fish's own lines are `candidate<TAB>description`. So a candidate
+    /// holding a newline is not offered as one awkward word, it is offered as
+    /// *two* — and the second one is a candidate the workspace never had.
+    ///
+    /// A repo's directory name is not workset's to choose: on Unix it may
+    /// hold any byte but `/` and NUL, and a repo can arrive as files — a
+    /// tarball, a shared directory, a copy someone handed over. A repo named
+    /// `evil<LF>github.com` therefore put a bare `github.com` in the list,
+    /// and `github.com` is not a repo at all but is still accepted as a
+    /// pattern: taking the suggestion ran `workset drop github.com`, which
+    /// matches every repo under it. That is the same escalation the unquoted
+    /// `COMPREPLY=($(...))` in `completions/workset.bash` used to allow by
+    /// globbing, reached through the candidate's own bytes instead.
+    ///
+    /// Printed output answers this by quoting the name
+    /// ([`workset::quote_path`]), but a candidate can't be quoted: bash
+    /// inserts it into the command line verbatim, so the C-style escapes
+    /// would become part of the pattern and name nothing. The candidate is
+    /// dropped instead, along with the rest of what
+    /// [`workset::path_rewrites_output`] covers — a tab truncates a fish
+    /// candidate at the description, and an ESC sequence or a bidi override
+    /// makes the menu read as a name other than the one that gets inserted.
+    /// The repo keeps everything but the suggestion: it is still listed (with
+    /// quoting), and still named by a pattern typed out by hand.
+    fn displayable(self) -> Self {
+        match self {
+            // workset's own words, not a repo's
+            Self::Subcommands(subcommands) => Self::Subcommands(subcommands),
+            Self::Library(repos) => Self::Library(
+                repos
+                    .into_iter()
+                    .filter(|repo| !workset::path_rewrites_output(repo))
+                    .collect(),
+            ),
+            Self::Workspace(repos) => Self::Workspace(
+                repos
+                    .into_iter()
+                    .filter(|(name, _)| !workset::path_rewrites_output(name))
+                    .collect(),
+            ),
+        }
+    }
+
     /// Just the candidate words, for shells that take no descriptions
     fn values(&self) -> Vec<&str> {
         match self {
@@ -761,7 +808,9 @@ fn completions<'line>(
         }
     };
 
-    (current_word, candidates)
+    // One gate for both shells, since both protocols are line-oriented and
+    // neither can carry the candidates this leaves out
+    (current_word, candidates.displayable())
 }
 
 /// The completion request as the shell describes it in the environment
@@ -1197,6 +1246,54 @@ mod tests {
             .map(|line| line.split('\t').next().unwrap().to_string())
             .collect();
         assert_eq!(offered, ["alpha", "beta", "gamma"]);
+    }
+
+    /// A completion candidate is one line of a line-oriented protocol, so a
+    /// repo whose directory name holds a newline used to be offered as two
+    /// candidates — and the extra one is a word the workspace never had. A
+    /// repo named `evil<LF>github.com` offered a bare `github.com`, which is
+    /// not a repo but is still a pattern, and `workset drop github.com`
+    /// matches every repo under it. The name is the repo's own (it can arrive
+    /// as files: a tarball, a shared directory, a copy someone handed over),
+    /// so the bytes are not workset's to trust.
+    #[test]
+    fn a_repo_name_cannot_forge_a_second_completion_candidate() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = workspace(temp.path());
+
+        // Both candidate sources: a repo checked out in the workspace, which
+        // `drop` and `clone` name, and a library entry, which `restore` does
+        for name in ["evil\ngithub.com", "evil\tgithub.com", "evil\u{1b}[2Kx"] {
+            let checked_out = temp.path().join(name);
+            std::fs::create_dir_all(&checked_out).unwrap();
+            gix::init(&checked_out).unwrap();
+            let stored = Path::new(&workspace.library_path()).join(name);
+            std::fs::create_dir_all(&stored).unwrap();
+            gix::init_bare(&stored).unwrap();
+        }
+
+        // Nothing but the repos that can be spelled on one line, so no line
+        // of the output splits into a candidate of its own
+        assert_eq!(
+            offered(Some(&workspace), "workset drop "),
+            ["github.com/user/alpha"]
+        );
+        assert_eq!(
+            offered(Some(&workspace), "workset restore "),
+            ["github.com/user/stored"]
+        );
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset drop ", None),
+            ["github.com/user/alpha"]
+        );
+
+        // Including through the lines fish is handed, where the candidate and
+        // its description are themselves separated by a tab
+        let (current_word, candidates) = completions(Some(&workspace), "workset drop ", None);
+        assert_eq!(
+            fish_lines(current_word, candidates),
+            ["github.com/user/alpha\tno commits"]
+        );
     }
 
     #[test]

@@ -266,6 +266,24 @@ testBashScriptDoesNotGlobRepoNames() {
 	diff <(printf '%s\n' "${COMPREPLY[@]}") <(printf '*\n'; repos)
 }
 
+## A completion candidate is one line, and a repo's directory name may hold a
+## newline -- it arrives as files (a tarball, a shared directory, a copy
+## someone handed over), so its bytes are whoever assembled it to choose. Such
+## a name used to be offered as *two* candidates, the second of which is a
+## word the workspace never had: 'subdir' is not a repo, but it is still taken
+## as a pattern, so `workset drop subdir` drops everything under it. The
+## candidate can't be quoted on the way out -- bash inserts it verbatim, so the
+## escapes would become part of the pattern -- so the repo goes unsuggested.
+testBashScriptDoesNotSplitRepoNamesOnNewlines() {
+	setupWorkspace
+	mkdir $'evil\nsubdir'
+	git -C $'evil\nsubdir' init -q -b main
+
+	bashCompleteThroughScript "workset drop "
+
+	diff <(printf '%s\n' "${COMPREPLY[@]}") <(repos)
+}
+
 ## Nothing to suggest leaves the array empty rather than holding one empty
 ## candidate, so bash falls back to the filenames `-o default` asks for
 testBashScriptOffersNothingForAnUnknownRepo() {

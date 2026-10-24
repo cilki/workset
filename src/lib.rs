@@ -133,6 +133,27 @@ impl RepoPattern {
     }
 }
 
+/// Whether this path holds a character that changes the text around it
+/// instead of occupying a column of its own: the C0/C1 controls, plus the
+/// bidi embeddings, overrides and isolates.
+///
+/// These are the characters [`quote_path`] quotes a path for, and a path
+/// without any of them is one that can be written into line-oriented output
+/// verbatim. A caller that can quote should; this is for the ones that can't,
+/// and have to leave the path out instead.
+pub fn path_rewrites_output(path: &str) -> bool {
+    path.contains(must_escape)
+}
+
+/// The C0/C1 control characters, plus the bidi embeddings, overrides and
+/// isolates: what they all have in common is that they change the text
+/// around them instead of occupying a column of their own.
+fn must_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// Printable form of a path, C-style quoted when it holds characters that
 /// would rewrite the output around it rather than just adding to it. A path
 /// that needs no quoting is returned untouched.
@@ -159,17 +180,11 @@ impl RepoPattern {
 /// the same way, with the C-style quoting of `core.quotePath`; the quotes are
 /// part of the answer, because they are what tells the user that what they
 /// are looking at is not literally the name.
+///
+/// [`path_rewrites_output`] is the same test without the quoting, for the
+/// callers that can't quote.
 pub fn quote_path(path: &str) -> std::borrow::Cow<'_, str> {
-    // The C0/C1 control characters, plus the bidi embeddings, overrides and
-    // isolates: what they all have in common is that they change the text
-    // around them instead of occupying a column of their own.
-    fn must_escape(c: char) -> bool {
-        c.is_control()
-            || matches!(c,
-                '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-    }
-
-    if !path.contains(must_escape) {
+    if !path_rewrites_output(path) {
         return std::borrow::Cow::Borrowed(path);
     }
 
