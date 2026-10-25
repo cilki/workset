@@ -42,7 +42,20 @@ const LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Only overrides that cost a legitimate repo nothing belong here; the two
 /// vectors that would trade away working setups (`remote.<name>.uploadpack`
 /// and gix's filter drivers) are left to the decision in issue #57.
-const UNTRUSTED_CONFIG_OVERRIDES: [&str; 3] = [
+const UNTRUSTED_CONFIG_OVERRIDES: [&str; 4] = [
+    // The program git runs to ask the user for a credential, which it does
+    // for any remote that answers a fetch with an authentication challenge.
+    // `GIT_TERMINAL_PROMPT=0` below does not cover it: that closes the
+    // *terminal* prompt, which git only reaches after the askpass program
+    // has been tried, so the repo's own `core.askpass` runs even though
+    // there is no terminal to prompt on. An askpass is a question put to a
+    // human, and these fetches are workset's rather than the user's: there
+    // is nobody at the other end of one, which is what
+    // `GIT_TERMINAL_PROMPT=0` already says. Pinning it empty leaves
+    // `GIT_ASKPASS` alone, so a user who exports one still gets it, and
+    // credential helpers — where a background fetch's credentials actually
+    // come from — are untouched.
+    "core.askpass=",
     // A command git runs to learn which paths changed, which it does whenever
     // it refreshes the index — both of the info panel's calls do. It is a
     // performance feature, so pinning it off only costs a slower scan of a
@@ -968,6 +981,92 @@ mod tests {
         let outcome = sync_repo(&repo, &AtomicBool::new(false)).unwrap();
 
         assert!(!marker.exists(), "the fetch ran the repo's proxy command");
+        assert!(outcome.offline);
+    }
+
+    /// Answer every request on a fresh loopback port with a Basic auth
+    /// challenge, so a fetch aimed at it gets as far as asking for a
+    /// credential. Returns the port.
+    #[cfg(unix)]
+    fn unauthorized_http_server() -> u16 {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                // Read the request first: answering and hanging up on a peer
+                // that is still writing costs the response its reader
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => request.push(byte[0]),
+                    }
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\n\
+                      WWW-Authenticate: Basic realm=\"workset\"\r\n\
+                      Content-Length: 0\r\n\r\n",
+                );
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    /// `core.askpass` names the program git runs to ask for a credential, and
+    /// it runs for any remote that answers with an authentication challenge —
+    /// which is any address the repo's config cares to name. The
+    /// `GIT_TERMINAL_PROMPT=0` the fetch already sets does not stand in for
+    /// this: it closes the *terminal* prompt, which git only falls back to
+    /// once the askpass program has been tried, so the repo's own askpass is
+    /// executed even with no terminal anywhere in sight.
+    #[cfg(unix)]
+    #[test]
+    fn a_fetch_that_needs_credentials_does_not_run_the_repos_askpass() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("work");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+
+        let marker = temp.path().join("pwned");
+        let script = temp.path().join("askpass.sh");
+        marker_script(&script, &marker);
+        git(&["config", "core.askpass", &script.to_string_lossy()]);
+        // Whatever helper the machine running the tests has configured would
+        // answer the challenge itself and the fetch would never ask; an empty
+        // value resets the list, and the repo's config is the attacker's own
+        // ground in this scenario anyway
+        git(&["config", "credential.helper", ""]);
+        let port = unauthorized_http_server();
+        git(&[
+            "remote",
+            "add",
+            "evil",
+            &format!("http://127.0.0.1:{}/repo.git", port),
+        ]);
+
+        let outcome = sync_repo(&repo, &AtomicBool::new(false)).unwrap();
+
+        assert!(!marker.exists(), "the fetch ran the repo's askpass program");
+        // Nothing could be fetched, which is what an unanswerable
+        // authentication challenge looks like from here
         assert!(outcome.offline);
     }
 
