@@ -291,32 +291,8 @@ fn find_git_repositories_below(path: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Return the config text with core.bare set to the given value, adding the
-/// [core] section or the bare entry if missing
-fn set_core_bare(config: &str, bare: bool) -> String {
-    if config.contains("[core]") {
-        if config.contains("bare =") || config.contains("bare=") {
-            config
-                .lines()
-                .map(|line| {
-                    if line.trim().starts_with("bare") {
-                        format!("\tbare = {}", bare)
-                    } else {
-                        line.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            config.replacen("[core]", &format!("[core]\n\tbare = {}", bare), 1)
-        }
-    } else {
-        format!("{}\n[core]\n\tbare = {}\n", config, bare)
-    }
-}
-
 /// Return the config text with every `worktree` entry removed from its
-/// `[core]` sections.
+/// `[core]` sections, and `core.bare` set to `bare` when one is given.
 ///
 /// `core.worktree` names the directory a git directory keeps its worktree in,
 /// and git honours it over the directory the `.git` is sitting in. workset's
@@ -332,35 +308,48 @@ fn set_core_bare(config: &str, bare: bool) -> String {
 /// Removing it costs the repo nothing a drop hadn't already taken: a relative
 /// path no longer resolves once the git directory lives in the library, and an
 /// absolute one names the worktree the drop just deleted.
-fn strip_core_worktree(config: &str) -> String {
-    let mut kept = String::with_capacity(config.len());
-    let mut in_core = false;
-    // A value ending in '\' continues on the next line, so a dropped entry
-    // has to take its continuation lines with it rather than leave them
-    // behind as config of their own
-    let mut continuing = false;
+///
+/// The edit goes through the same parser gix reads a repository's config with,
+/// rather than over the lines of the file, because the shape of a line is not
+/// what decides whether git reads a key. A variable may sit on the section
+/// header's own line (`[core] worktree = /outside`), a header may be followed
+/// by a comment (`[core] ; mine`) that leaves the keys under it in `core` all
+/// the same, and a value may be quoted or continued across lines. Matching
+/// `[core]` as a whole line missed the first two spellings, so the entry this
+/// exists to remove went into the library with the repo and came back out
+/// with it — and splicing `bare` in after the literal text `[core]` appended
+/// it to whatever variable shared that line, which left the library holding a
+/// config git refuses to read at all.
+fn edited_config(config: &gix::bstr::BStr, bare: Option<bool>) -> Result<gix::bstr::BString> {
+    let mut file = gix::config::File::try_from(config)?;
 
-    for line in config.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if continuing {
-            continuing = trimmed.ends_with('\\');
-            continue;
+    // Every `[core]` section, because git reads the key from any of them —
+    // not just from the last, which is only where its *value* comes from.
+    // `[core "sub"]` is a section of its own and so is `[submodule]`: a
+    // `worktree` in either is that section's business and stays.
+    let core_sections: Vec<_> = file
+        .sections_and_ids_by_name("core")
+        .into_iter()
+        .flatten()
+        .filter(|(section, _)| section.header().subsection_name().is_none())
+        .map(|(_, id)| id)
+        .collect();
+    for id in core_sections {
+        if let Some(mut section) = file.section_mut_by_id(id) {
+            // One entry at a time, so a section naming the key more than once
+            // loses every one of them
+            while section.remove("worktree").is_some() {}
         }
-        if trimmed.starts_with('[') {
-            // Section names are case-insensitive, and `core` takes no
-            // subsection, so a `[core "..."]` header is some other section
-            in_core = trimmed.eq_ignore_ascii_case("[core]");
-        } else if in_core {
-            let key = trimmed.split('=').next().unwrap_or_default().trim();
-            if key.eq_ignore_ascii_case("worktree") {
-                continuing = trimmed.ends_with('\\');
-                continue;
-            }
-        }
-        kept.push_str(line);
     }
 
-    kept
+    if let Some(bare) = bare {
+        // Into the last `[core]` section, which is the one git takes the
+        // value from, or a new one when the config has none
+        file.section_mut_or_create_new("core", None)?
+            .set("bare", if bare { "true" } else { "false" })?;
+    }
+
+    Ok(file.to_bstring())
 }
 
 /// Clone a repository (from a remote URL or a local path) into the given
@@ -419,7 +408,7 @@ pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
 /// truncated config, which is where its remotes are.
 fn set_bare_in_config(git_dir: &Path, bare: bool) -> Result<()> {
     rewrite_config(git_dir, "config", |config| {
-        set_core_bare(&strip_core_worktree(config), bare)
+        edited_config(config, Some(bare))
     })?;
 
     // `extensions.worktreeConfig` splits a repository's config in two, and the
@@ -428,7 +417,9 @@ fn set_bare_in_config(git_dir: &Path, bare: bool) -> Result<()> {
     // still names a worktree somewhere else and every status check after the
     // restore reads that directory instead of the one in the workspace.
     if git_dir.join("config.worktree").is_file() {
-        rewrite_config(git_dir, "config.worktree", strip_core_worktree)?;
+        rewrite_config(git_dir, "config.worktree", |config| {
+            edited_config(config, None)
+        })?;
     }
     Ok(())
 }
@@ -436,12 +427,19 @@ fn set_bare_in_config(git_dir: &Path, bare: bool) -> Result<()> {
 /// Replace one of the git directory's config files with `rewrite` applied to
 /// its text; see [`set_bare_in_config`] for why the write goes through a
 /// rename rather than landing on the existing file.
-fn rewrite_config(git_dir: &Path, name: &str, rewrite: impl FnOnce(&str) -> String) -> Result<()> {
+fn rewrite_config(
+    git_dir: &Path,
+    name: &str,
+    rewrite: impl FnOnce(&gix::bstr::BStr) -> Result<gix::bstr::BString>,
+) -> Result<()> {
     use std::io::Write;
 
+    // Read as bytes rather than as text: a config value is a path as often as
+    // not, and a path is bytes. A repo whose config holds one this platform
+    // can't spell in UTF-8 is still a repo to drop and restore.
     let config_path = git_dir.join(name);
-    let config = std::fs::read_to_string(&config_path)?;
-    let updated = rewrite(&config);
+    let config = std::fs::read(&config_path)?;
+    let updated = rewrite(gix::bstr::BStr::new(&config))?;
 
     // Created exclusively, so the write can't be aimed somewhere else by a
     // link planted under this name either. `remove_file` clears a stale one
@@ -453,7 +451,7 @@ fn rewrite_config(git_dir: &Path, name: &str, rewrite: impl FnOnce(&str) -> Stri
         .write(true)
         .create_new(true)
         .open(&temp_path)
-        .and_then(|mut file| file.write_all(updated.as_bytes()))
+        .and_then(|mut file| file.write_all(&updated))
         .and_then(|()| std::fs::rename(&temp_path, &config_path));
     if let Err(e) = write {
         // Nothing reads this file but the rename that was meant to consume it
@@ -951,18 +949,60 @@ pub fn check_repo_status_and_modification_time(
     Ok((status, time))
 }
 
-/// Open a repository, logging and returning None when it can't be opened
+/// Open a repository to read the status of the worktree at `repo_path`,
+/// logging and returning None when it can't be opened — or when the worktree
+/// it would report on is not the directory at `repo_path`.
 fn open_repo(repo_path: &Path) -> Option<gix::Repository> {
-    match gix::open(repo_path) {
-        Ok(repo) => Some(repo),
+    let repo = match gix::open(repo_path) {
+        Ok(repo) => repo,
         Err(e) => {
             warn!(
                 path = %repo_path.display(),
                 error = %e,
                 "Failed to open repository"
             );
-            None
+            return None;
         }
+    };
+
+    // A status answers "what is in this directory that exists nowhere else",
+    // and `drop` consumes the directory on the strength of the answer. So the
+    // worktree the status walked has to be the directory being asked about:
+    // `core.worktree` in the repo's own config names another one, git and gix
+    // both honour it, and `.git` is part of whatever a repo was when it
+    // arrived — a tarball, a shared directory, a copy someone handed over —
+    // so the key need not be one the user ever set.
+    //
+    // A repo carrying one reported the state of the directory the key named.
+    // Pointed at an empty directory it read "clean", and the drop that
+    // followed deleted the uncommitted work in the workspace directory
+    // instead: the one thing a status exists to prevent. There is nothing to
+    // report about a repo workset can't read the worktree of, which is what
+    // [`RepoStatus::Unknown`] says and what `drop` refuses on.
+    if !repo
+        .workdir()
+        .is_some_and(|workdir| is_same_dir(workdir, repo_path))
+    {
+        warn!(
+            path = %repo_path.display(),
+            workdir = ?repo.workdir(),
+            "Repository's worktree is not the directory it sits in"
+        );
+        return None;
+    }
+    Some(repo)
+}
+
+/// Whether both paths name the same directory on disk.
+///
+/// Compared on canonical paths, because the same directory has many
+/// spellings: a workspace reached through a symlink, a relative path, a `..`
+/// on the way. A path that can't be resolved at all — the worktree a config
+/// names need not exist — names no directory, and so matches nothing.
+fn is_same_dir(one: &Path, other: &Path) -> bool {
+    match (std::fs::canonicalize(one), std::fs::canonicalize(other)) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => false,
     }
 }
 
@@ -1964,25 +2004,82 @@ mod tests {
         assert_eq!(quote_path("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
     }
 
+    /// [`edited_config`] over text, for the cases that are about the config
+    /// file rather than about a repository on disk
+    fn edit(config: &str, bare: Option<bool>) -> String {
+        edited_config(gix::bstr::BStr::new(config), bare)
+            .unwrap()
+            .to_string()
+    }
+
+    /// What git reads `core.worktree` as in the given config text, asked of
+    /// git itself so the answer is the one that matters rather than this
+    /// test's idea of how config is spelled
+    fn git_core_worktree(dir: &Path, config: &str) -> String {
+        let path = dir.join("under-test");
+        fs::write(&path, config).unwrap();
+        git(
+            dir,
+            &[
+                "config",
+                "--file",
+                &path.to_string_lossy(),
+                "--default",
+                "",
+                "--get",
+                "core.worktree",
+            ],
+        )
+    }
+
     #[test]
     fn set_core_bare_replaces_existing_entry() {
         let config = "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = x\n";
-        let updated = set_core_bare(config, true);
-        assert!(updated.contains("\tbare = true"));
+        let updated = edit(config, Some(true));
+        assert!(updated.contains("bare = true"));
         assert!(!updated.contains("bare = false"));
         assert!(updated.contains("[remote \"origin\"]"));
 
-        let reverted = set_core_bare(&updated, false);
-        assert!(reverted.contains("\tbare = false"));
+        let reverted = edit(&updated, Some(false));
+        assert!(reverted.contains("bare = false"));
         assert!(!reverted.contains("bare = true"));
     }
 
     #[test]
     fn set_core_bare_inserts_under_existing_core_section() {
         let config = "[core]\n\tfilemode = true\n";
-        let updated = set_core_bare(config, true);
-        assert!(updated.contains("[core]\n\tbare = true"));
-        assert!(updated.contains("filemode = true"));
+        let updated = edit(config, Some(true));
+        assert!(updated.contains("[core]\n\tfilemode = true\n\tbare = true"));
+    }
+
+    #[test]
+    fn set_core_bare_appends_missing_core_section() {
+        let config = "[user]\n\tname = example\n";
+        let updated = edit(config, Some(false));
+        assert!(updated.contains("[core]\n\tbare = false"));
+        assert!(updated.contains("name = example"));
+    }
+
+    /// A variable may sit on its section header's own line, and `[core]` with
+    /// a variable behind it is still the `core` section. Splicing `bare` in
+    /// after the text `[core]` appended it to that variable's line instead —
+    /// `bare = true worktree = /outside` — which is one bad value git refuses
+    /// the whole config over, so the library ended up holding an entry
+    /// neither git nor gix would open.
+    #[test]
+    fn set_core_bare_keeps_a_variable_on_the_header_line_readable() {
+        let temp_dir = TempDir::new().unwrap();
+        let updated = edit("[core] filemode = true\n", Some(true));
+
+        assert_eq!(
+            git_core_worktree(temp_dir.path(), &updated),
+            "",
+            "{updated:?}"
+        );
+        let query = ["config", "--file", "under-test", "--get", "core.bare"];
+        assert_eq!(git(temp_dir.path(), &query), "true", "{updated:?}");
+        let query = ["config", "--file", "under-test", "--get", "core.filemode"];
+        assert_eq!(git(temp_dir.path(), &query), "true", "{updated:?}");
     }
 
     /// `core.worktree` points git at a worktree of its own choosing, which a
@@ -2004,7 +2101,7 @@ mod tests {
             "[submodule \"x\"]\n",
             "\tworktree = /kept/other-section\n",
         );
-        let stripped = strip_core_worktree(config);
+        let stripped = edit(config, None);
 
         assert!(!stripped.contains("/outside"));
         assert!(stripped.contains("\trepositoryformatversion = 0\n"));
@@ -2012,6 +2109,43 @@ mod tests {
         assert!(stripped.contains("[CORE]\n"));
         assert!(stripped.contains("/kept/subsection"));
         assert!(stripped.contains("/kept/other-section"));
+    }
+
+    /// Every spelling git reads the key in, which is not the same thing as
+    /// every spelling that looks like a line of config: a variable can share
+    /// the section header's line, a header can be followed by a comment and
+    /// still open the section for the lines under it, and a value can be
+    /// quoted. The first two survived a pass that matched `[core]` as a whole
+    /// line, so the key they carried went into the library with the repo and
+    /// came back out with it — and then named the worktree of every status
+    /// check, `git diff` and later drop of the restored repo.
+    #[test]
+    fn strip_core_worktree_removes_every_spelling_git_reads() {
+        let temp_dir = TempDir::new().unwrap();
+        for config in [
+            "[core]\n\tworktree = /outside\n",
+            "[core] worktree = /outside\n",
+            "[core] ; a comment ends the header\n\tworktree = /outside\n",
+            "[core] # and so does this one\n\tworktree = /outside\n",
+            "[core]\n\tworktree = \"/outside\"\n",
+            "[core]\n\tworktree = /out\\\nside\n",
+            "[CoRe] WorkTree = /outside\n",
+            "[core]\n\tworktree = /first\n\tworktree = /second\n",
+            "[core]\n\tbare = false\n[core]\n\tworktree = /outside\n",
+        ] {
+            // The vector is real: git reads the key out of each of these
+            assert_ne!(
+                git_core_worktree(temp_dir.path(), config),
+                "",
+                "git reads no core.worktree in {config:?}"
+            );
+            let stripped = edit(config, Some(true));
+            assert_eq!(
+                git_core_worktree(temp_dir.path(), &stripped),
+                "",
+                "core.worktree survived in {stripped:?}"
+            );
+        }
     }
 
     /// A git config value ending in a backslash continues on the next line, so
@@ -2022,25 +2156,24 @@ mod tests {
     #[test]
     fn strip_core_worktree_takes_a_continued_value_whole() {
         let config = "[core]\n\tworktree = /outside/one\\\n/two\\\n/three\n\tfilemode = true\n";
-        let stripped = strip_core_worktree(config);
+        let stripped = edit(config, None);
 
         assert_eq!(stripped, "[core]\n\tfilemode = true\n");
     }
 
     /// A config with nothing to strip comes back byte for byte, trailing
-    /// newline included: the rewrite is only meant to remove the one key.
+    /// newline and comments included: the rewrite is only meant to remove the
+    /// one key, and the rest of the file is the repo's.
     #[test]
     fn strip_core_worktree_leaves_an_innocent_config_alone() {
-        let config = "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = x\n";
-        assert_eq!(strip_core_worktree(config), config);
-    }
-
-    #[test]
-    fn set_core_bare_appends_missing_core_section() {
-        let config = "[user]\n\tname = example\n";
-        let updated = set_core_bare(config, false);
-        assert!(updated.contains("[core]\n\tbare = false"));
-        assert!(updated.contains("name = example"));
+        let config = concat!(
+            "# a comment of the user's own\n",
+            "[core]\n",
+            "\tbare = false\n",
+            "[remote \"origin\"]\n",
+            "\turl = x ; and another\n",
+        );
+        assert_eq!(edit(config, None), config);
     }
 
     #[test]
@@ -3694,6 +3827,152 @@ mod tests {
         let report = workspace.drop(&pattern, true, true).unwrap();
         assert_eq!(report.dropped, vec!["opaque".to_string()]);
         assert!(!repo.exists());
+    }
+
+    /// A repo in the workspace whose own config names a worktree somewhere
+    /// else, published so that nothing it holds counts as unpushed and
+    /// committing no files at all so that an empty directory matches its
+    /// HEAD. Returns the directory the config names.
+    fn repo_naming_another_worktree(temp_dir: &Path, repo: &Path, config_entry: &str) -> PathBuf {
+        git(temp_dir, &["init", "--quiet", "--bare", "remote.git"]);
+        repo_with_a_commit(repo);
+        git(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &temp_dir.join("remote.git").to_string_lossy(),
+            ],
+        );
+        git(
+            repo,
+            &["push", "--quiet", "--set-upstream", "origin", "main"],
+        );
+
+        let decoy = temp_dir.join("decoy");
+        fs::create_dir_all(&decoy).unwrap();
+        // Written straight into the config, the way a repo that arrived as
+        // files would carry it
+        let config_path = repo.join(".git/config");
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        config.push_str(&config_entry.replace("{}", &decoy.to_string_lossy()));
+        fs::write(&config_path, config).unwrap();
+        decoy
+    }
+
+    /// A status is a question about the directory in the workspace: what does
+    /// it hold that exists nowhere else? `core.worktree` names a worktree of
+    /// the repo's own choosing, and git and gix both honour it over the
+    /// directory the `.git` sits in — so a repo carrying the key answered
+    /// about the directory it named instead. Pointed at an empty one, with a
+    /// HEAD whose tree is empty too, it read "clean", and the drop that
+    /// followed deleted the untracked work sitting in the workspace
+    /// directory: the one thing the drop gate exists to prevent.
+    ///
+    /// `.git` is part of whatever a repo was when it arrived — a tarball, a
+    /// shared directory, a copy someone handed over — so the key need not be
+    /// one the user ever set.
+    #[test]
+    fn drop_refuses_a_repo_whose_config_names_another_worktree() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        repo_naming_another_worktree(temp_dir.path(), &repo, "[core]\n\tworktree = {}\n");
+
+        // The user's own work, uncommitted, in the directory the workspace
+        // lists and a drop deletes
+        fs::write(repo.join("notes.txt"), "exists nowhere else").unwrap();
+
+        // There is no reading the worktree of this repo, and a repo that
+        // can't be read may be full of work
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Unknown);
+        assert_eq!(
+            check_repo_status_and_modification_time(&repo).unwrap(),
+            (RepoStatus::Unknown, None)
+        );
+
+        let pattern = "github.com/user/project".parse::<RepoPattern>().unwrap();
+        for delete in [false, true] {
+            let report = workspace.drop(&pattern, delete, false).unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(
+                report.skipped,
+                vec![(
+                    "github.com/user/project".to_string(),
+                    DropBlocker::Outstanding(RepoStatus::Unknown)
+                )]
+            );
+            assert_eq!(
+                fs::read_to_string(repo.join("notes.txt")).unwrap(),
+                "exists nowhere else"
+            );
+        }
+    }
+
+    /// Forcing that drop is the user saying "take it anyway", and what the
+    /// library stores must not carry the key: a restored repo that still
+    /// named another worktree would answer every status check, info panel and
+    /// later drop about that directory rather than its own, and the status it
+    /// answered with is what the next drop deletes the workspace directory
+    /// on. The spelling here is the one a line-by-line rewrite kept, with the
+    /// key on the section header's own line.
+    #[test]
+    fn a_forced_drop_leaves_the_worktree_key_out_of_the_library() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        let decoy = repo_naming_another_worktree(temp_dir.path(), &repo, "[core] worktree = {}\n");
+
+        let pattern = "github.com/user/project".parse::<RepoPattern>().unwrap();
+        let report = workspace.drop(&pattern, false, true).unwrap();
+        assert_eq!(report.dropped, vec!["github.com/user/project".to_string()]);
+
+        // Asked of git, because git is what reads it back
+        let entry = PathBuf::from(workspace.library_path()).join("github.com/user/project");
+        let query = ["config", "--default", "", "--get", "core.worktree"];
+        assert_eq!(
+            git(&entry, &query),
+            "",
+            "the library entry kept core.worktree"
+        );
+
+        // So the repo that comes back out reports on its own directory again
+        workspace
+            .restore_from_library("github.com/user/project")
+            .unwrap();
+        assert_eq!(git(&repo, &query), "");
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        fs::write(repo.join("notes.txt"), "work").unwrap();
+        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Dirty);
+        assert_eq!(fs::read_dir(&decoy).unwrap().count(), 0);
+    }
+
+    /// The worktree a repo's *config* names is the hazard, not every repo
+    /// whose git directory lives somewhere else. A linked worktree's `.git`
+    /// is a file pointing into the repo it was added from, and the directory
+    /// holding that file is its worktree all the same — reading it as unknown
+    /// would leave `workset list` saying nothing about a row it shows.
+    #[test]
+    fn a_linked_worktree_reports_on_its_own_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_repo = temp_dir.path().join("main");
+        repo_with_a_commit(&main_repo);
+        let linked = temp_dir.path().join("feature");
+        git(
+            &main_repo,
+            &["worktree", "add", "--quiet", &linked.to_string_lossy()],
+        );
+
+        assert_eq!(check_repo_status(&linked).unwrap(), RepoStatus::Clean);
+        fs::write(linked.join("work.txt"), "only here").unwrap();
+        assert_eq!(check_repo_status(&linked).unwrap(), RepoStatus::Dirty);
     }
 
     /// Run git in `dir`, returning None when it failed instead of asserting,

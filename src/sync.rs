@@ -521,6 +521,16 @@ fn run_git(
         // also what a workspace without one wants, so a legitimate `git://`
         // remote still connects directly.
         .env("GIT_PROXY_COMMAND", "")
+        // The worktree git reads is the directory workset put the repo in,
+        // not the one the repo's own `core.worktree` names. This one can't be
+        // pinned with `-c` either: git resolves the worktree while it is
+        // still setting up, before the command line's config is in play, so
+        // the repo's value is the one used. The environment is read first of
+        // all, and `.` is the directory each of these commands already runs
+        // in — so a repo whose config aimed the info panel's `git diff` and
+        // `git ls-files` at a directory of its own choosing gets them aimed
+        // back at its own files.
+        .env("GIT_WORK_TREE", ".")
         // BatchMode alone rejects hosts not yet in known_hosts, since there is
         // no terminal to confirm on; accept-new trusts a host's key on first
         // contact but still fails hard if a known key ever changes
@@ -1147,6 +1157,60 @@ mod tests {
 
         let interrupt = AtomicBool::new(false);
         assert_eq!(count_diff_lines(&repo, &interrupt).unwrap(), (3, 0));
+    }
+
+    /// `core.worktree` names a worktree of the repo's own choosing, and git
+    /// honours it over the directory the `.git` sits in, so the info panel's
+    /// `git diff` and `git ls-files` reported on that directory instead: a
+    /// repo carrying the key counted the lines of files it doesn't have and
+    /// none of the ones it does. The key is config a repo that arrived as
+    /// files brings with it, and workset's model has no room for it anyway —
+    /// a repo in the workspace is the directory holding its `.git`.
+    #[test]
+    fn counting_changed_lines_ignores_the_worktree_the_config_names() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("work");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "workset"]);
+        git(&["config", "user.email", "workset@example.com"]);
+        std::fs::write(repo.join("tracked.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "--quiet", "-m", "one"]);
+
+        // Written straight into the config, the way a repo that arrived as
+        // files would carry it. The directory it names holds nothing, so
+        // reading it counts the whole commit as deleted.
+        let decoy = temp.path().join("decoy");
+        std::fs::create_dir(&decoy).unwrap();
+        let mut config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+        config.push_str(&format!("[core]\n\tworktree = {}\n", decoy.display()));
+        std::fs::write(repo.join(".git/config"), config).unwrap();
+
+        // One line changed in a tracked file, one line in an untracked one,
+        // in the repo's own directory
+        std::fs::write(repo.join("tracked.txt"), "one\nthree\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "four\n").unwrap();
+
+        assert_eq!(
+            count_diff_lines(&repo, &AtomicBool::new(false)).unwrap(),
+            (2, 1)
+        );
+        // And nothing was read out of the directory the config named
+        assert_eq!(std::fs::read_dir(&decoy).unwrap().count(), 0);
     }
 
     /// A file is counted through a fixed buffer, so its size is not the amount

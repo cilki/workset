@@ -170,6 +170,15 @@ A repository **workset** can't read at all is kept too, and reported as
 library **workset** uses, so rather than guess at what such a repo holds, it is
 left where it is until you drop it with `--force`.
 
+A repo whose `core.worktree` names some other directory reads as `✗ unreadable`
+for the same reason. A status answers what the directory in your workspace holds
+that exists nowhere else, and a drop deletes that directory on the strength of
+the answer — so if git would look somewhere else to work it out, **workset** has
+nothing to say about this repo rather than something about another directory.
+Remove the key (`git config --unset core.worktree`) and the repo reads normally;
+a drop that takes it anyway, with `--force`, leaves the key behind rather than
+storing it, so what comes back out of the library reports on its own directory.
+
 ### What a drop won't touch at all
 
 A drop moves a git directory into the library and deletes the working tree
