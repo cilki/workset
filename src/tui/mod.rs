@@ -1164,10 +1164,8 @@ fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
 
     // Workspace repos show status icons and modification time; library repos show size
     type IdleMetadata = fn(&RepoInfo) -> String;
-    let (items, state, title, show_status_icons, idle_metadata) = match section {
+    let (title, show_status_icons, idle_metadata) = match section {
         Section::Workspace => (
-            app.get_flattened_workspace(),
-            &app.workspace_state,
             workspace_panel_title(app, area.width),
             true,
             (|repo| {
@@ -1177,13 +1175,15 @@ fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
             }) as IdleMetadata,
         ),
         Section::Library => (
-            app.get_flattened_library(),
-            &app.library_state,
-            Line::from(format!("Library ({})", app.count_library_repos())),
+            Line::from(format!("Library ({})", app.count_repos(Section::Library))),
             false,
             (|repo| repo.size_bytes.map(format_size).unwrap_or_default()) as IdleMetadata,
         ),
     };
+    let items = app.flattened(section);
+    // Only the active panel has a selected row, so this is also what decides
+    // whether the detail rows and the highlight belong to this one
+    let selected = app.selected_index(section);
 
     let mut list_items: Vec<ListItem> = items
         .iter()
@@ -1205,8 +1205,7 @@ fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
     // unaffected and the rows can't be selected. Rows may be clipped when the
     // selection is at the bottom of the viewport, since the list keeps only
     // the selected row visible.
-    if app.active_section == section
-        && let Some(selected) = state.selected()
+    if let Some(selected) = selected
         && let Some((node, depth, _, _)) = items.get(selected)
         && let Some(repo) = node.repo_info.as_ref()
     {
@@ -1236,14 +1235,14 @@ fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
 
     // Create a custom state wrapper for rendering
     let mut list_state = ratatui::widgets::ListState::default();
-    list_state.select(state.selected());
+    list_state.select(selected);
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
 /// Title for the workspace panel: the workspace path (truncated to fit),
 /// repo count, and any transient loading/watcher markers
 fn workspace_panel_title(app: &App, panel_width: u16) -> Line<'static> {
-    let suffix = format!(" ({})", app.count_workspace_repos());
+    let suffix = format!(" ({})", app.count_repos(Section::Workspace));
 
     let mut markers = String::new();
     if let Some(ref progress) = app.loading_progress {
@@ -1732,7 +1731,7 @@ mod tests {
         }
 
         let rows: Vec<String> = app
-            .get_flattened_workspace()
+            .flattened(Section::Workspace)
             .iter()
             .filter(|(node, _, _, _)| node.repo_info.is_some())
             .map(|(_, _, _, path)| path.clone())
@@ -1820,7 +1819,7 @@ mod tests {
         app.search_query = "a".to_string();
         app.filter_repos();
 
-        let rows = app.get_flattened_workspace();
+        let rows = app.flattened(Section::Workspace);
         assert_eq!(
             rows.iter()
                 .map(|(_, _, _, path)| path.as_str())
