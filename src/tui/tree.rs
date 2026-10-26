@@ -1,24 +1,5 @@
 use std::path::PathBuf;
 
-pub struct TreeState {
-    /// Currently selected item index (in flattened view)
-    selected: Option<usize>,
-}
-
-impl TreeState {
-    pub fn new() -> Self {
-        Self { selected: None }
-    }
-
-    pub fn select(&mut self, index: Option<usize>) {
-        self.selected = index;
-    }
-
-    pub fn selected(&self) -> Option<usize> {
-        self.selected
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum RepoOperationStatus {
     #[default]

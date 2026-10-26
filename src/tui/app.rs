@@ -1,6 +1,6 @@
 use super::tree::{
-    RepoInfo, RepoOperationStatus, TreeNode, TreeState, build_library_tree, build_tree,
-    count_repos_in_trees, flatten_trees, toggle_node_at_path,
+    RepoInfo, RepoOperationStatus, TreeNode, build_library_tree, build_tree, count_repos_in_trees,
+    flatten_trees, toggle_node_at_path,
 };
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -19,10 +19,21 @@ pub enum Section {
 }
 
 impl Section {
+    /// Both panels, in the order the selection prefers them
+    const ALL: [Section; 2] = [Section::Workspace, Section::Library];
+
     fn other(self) -> Self {
         match self {
             Section::Workspace => Section::Library,
             Section::Library => Section::Workspace,
+        }
+    }
+
+    /// Where this section's tree sits in [`App::trees`]
+    fn index(self) -> usize {
+        match self {
+            Section::Workspace => 0,
+            Section::Library => 1,
         }
     }
 }
@@ -30,13 +41,19 @@ impl Section {
 pub struct App {
     workspace_repos_list: Vec<RepoInfo>,
     library_repos_list: Vec<RepoInfo>,
-    /// What each panel renders: the repo lists grouped into a tree, with the
-    /// transient status overlays and the search query already applied. Rebuilt
-    /// from the lists whenever any of those change.
-    workspace_tree: Vec<TreeNode>,
-    library_tree: Vec<TreeNode>,
-    pub workspace_state: TreeState,
-    pub library_state: TreeState,
+    /// What each panel renders, indexed by [`Section`]: the repo lists
+    /// grouped into a tree, with the transient status overlays and the search
+    /// query already applied. Rebuilt from the lists whenever any of those
+    /// change.
+    trees: [Vec<TreeNode>; 2],
+    /// The row the selection sits on, as an index into the active section's
+    /// flattened tree.
+    ///
+    /// There is one selection, not one per panel: moving into a section is
+    /// what makes it active, so the inactive panel never has a selected row.
+    /// Two indices had to be kept in step to say that, with every selecting
+    /// path responsible for clearing the other one.
+    selected: Option<usize>,
     pub search_query: String,
     pub active_section: Section,
     /// Whether the terminal is too narrow for the side-by-side layout; set
@@ -77,10 +94,8 @@ impl App {
         let mut app = Self {
             workspace_repos_list: Vec::new(),
             library_repos_list: Vec::new(),
-            workspace_tree: Vec::new(),
-            library_tree: Vec::new(),
-            workspace_state: TreeState::new(),
-            library_state: TreeState::new(),
+            trees: [Vec::new(), Vec::new()],
+            selected: None,
             search_query: String::new(),
             active_section: Section::Workspace,
             single_panel: false,
@@ -126,13 +141,13 @@ impl App {
                     )
                     .is_some()
         };
-        self.workspace_tree = build_tree(
+        let workspace = build_tree(
             self.workspace_repos_with_overlays()
                 .into_iter()
                 .filter(|repo| matches(repo))
                 .collect(),
         );
-        self.library_tree = build_library_tree(
+        let library = build_library_tree(
             self.library_repos_list
                 .iter()
                 .filter(|repo| matches(repo))
@@ -140,6 +155,7 @@ impl App {
                 .collect(),
             &self.workspace_repos_list,
         );
+        self.trees = [workspace, library];
     }
 
     /// The workspace repos with transient statuses applied: a repo with an
@@ -180,58 +196,43 @@ impl App {
     /// Select the first item in the first section that has any, preferring the
     /// workspace. Marks the selection as automatic.
     fn select_first_available(&mut self) {
-        if !self.workspace_tree.is_empty() {
-            self.select(Section::Workspace, 0);
-        } else if !self.library_tree.is_empty() {
-            self.select(Section::Library, 0);
-        } else {
-            self.workspace_state.select(None);
-            self.library_state.select(None);
+        self.selected = None;
+        for section in Section::ALL {
+            if !self.trees(section).is_empty() {
+                self.select(section, 0);
+                break;
+            }
         }
         self.selection_is_auto = true;
     }
 
-    pub fn get_flattened_workspace(&self) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
-        flatten_trees(self.trees(Section::Workspace))
+    /// The given section's rows, flattened for rendering
+    pub fn flattened(&self, section: Section) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
+        flatten_trees(self.trees(section))
     }
 
-    pub fn get_flattened_library(&self) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
-        flatten_trees(self.trees(Section::Library))
-    }
-
-    pub fn count_workspace_repos(&self) -> usize {
-        count_repos_in_trees(self.trees(Section::Workspace))
-    }
-
-    pub fn count_library_repos(&self) -> usize {
-        count_repos_in_trees(self.trees(Section::Library))
+    /// How many repos the given section holds, after filtering
+    pub fn count_repos(&self, section: Section) -> usize {
+        count_repos_in_trees(self.trees(section))
     }
 
     /// The rendered trees of the given section
     fn trees(&self, section: Section) -> &[TreeNode] {
-        match section {
-            Section::Workspace => &self.workspace_tree,
-            Section::Library => &self.library_tree,
-        }
+        &self.trees[section.index()]
     }
 
-    /// The selection state of the given section
-    fn state(&self, section: Section) -> &TreeState {
-        match section {
-            Section::Workspace => &self.workspace_state,
-            Section::Library => &self.library_state,
-        }
+    /// The row selected in the given section, which is nothing at all unless
+    /// the section is the active one
+    pub fn selected_index(&self, section: Section) -> Option<usize> {
+        (self.active_section == section)
+            .then_some(self.selected)
+            .flatten()
     }
 
-    /// Select the given index in the given section, clearing the other section
+    /// Make the given section active with the given row selected
     fn select(&mut self, section: Section, index: usize) {
-        let (target, other) = match section {
-            Section::Workspace => (&mut self.workspace_state, &mut self.library_state),
-            Section::Library => (&mut self.library_state, &mut self.workspace_state),
-        };
-        target.select(Some(index));
-        other.select(None);
         self.active_section = section;
+        self.selected = Some(index);
     }
 
     /// Number of visible (flattened) items in the given section
@@ -248,8 +249,7 @@ impl App {
             self.selection_is_auto = false;
         } else if self.single_panel {
             self.active_section = other;
-            self.workspace_state.select(None);
-            self.library_state.select(None);
+            self.selected = None;
             self.selection_is_auto = false;
         }
     }
@@ -272,7 +272,7 @@ impl App {
         }
         self.selection_is_auto = false;
 
-        let Some(i) = self.state(section).selected() else {
+        let Some(i) = self.selected else {
             self.select(section, 0);
             return;
         };
@@ -298,25 +298,22 @@ impl App {
 
     /// The currently selected tree node in the active section
     pub fn selected_node(&self) -> Option<&TreeNode> {
-        let index = self.state(self.active_section).selected()?;
+        let index = self.selected?;
         flatten_trees(self.trees(self.active_section))
             .get(index)
             .map(|(node, _, _, _)| *node)
     }
 
     pub fn toggle_expand(&mut self) {
-        let index_path = self.state(self.active_section).selected().and_then(|i| {
+        let index_path = self.selected.and_then(|i| {
             flatten_trees(self.trees(self.active_section))
                 .get(i)
                 .map(|(_, _, path, _)| path.clone())
         });
 
         if let Some(index_path) = index_path {
-            let trees = match self.active_section {
-                Section::Workspace => &mut self.workspace_tree,
-                Section::Library => &mut self.library_tree,
-            };
-            toggle_node_at_path(trees, &index_path);
+            let section = self.active_section.index();
+            toggle_node_at_path(&mut self.trees[section], &index_path);
         }
     }
 
@@ -325,8 +322,9 @@ impl App {
     /// rebuild — which is all `run_repo_operation` needs: it draws each step
     /// itself, and the rescan that follows reports the real outcome.
     pub fn update_repo_status(&mut self, display_name: &str, status: RepoOperationStatus) {
-        update_repo_status_in_tree(&mut self.workspace_tree, display_name, status.clone());
-        update_repo_status_in_tree(&mut self.library_tree, display_name, status);
+        for tree in &mut self.trees {
+            update_repo_status_in_tree(tree, display_name, status.clone());
+        }
     }
 
     /// Update the app with new repository data (for real-time loading).
@@ -424,7 +422,7 @@ impl App {
 
     /// The section, index, and full path of the currently selected item
     fn selected_position(&self) -> Option<(Section, usize, String)> {
-        let index = self.state(self.active_section).selected()?;
+        let index = self.selected?;
         let path = flatten_trees(self.trees(self.active_section))
             .get(index)
             .map(|(_, _, _, path)| path.clone())?;
@@ -488,7 +486,7 @@ mod tests {
     }
 
     fn workspace_repo_info(app: &App, name: &str) -> Option<RepoInfo> {
-        flatten_trees(&app.workspace_tree)
+        flatten_trees(app.trees(Section::Workspace))
             .iter()
             .find(|(_, _, _, p)| p == name)
             .and_then(|(node, _, _, _)| node.repo_info.clone())
@@ -534,14 +532,14 @@ mod tests {
             vec![repo("github.com/bar/lib"), repo("github.com/bar/tool")],
         );
         app.set_sync_status("github.com/foo/tool", RepoOperationStatus::Fetching);
-        assert_eq!(app.count_workspace_repos(), 2);
-        assert_eq!(app.count_library_repos(), 2);
+        assert_eq!(app.count_repos(Section::Workspace), 2);
+        assert_eq!(app.count_repos(Section::Library), 2);
 
         // Both panels narrow to the matching repo, which keeps its overlay
         app.search_query = "tool".to_string();
         app.filter_repos();
-        assert_eq!(app.count_workspace_repos(), 1);
-        assert_eq!(app.count_library_repos(), 1);
+        assert_eq!(app.count_repos(Section::Workspace), 1);
+        assert_eq!(app.count_repos(Section::Library), 1);
         let info = workspace_repo_info(&app, "github.com/foo/tool").unwrap();
         assert_eq!(info.operation_status, RepoOperationStatus::Fetching);
 
@@ -550,13 +548,13 @@ mod tests {
             vec![repo("github.com/foo/app"), repo("github.com/foo/tool")],
             vec![repo("github.com/bar/lib"), repo("github.com/bar/tool")],
         );
-        assert_eq!(app.count_workspace_repos(), 1);
-        assert_eq!(app.count_library_repos(), 1);
+        assert_eq!(app.count_repos(Section::Workspace), 1);
+        assert_eq!(app.count_repos(Section::Library), 1);
 
         // Clearing the search brings every repo back
         app.clear_search();
-        assert_eq!(app.count_workspace_repos(), 2);
-        assert_eq!(app.count_library_repos(), 2);
+        assert_eq!(app.count_repos(Section::Workspace), 2);
+        assert_eq!(app.count_repos(Section::Library), 2);
     }
 
     #[test]
@@ -688,12 +686,12 @@ mod tests {
         app.switch_section();
         assert_eq!(app.active_section, Section::Library);
         assert!(selected_path(&app).is_none());
-        assert!(app.workspace_state.selected().is_none());
+        assert!(app.selected_index(Section::Workspace).is_none());
 
         // Tab again returns to the workspace with a selection
         app.switch_section();
         assert_eq!(app.active_section, Section::Workspace);
-        assert_eq!(app.workspace_state.selected(), Some(0));
+        assert_eq!(app.selected_index(Section::Workspace), Some(0));
     }
 
     #[test]
@@ -724,12 +722,15 @@ mod tests {
         app.previous();
         assert_eq!(app.active_section, Section::Workspace);
         let last = app.section_len(Section::Workspace) - 1;
-        assert_eq!(app.workspace_state.selected(), Some(last));
+        assert_eq!(app.selected_index(Section::Workspace), Some(last));
 
         // With both panels visible, the same move crosses into the library
         app.single_panel = false;
         app.next();
         assert_eq!(app.active_section, Section::Library);
-        assert_eq!(app.library_state.selected(), Some(0));
+        assert_eq!(app.selected_index(Section::Library), Some(0));
+        // The selection crossed over, so the panel left behind highlights
+        // nothing: only one row in the whole view is ever selected
+        assert!(app.selected_index(Section::Workspace).is_none());
     }
 }
