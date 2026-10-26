@@ -210,85 +210,129 @@ pub fn quote_path(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(quoted)
 }
 
-/// Whether this directory is a git directory itself rather than a worktree
-/// with one in it: a bare repository, or the `.git` directory of a non-bare
-/// one. Uses the same cheap test git does — a `HEAD`, an `objects` directory
-/// and a `refs` directory — and stats `HEAD` first, because almost nothing
-/// else has one and the other two cost nothing once it's missing.
-fn is_git_dir(path: &Path) -> bool {
-    path.join("HEAD").is_file() && path.join("objects").is_dir() && path.join("refs").is_dir()
+/// What shape of repository a directory is.
+///
+/// Both shapes end the walk below down that branch — what sits inside a
+/// repository is that repository's content, not more repos — but each caller
+/// wants only one of them: the working set is made of worktrees, and the
+/// library of the bare git directories a drop moves into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoKind {
+    /// A directory holding a `.git`, which is what a repo in the workspace is
+    Worktree,
+    /// A git directory itself rather than a worktree with one in it: a bare
+    /// repository, or the `.git` directory of a non-bare one
+    Bare,
 }
 
-/// Recursively find "top-level" git repositories.
-/// This function will not traverse into .git directories or nested git repositories.
+/// Which shape of repository `path` is, or None when it is neither.
 ///
-/// A directory that can't be read is skipped rather than reported, so the walk
-/// always yields whatever it could reach.
-pub fn find_git_repositories(path: &Path) -> Vec<PathBuf> {
-    debug!(path = %path.display(), "Recursively searching for git repositories");
-
-    // Check if this path itself is a git repository
+/// `.git` decides first, because a directory holding one is a worktree
+/// however the git directory inside it is configured. The bare test is the
+/// cheap one git itself uses — a `HEAD`, an `objects` directory and a `refs`
+/// directory — and `HEAD` is stat'd first, because almost nothing else has
+/// one and the other two cost nothing once it's missing.
+fn repo_kind(path: &Path) -> Option<RepoKind> {
     if path.join(".git").exists() {
-        return vec![path.to_path_buf()]; // Don't traverse into git repositories
+        Some(RepoKind::Worktree)
+    } else if path.join("HEAD").is_file()
+        && path.join("objects").is_dir()
+        && path.join("refs").is_dir()
+    {
+        Some(RepoKind::Bare)
+    } else {
+        None
     }
-
-    // A bare repository is a repository too, so the search stops here as
-    // well. It isn't reported, because every caller wants the working set:
-    // repos with a worktree to show a status for, to drop, to open a shell
-    // in. A bare repo has none, which is why it was never reported before
-    // either — but the search used to walk straight through it.
-    //
-    // Walking through one is what made every command pay for the library.
-    // `drop` stores each repo as a bare git directory under `.workset/`, and
-    // `.workset/` lives in the workspace, so the walk that enumerates the
-    // working set descended through every library entry's whole object store
-    // — a 256-way fanout per repo, thousands of directories that cannot hold
-    // a workspace repo — to find nothing in any of them. The cost grew with
-    // the library, which is the part of a workspace this tool exists to let
-    // you grow.
-    if is_git_dir(path) {
-        return Vec::new();
-    }
-
-    find_git_repositories_below(path)
 }
 
-/// The repos under `path`, without `path` itself ever being one of them.
+/// Every repository at or under `path`, with the shape each one is, in path
+/// order.
 ///
-/// Same walk as [`find_git_repositories`], minus the test that stops it on
-/// the spot when the starting directory is a repo. Only the workspace root
-/// is searched this way: see [`Workspace::repos_under`].
-fn find_git_repositories_below(path: &Path) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = Vec::new();
+/// The walk stops at the first repository on each branch. Walking through one
+/// instead is what made every command pay for the library: `drop` stores each
+/// repo as a bare git directory under `.workset/`, and `.workset/` lives in
+/// the workspace, so the walk that enumerates the working set descended
+/// through every library entry's whole object store — a 256-way fanout per
+/// repo, thousands of directories that cannot hold a workspace repo — to find
+/// nothing in any of them. The cost grew with the library, which is the part
+/// of a workspace this tool exists to let you grow.
+///
+/// A directory that can't be read is skipped rather than reported, so the
+/// walk always yields whatever it could reach.
+fn find_repos(path: &Path) -> Vec<(PathBuf, RepoKind)> {
+    match repo_kind(path) {
+        Some(kind) => vec![(path.to_path_buf(), kind)],
+        None => find_repos_below(path),
+    }
+}
 
-    // Otherwise, recursively search subdirectories. `read_dir` hands entries
-    // back in whatever order the filesystem keeps them, which is neither
-    // alphabetical nor the same on two machines holding the same repos. Every
-    // caller shows this list to someone — `workset list`, the drop report, the
-    // completion candidates — so walking in name order is what makes their
-    // output the same everywhere, and a depth-first walk of sorted entries
-    // comes out sorted by path.
-    if let Ok(entries) = std::fs::read_dir(path) {
-        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        entries.sort_by_key(|entry| entry.file_name());
+/// The repositories under `path`, without `path` itself ever being one of
+/// them.
+///
+/// Same walk as [`find_repos`], minus the test that stops it on the spot when
+/// the starting directory is a repo. Only a root is searched this way: see
+/// [`Workspace::repos_under`].
+fn find_repos_below(path: &Path) -> Vec<(PathBuf, RepoKind)> {
+    // `read_dir` hands entries back in whatever order the filesystem keeps
+    // them, which is neither alphabetical nor the same on two machines
+    // holding the same repos. Every caller shows this list to someone —
+    // `workset list`, the drop report, the completion candidates, the library
+    // listing — so walking in name order is what makes their output the same
+    // everywhere, and a depth-first walk of sorted entries comes out sorted
+    // by path.
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|entry| entry.file_name());
 
-        for entry in entries {
-            // Only traverse real directories. `file_type` doesn't follow
-            // symlinks, so a symlinked directory is skipped: whatever it
-            // points at lives somewhere else, and a repo found through one
-            // would be reported under a workspace-relative path that doesn't
-            // name where it actually is. Acting on that path — dropping it
-            // into the library, deleting it — reaches back out through the
-            // link and touches a repo the workspace never contained.
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-
-            found.append(&mut find_git_repositories(&entry.path()));
+    let mut found: Vec<(PathBuf, RepoKind)> = Vec::new();
+    for entry in entries {
+        // Only traverse real directories. `file_type` doesn't follow
+        // symlinks, so a symlinked directory is skipped: whatever it points
+        // at lives somewhere else, and a repo found through one would be
+        // reported under a root-relative path that doesn't name where it
+        // actually is. Acting on that path — dropping it into the library,
+        // restoring it back out, deleting it — reaches back out through the
+        // link and touches a repo the root never contained. A link that
+        // points at one of its own ancestors has no bottom to reach either,
+        // so descending through one is a walk that never ends.
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
         }
+
+        found.extend(find_repos(&entry.path()));
     }
 
     found
+}
+
+/// Just the paths of the repositories that have a worktree, dropping the bare
+/// ones the walk stopped at along the way
+fn worktrees(repos: Vec<(PathBuf, RepoKind)>) -> Vec<PathBuf> {
+    repos
+        .into_iter()
+        .filter(|(_, kind)| *kind == RepoKind::Worktree)
+        .map(|(repo, _)| repo)
+        .collect()
+}
+
+/// Recursively find "top-level" git repositories: the directories holding a
+/// `.git`.
+/// This function will not traverse into .git directories or nested git repositories.
+///
+/// A bare repository is a repository too, so the walk stops at one as well —
+/// it just isn't reported, because every caller here wants the working set:
+/// repos with a worktree to show a status for, to drop, to open a shell in.
+pub fn find_git_repositories(path: &Path) -> Vec<PathBuf> {
+    debug!(path = %path.display(), "Recursively searching for git repositories");
+    worktrees(find_repos(path))
+}
+
+/// The repos under `path`, without `path` itself ever being one of them; see
+/// [`find_repos_below`].
+fn find_git_repositories_below(path: &Path) -> Vec<PathBuf> {
+    worktrees(find_repos_below(path))
 }
 
 /// Return the config text with every `worktree` entry removed from its
@@ -1842,7 +1886,14 @@ impl Workspace {
         Ok(())
     }
 
-    /// List all repositories in the library, by workspace-relative path.
+    /// List all repositories in the library, by workspace-relative path, in
+    /// path order.
+    ///
+    /// Both shapes of repository count here, unlike in the working set: the
+    /// library keeps what it holds as a bare git directory, but an entry that
+    /// still has its worktree — a restore that died halfway, a repo moved in
+    /// by hand — is an entry all the same, and listing it is what makes it
+    /// restorable.
     ///
     /// The walk reports whatever it could reach, the way the workspace walk
     /// in [`find_git_repositories`] does: a library that isn't there yet
@@ -1854,48 +1905,29 @@ impl Workspace {
     /// and the completions substituted an empty library.
     pub fn list_library(&self) -> Vec<String> {
         let library_path = self.library_path();
-        let mut repos = Vec::new();
-
-        // Recursively find all git repositories in the library
-        fn find_repos(base_path: &str, current_path: &Path, repos: &mut Vec<String>) {
-            if current_path.is_dir() {
-                // Is this directory a repository? `gix::open` answers by
-                // building a whole Repository — locating the git directory,
-                // reading and parsing the repo's config and every file it
-                // includes, resolving the object store — and all of it is
-                // thrown away here, where only the yes or no is wanted. The
-                // stats git itself uses answer the same question for a
-                // fraction of the cost, and this walk is not a rare one: it
-                // runs before the TUI's first paint, on every `workset
-                // status`, before every restore, and on every TAB press
-                // through the shell completions. Its cost grows with the
-                // library, which is the part of a workspace this tool exists
-                // to let you grow.
-                if is_git_dir(current_path) || current_path.join(".git").exists() {
-                    // Get the relative path from the library base
-                    if let Ok(rel_path) = current_path.strip_prefix(base_path) {
-                        let repo_path = rel_path.to_string_lossy().to_string();
-                        if !repo_path.is_empty() {
-                            repos.push(repo_path);
-                        }
-                    }
-                    return; // Don't recurse into git repos
-                }
-
-                // Recursively search subdirectories
-                if let Ok(entries) = std::fs::read_dir(current_path) {
-                    for entry in entries.filter_map(|e| e.ok()) {
-                        let path = entry.path();
-                        find_repos(base_path, &path, repos);
-                    }
-                }
-            }
-        }
-
-        find_repos(&library_path, Path::new(&library_path), &mut repos);
+        // The library is walked by [`find_repos`], the same walk the working
+        // set is enumerated with, so it stops at each entry rather than
+        // reading the whole object store inside it, comes out in path order
+        // without a sort of its own, and never follows a symlink out of the
+        // library. A listing that did follow one named an entry under a
+        // library-relative path that wasn't where it was, and `restore` acts
+        // on exactly that path: it renamed the link rather than the
+        // repository, leaving the workspace wired to a git directory
+        // somewhere else and flipping that repository's `core.bare` on the
+        // way. A link pointing at one of its own ancestors had no bottom
+        // either, and the listing recursed until the stack ran out.
+        let repos: Vec<String> = find_repos(Path::new(&library_path))
+            .into_iter()
+            .filter_map(|(repo, _)| {
+                // The library root itself isn't an entry in the library, so a
+                // root that is somehow a repository names no relative path
+                let relative = repo.strip_prefix(&library_path).ok()?;
+                let relative = relative.to_string_lossy().to_string();
+                (!relative.is_empty()).then_some(relative)
+            })
+            .collect();
 
         debug!(count = repos.len(), "Found repositories in library");
-        repos.sort();
         repos
     }
 }
@@ -4138,6 +4170,42 @@ mod tests {
         fs::write(entry.join("tracked.txt"), "hello").unwrap();
 
         assert_eq!(workspace.list_library(), vec!["github.com/user/repo"]);
+    }
+
+    /// The library listing names each entry by its path under `.workset/`,
+    /// and `restore` acts on exactly that path: it renames
+    /// `.workset/<name>` into the workspace. So a name the listing reached
+    /// through a symlink is a name that doesn't say where the repository is —
+    /// the rename would move the link, leaving the restored worktree wired to
+    /// a git directory somewhere else and `check_out_worktree` flipping that
+    /// repository's `core.bare` on the way. A link pointing at one of its own
+    /// ancestors has no bottom to reach at all, and the listing used to
+    /// descend through one until the stack ran out.
+    #[cfg(unix)]
+    #[test]
+    fn list_library_does_not_follow_symlinks_out_of_the_library() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let workspace = Workspace {
+            path: root.to_string_lossy().to_string(),
+        };
+        let library = PathBuf::from(workspace.library_path());
+        fs::create_dir_all(&library).unwrap();
+
+        // The one entry the library really holds
+        gix::init(root.join("github.com/user/own")).unwrap();
+        workspace.store_in_library("github.com/user/own").unwrap();
+
+        // A repository that lives outside the library, reachable only through
+        // a link planted in it
+        let outside = root.join("elsewhere/repo");
+        fs::create_dir_all(&outside).unwrap();
+        gix::init_bare(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, library.join("linked")).unwrap();
+        // And a link back at the library, which has no bottom to reach
+        std::os::unix::fs::symlink(&library, library.join("loop")).unwrap();
+
+        assert_eq!(workspace.list_library(), vec!["github.com/user/own"]);
     }
 
     /// A dropped repo lives on in the library as a bare git directory, and the
