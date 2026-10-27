@@ -1479,8 +1479,7 @@ fn workspace_display_name(workspace_path: &str, path: &Path) -> String {
 /// Fill in a discovered workspace repo's status and modification time
 fn scan_workspace_repo(mut repo: RepoInfo) -> RepoInfo {
     // Check repo status and get modification time in a single repo open for performance
-    let (status, modification_time) = crate::check_repo_status_and_modification_time(&repo.path)
-        .unwrap_or((crate::RepoStatus::Unknown, None));
+    let (status, modification_time) = crate::check_repo_status_and_modification_time(&repo.path);
     repo.status = Some(status);
     repo.modification_time = modification_time;
     repo.operation_status = RepoOperationStatus::None;

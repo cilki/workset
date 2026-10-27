@@ -941,45 +941,47 @@ fn clean_worktree_status(repo: &gix::Repository) -> RepoStatus {
     }
 }
 
-/// Check repository status (commits, changes, unpushed) in a single pass
-pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
+/// Check repository status (commits, changes, unpushed) in a single pass.
+///
+/// Never fails: a repo that can't be read is [`RepoStatus::Unknown`].
+pub fn check_repo_status(repo_path: &Path) -> RepoStatus {
     let Some(repo) = open_repo(repo_path) else {
-        return Ok(RepoStatus::Unknown);
+        return RepoStatus::Unknown;
     };
     // Dirtiness is checked before the first commit is looked for, because a
     // repo without commits still holds whatever is staged or untracked in its
     // worktree, and that work exists nowhere but here: no commit, no remote,
     // nothing the library would keep. Reporting it as NoCommits told `drop` it
     // was safe to move the git directory away and delete the worktree.
-    Ok(match has_uncommitted_work(&repo, repo_path) {
+    match has_uncommitted_work(&repo, repo_path) {
         Some(true) => RepoStatus::Dirty,
         // A status that couldn't be read is not a repo without changes
         None => RepoStatus::Unknown,
         Some(false) => clean_worktree_status(&repo),
-    })
+    }
 }
 
 /// Check repository status and get modification time in a single repo open
-/// and a single worktree scan
+/// and a single worktree scan. Like [`check_repo_status`], never fails.
 pub fn check_repo_status_and_modification_time(
     repo_path: &Path,
-) -> Result<(RepoStatus, Option<std::time::SystemTime>)> {
+) -> (RepoStatus, Option<std::time::SystemTime>) {
     let Some(repo) = open_repo(repo_path) else {
-        return Ok((RepoStatus::Unknown, None));
+        return (RepoStatus::Unknown, None);
     };
 
     let (readable, dirty_time) = dirty_files_time(&repo, repo_path);
     if !readable {
         // Nothing may conclude from an unreadable worktree that it holds no
         // work, least of all `drop`
-        return Ok((RepoStatus::Unknown, None));
+        return (RepoStatus::Unknown, None);
     }
 
     if let Some(dirty_time) = dirty_time {
         // For dirty repos, use the max of last commit time and dirty file
         // times. A repo without commits has no commit time, only the files'.
         let commit_time = get_last_commit_time(&repo).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        return Ok((RepoStatus::Dirty, Some(commit_time.max(dirty_time))));
+        return (RepoStatus::Dirty, Some(commit_time.max(dirty_time)));
     }
 
     let status = clean_worktree_status(&repo);
@@ -990,7 +992,7 @@ pub fn check_repo_status_and_modification_time(
         RepoStatus::Clean | RepoStatus::Unpushed => get_last_commit_time(&repo).ok(),
         RepoStatus::Dirty | RepoStatus::NoCommits | RepoStatus::Unknown => None,
     };
-    Ok((status, time))
+    (status, time)
 }
 
 /// Open a repository to read the status of the worktree at `repo_path`,
@@ -1732,7 +1734,7 @@ impl Workspace {
         // step exists to find work that would be lost, and a repo workset
         // can't see into may be full of it.
         if !force {
-            let status = check_repo_status(repo)?;
+            let status = check_repo_status(repo);
             if matches!(
                 status,
                 RepoStatus::Dirty | RepoStatus::Unpushed | RepoStatus::Unknown
@@ -2505,7 +2507,7 @@ mod tests {
 
         // Freshly initialized and genuinely empty
         assert_eq!(
-            check_repo_status(repo_path).unwrap(),
+            check_repo_status(repo_path),
             RepoStatus::NoCommits,
             "an empty repo has no work to lose"
         );
@@ -2513,7 +2515,7 @@ mod tests {
         // A file in the worktree is work that exists nowhere else yet, which
         // the commit-less case used to hide behind NoCommits
         fs::write(repo_path.join("notes.txt"), "unfinished").unwrap();
-        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+        assert_eq!(check_repo_status(repo_path), RepoStatus::Dirty);
     }
 
     #[test]
@@ -2733,7 +2735,7 @@ mod tests {
                 "the restore wrote through the link (hard: {hard})"
             );
             assert_eq!(git(&repo, &["config", "core.bare"]), "false");
-            assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+            assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
         }
     }
 
@@ -2953,7 +2955,7 @@ mod tests {
             fs::read_to_string(repo.join("src/nested/one.txt")).unwrap(),
             "tracked\n"
         );
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
         assert_eq!(git(&repo, &["rev-parse", "side"]), side);
         assert_eq!(git(&repo, &["config", "core.bare"]), "false");
         // The library hands the repo over rather than keeping a stale copy
@@ -3017,7 +3019,7 @@ mod tests {
         // calls that come after the restore — the status scan, the info
         // panel's line count, a later drop — read the worktree in the
         // workspace rather than the one the config named
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
         let query = ["config", "--default", "", "--get", "core.worktree"];
         assert_eq!(
             git(&repo, &query),
@@ -3078,7 +3080,7 @@ mod tests {
 
         // The per-worktree config loses the key as well, so the status checks
         // that follow the restore read the worktree in the workspace
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
         let query = ["config", "--default", "", "--get", "core.worktree"];
         assert_eq!(
             git(&repo, &query),
@@ -3332,7 +3334,7 @@ mod tests {
         let repo_path = temp_dir.path();
         gix::init(repo_path).unwrap();
 
-        let (status, mod_time) = check_repo_status_and_modification_time(repo_path).unwrap();
+        let (status, mod_time) = check_repo_status_and_modification_time(repo_path);
         assert_eq!(status, RepoStatus::NoCommits);
         // A brand-new repo with no commits and a clean worktree has no
         // meaningful modification time.
@@ -3346,7 +3348,7 @@ mod tests {
         gix::init(repo_path).unwrap();
         fs::write(repo_path.join("untracked.txt"), "hello").unwrap();
 
-        let (status, mod_time) = check_repo_status_and_modification_time(repo_path).unwrap();
+        let (status, mod_time) = check_repo_status_and_modification_time(repo_path);
         // The missing first commit is beside the point: the untracked file is
         // work that exists nowhere else, which is what Dirty means.
         assert_eq!(status, RepoStatus::Dirty);
@@ -3431,9 +3433,9 @@ mod tests {
         );
 
         // The history is right there, so calling it "no commits" is wrong
-        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(repo_path), RepoStatus::Clean);
 
-        let (status, mod_time) = check_repo_status_and_modification_time(repo_path).unwrap();
+        let (status, mod_time) = check_repo_status_and_modification_time(repo_path);
         assert_eq!(status, RepoStatus::Clean);
         // And the detached commit is a real time to report, not the absence
         // of one that a commit-less repo yields
@@ -3518,10 +3520,10 @@ mod tests {
         let dated = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
         assert_eq!(get_repo_modification_time(&repo).unwrap(), dated);
         assert_eq!(
-            check_repo_status_and_modification_time(&repo).unwrap(),
+            check_repo_status_and_modification_time(&repo),
             (RepoStatus::Clean, Some(dated))
         );
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
 
         // What the user sees of it is a date many years ago, which is what
         // the commit says (the exact number grows with every year that
@@ -3540,7 +3542,7 @@ mod tests {
 
         // Uncommitted work outranks where HEAD happens to point, so a drop
         // still refuses the repo
-        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+        assert_eq!(check_repo_status(repo_path), RepoStatus::Dirty);
     }
 
     /// A repo with `tracked` committed on `main`, then `write` (if any)
@@ -3582,14 +3584,14 @@ mod tests {
             repo_with_staged_work(repo_path, write, stage);
 
             assert_eq!(
-                check_repo_status(repo_path).unwrap(),
+                check_repo_status(repo_path),
                 RepoStatus::Dirty,
                 "a staged {name} is uncommitted work"
             );
 
             // The TUI reads the status through this second entry point, which
             // walks the same changes to date the row, so it must agree
-            let (status, mod_time) = check_repo_status_and_modification_time(repo_path).unwrap();
+            let (status, mod_time) = check_repo_status_and_modification_time(repo_path);
             assert_eq!(status, RepoStatus::Dirty, "staged {name}, with its time");
             assert!(
                 mod_time.is_some(),
@@ -3607,7 +3609,7 @@ mod tests {
         // arrives as the two halves — either way there is work here.
         repo_with_staged_work(repo_path, None, &["mv", "tracked", "renamed"]);
 
-        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+        assert_eq!(check_repo_status(repo_path), RepoStatus::Dirty);
     }
 
     #[test]
@@ -3621,7 +3623,7 @@ mod tests {
         // Staging the file is what hid it: it stopped being untracked without
         // becoming a commit, and there is no commit for it to differ from
         // either. It exists in this one index and nowhere else.
-        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Dirty);
+        assert_eq!(check_repo_status(repo_path), RepoStatus::Dirty);
     }
 
     #[test]
@@ -3635,8 +3637,8 @@ mod tests {
 
         // Reading HEAD against the index as well must not invent a change out
         // of a committed file whose index entry matches the commit
-        assert_eq!(check_repo_status(repo_path).unwrap(), RepoStatus::Clean);
-        let (status, _) = check_repo_status_and_modification_time(repo_path).unwrap();
+        assert_eq!(check_repo_status(repo_path), RepoStatus::Clean);
+        let (status, _) = check_repo_status_and_modification_time(repo_path);
         assert_eq!(status, RepoStatus::Clean);
     }
 
@@ -3706,7 +3708,7 @@ mod tests {
         let repo = temp_dir.path().join("repo");
         repo_with_a_remote(temp_dir.path(), &repo);
         let published = git(&repo, &["rev-parse", "HEAD"]);
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
 
         // A branch HEAD doesn't point at, holding a commit no remote has
         git(&repo, &["checkout", "--quiet", "-b", "side"]);
@@ -3715,14 +3717,14 @@ mod tests {
             &["commit", "--quiet", "--allow-empty", "-m", "only on side"],
         );
         git(&repo, &["checkout", "--quiet", "main"]);
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Unpushed);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Unpushed);
         // Both ways in report the same repo the same way
-        let (status, _) = check_repo_status_and_modification_time(&repo).unwrap();
+        let (status, _) = check_repo_status_and_modification_time(&repo);
         assert_eq!(status, RepoStatus::Unpushed);
 
         // Pushing the branch is what makes the repo clean again
         git(&repo, &["push", "--quiet", "origin", "side"]);
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
 
         // A branch left behind in published history is not unpushed work: its
         // commits are on the remote, however far back the branch points
@@ -3732,16 +3734,16 @@ mod tests {
         );
         git(&repo, &["push", "--quiet", "origin", "main"]);
         git(&repo, &["branch", "merged", &published]);
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
 
         // A stash's commits hang off refs/stash and nothing else, so they are
         // the only copy too — and it leaves a clean worktree behind, which is
         // what hid it from the dirty check
         fs::write(repo.join("file.txt"), "work in progress\n").unwrap();
         git(&repo, &["stash", "push", "--quiet"]);
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Unpushed);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Unpushed);
         git(&repo, &["stash", "drop", "--quiet"]);
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
     }
 
     /// `--delete` destroys the repo instead of storing it, so the only copy of
@@ -3815,8 +3817,8 @@ mod tests {
         repo_gix_cannot_open(&repo);
         fs::write(repo.join("work.txt"), "exists nowhere else").unwrap();
 
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Unknown);
-        let (status, mod_time) = check_repo_status_and_modification_time(&repo).unwrap();
+        assert_eq!(check_repo_status(&repo), RepoStatus::Unknown);
+        let (status, mod_time) = check_repo_status_and_modification_time(&repo);
         assert_eq!(status, RepoStatus::Unknown);
         // Nothing was read, so there is no time to claim either
         assert_eq!(mod_time, None);
@@ -3921,9 +3923,9 @@ mod tests {
 
         // There is no reading the worktree of this repo, and a repo that
         // can't be read may be full of work
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Unknown);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Unknown);
         assert_eq!(
-            check_repo_status_and_modification_time(&repo).unwrap(),
+            check_repo_status_and_modification_time(&repo),
             (RepoStatus::Unknown, None)
         );
 
@@ -3980,9 +3982,9 @@ mod tests {
             .restore_from_library("github.com/user/project")
             .unwrap();
         assert_eq!(git(&repo, &query), "");
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
         fs::write(repo.join("notes.txt"), "work").unwrap();
-        assert_eq!(check_repo_status(&repo).unwrap(), RepoStatus::Dirty);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Dirty);
         assert_eq!(fs::read_dir(&decoy).unwrap().count(), 0);
     }
 
@@ -4002,9 +4004,9 @@ mod tests {
             &["worktree", "add", "--quiet", &linked.to_string_lossy()],
         );
 
-        assert_eq!(check_repo_status(&linked).unwrap(), RepoStatus::Clean);
+        assert_eq!(check_repo_status(&linked), RepoStatus::Clean);
         fs::write(linked.join("work.txt"), "only here").unwrap();
-        assert_eq!(check_repo_status(&linked).unwrap(), RepoStatus::Dirty);
+        assert_eq!(check_repo_status(&linked), RepoStatus::Dirty);
     }
 
     /// Run git in `dir`, returning None when it failed instead of asserting,
@@ -4046,7 +4048,7 @@ mod tests {
         fs::write(repo.join("tracked.txt"), "uncommitted").unwrap();
 
         assert_ne!(
-            check_repo_status(&repo).unwrap(),
+            check_repo_status(&repo),
             RepoStatus::NoCommits,
             "a repo with a commit and uncommitted work is not empty"
         );

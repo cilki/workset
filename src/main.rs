@@ -642,12 +642,11 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
             let repo_name = workspace.relative_name(repo);
 
             let status_str = match status {
-                Ok(workset::RepoStatus::Clean) => "✓ clean",
-                Ok(workset::RepoStatus::Dirty) => "⚠ modified",
-                Ok(workset::RepoStatus::Unpushed) => "⚠ unpushed",
-                Ok(workset::RepoStatus::NoCommits) => "⚠ no commits",
-                Ok(workset::RepoStatus::Unknown) => "✗ unreadable",
-                Err(_) => "✗ error",
+                workset::RepoStatus::Clean => "✓ clean",
+                workset::RepoStatus::Dirty => "⚠ modified",
+                workset::RepoStatus::Unpushed => "⚠ unpushed",
+                workset::RepoStatus::NoCommits => "⚠ no commits",
+                workset::RepoStatus::Unknown => "✗ unreadable",
             };
 
             // A repo's directory name is the repo's to choose, and this line
@@ -825,32 +824,18 @@ fn completion_request() -> (String, Option<usize>) {
 /// How a workspace repo is described next to its completion: its status and
 /// how long ago it changed, both from a single repo open
 fn describe_workspace_repo(repo: &Path) -> String {
-    // A repo we can't read still gets a completion, just an unadorned one
-    let (status, modification_time) = workset::check_repo_status_and_modification_time(repo)
-        .map(|(status, time)| (Some(status), time))
-        .unwrap_or((None, None));
+    let (status, modification_time) = workset::check_repo_status_and_modification_time(repo);
 
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(status) = status {
-        parts.push(
-            match status {
-                workset::RepoStatus::Clean => "clean",
-                workset::RepoStatus::Dirty => "dirty",
-                workset::RepoStatus::Unpushed => "unpushed",
-                workset::RepoStatus::NoCommits => "no commits",
-                workset::RepoStatus::Unknown => "unreadable",
-            }
-            .to_string(),
-        );
-    }
-    if let Some(time) = modification_time {
-        parts.push(workset::format_time_ago(time));
-    }
-
-    if parts.is_empty() {
-        "repository".to_string()
-    } else {
-        parts.join(", ")
+    let status = match status {
+        workset::RepoStatus::Clean => "clean",
+        workset::RepoStatus::Dirty => "dirty",
+        workset::RepoStatus::Unpushed => "unpushed",
+        workset::RepoStatus::NoCommits => "no commits",
+        workset::RepoStatus::Unknown => "unreadable",
+    };
+    match modification_time {
+        Some(time) => format!("{status}, {}", workset::format_time_ago(time)),
+        None => status.to_string(),
     }
 }
 
