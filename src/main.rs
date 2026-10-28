@@ -278,10 +278,24 @@ fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
     let mut failed = 0;
 
     for repo_path in matching_repos {
-        // Check if already exists in workspace
+        // Something already occupying the repo's path keeps the repo in the
+        // library, and that is a repo the user asked for and didn't get: it
+        // fails the request like any other restore that couldn't happen. Only
+        // a git repository there is the repo being "in the workspace"; a
+        // plain directory or file is just in the way, and saying the repo is
+        // checked out would send the user looking for one that isn't.
         let dest_path = PathBuf::from(&workspace.path).join(&repo_path);
         if dest_path.exists() {
-            eprintln!("{} is already in the workspace", quote_path(&repo_path));
+            if dest_path.join(".git").exists() {
+                eprintln!("{} is already in the workspace", quote_path(&repo_path));
+            } else {
+                eprintln!(
+                    "Failed to restore {}: something that isn't the repository is already at {}",
+                    quote_path(&repo_path),
+                    quote_path(&dest_path.to_string_lossy())
+                );
+            }
+            failed += 1;
             continue;
         }
 
