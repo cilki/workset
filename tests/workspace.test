@@ -36,6 +36,23 @@ testInit() {
 	[ -d .workset ]
 }
 
+## Initializing below an existing workspace is refused: the nested library
+## would take every repo dropped beneath it out of sight of the real one
+testInitInsideWorkspaceFails() {
+	newWorkspace
+	createRepo github.com/user/repo
+	cd github.com
+
+	output=$(workset init 2>&1) && exit 1
+	echo "$output" | grep "is already inside the workspace at "
+	[ ! -e .workset ]
+
+	# Commands from here still act on the enclosing workspace
+	workset drop user | grep "^  github.com/user/repo - ✓ dropped"
+	cd ..
+	workset restore github.com/user/repo | grep "^Restored github.com/user/repo"
+}
+
 ## Commands that need a workspace say so and fail outside one
 testCommandsOutsideWorkspaceFail() {
 	for command in list drop; do

@@ -485,16 +485,32 @@ fn main() -> Result<ExitCode> {
                 let library_path = workspace_path.join(".workset");
 
                 let workspace_name = workspace_path.display().to_string();
-                if library_path.exists() {
+                // A workspace below another one splits it: every command run
+                // from beneath the new root stops seeing the outer workspace,
+                // so a drop stores the repo in a second library under a name
+                // missing the directories above it, where neither 'list' nor
+                // 'restore' at the real root can find it again
+                if let Some(enclosing) = maybe_workspace
+                    .as_ref()
+                    .filter(|workspace| Path::new(&workspace.path) != workspace_path)
+                {
+                    eprintln!(
+                        "{} is already inside the workspace at {}",
+                        quote_path(&workspace_name),
+                        quote_path(&enclosing.path)
+                    );
+                    false
+                } else if library_path.exists() {
                     outln!(
                         "Workspace already initialized in {}",
                         quote_path(&workspace_name)
                     );
+                    true
                 } else {
                     std::fs::create_dir_all(&library_path)?;
                     outln!("Initialized workspace in {}", quote_path(&workspace_name));
+                    true
                 }
-                true
             }
             "clone" => {
                 let workspace = require_workspace!(maybe_workspace);
