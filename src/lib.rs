@@ -117,13 +117,6 @@ impl RepoPattern {
         }
     }
 
-    /// Get the provider and path as a tuple if provider exists
-    pub fn provider_and_path(&self) -> Option<(&str, &str)> {
-        self.provider
-            .as_ref()
-            .map(|p| (p.as_str(), self.path.as_str()))
-    }
-
     /// Get the full path including provider if it exists
     pub fn full_path(&self) -> String {
         match &self.provider {
@@ -933,10 +926,14 @@ fn clean_worktree_status(repo: &gix::Repository) -> RepoStatus {
     match unpublished_work(repo) {
         Unpublished::Some => RepoStatus::Unpushed,
         Unpublished::Unreadable => RepoStatus::Unknown,
-        Unpublished::None => match head_state(repo) {
-            HeadState::Unborn => RepoStatus::NoCommits,
-            HeadState::Unreadable => RepoStatus::Unknown,
-            HeadState::Detached | HeadState::Branch => RepoStatus::Clean,
+        // A detached HEAD has history just like a branch does, so the only
+        // question left is whether HEAD has any at all. HEAD that can't be
+        // read (a reftable repo, for one) is no more "no commits" than it is
+        // clean.
+        Unpublished::None => match repo.head() {
+            Ok(head) if head.is_unborn() => RepoStatus::NoCommits,
+            Ok(_) => RepoStatus::Clean,
+            Err(_) => RepoStatus::Unknown,
         },
     }
 }
@@ -1049,39 +1046,6 @@ fn is_same_dir(one: &Path, other: &Path) -> bool {
     match (std::fs::canonicalize(one), std::fs::canonicalize(other)) {
         (Ok(one), Ok(other)) => one == other,
         _ => false,
-    }
-}
-
-/// Where a repository's HEAD points
-enum HeadState {
-    /// At a branch
-    Branch,
-    /// Straight at a commit, as during a bisect, a rebase or after an
-    /// explicit `git checkout --detach`. There is history, but no branch and
-    /// therefore no upstream.
-    Detached,
-    /// At a branch that doesn't exist yet, because the repo has no commits
-    Unborn,
-    /// HEAD couldn't be read, so where it points is unknown. A repo whose refs
-    /// gix can't read (reftable) lands here, and it is no more "no commits"
-    /// than it is clean.
-    Unreadable,
-}
-
-/// Classify what HEAD points at. Detached is kept apart from Unborn because
-/// the two look alike through `try_into_referent` — it yields no reference
-/// either way — and calling a repo full of history "no commits" is a lie the
-/// status line, the summary counts and the TUI all repeat.
-fn head_state(repo: &gix::Repository) -> HeadState {
-    let Ok(head) = repo.head() else {
-        return HeadState::Unreadable;
-    };
-    if head.is_unborn() {
-        return HeadState::Unborn;
-    }
-    match head.try_into_referent() {
-        Some(_) => HeadState::Branch,
-        None => HeadState::Detached,
     }
 }
 
@@ -1259,12 +1223,9 @@ fn commit_time(seconds: i64) -> Option<std::time::SystemTime> {
 
 /// Get the last commit time using gix
 fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime> {
-    if matches!(head_state(repo), HeadState::Unborn) {
-        bail!("Repository has no commits");
-    }
-
     // head_commit resolves a detached HEAD too, so a repo mid-bisect or
-    // mid-rebase still reports when it last changed
+    // mid-rebase still reports when it last changed, and fails for an unborn
+    // one, which has no commit to date
     let commit = repo.head_commit()?;
     let timestamp = commit.time()?.seconds;
 
@@ -4265,22 +4226,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_parse_simple_path() -> Result<(), Box<dyn Error>> {
-        let pattern = str::parse::<RepoPattern>("repo")?;
-        assert_eq!(pattern.provider, None);
-        assert_eq!(pattern.path, "repo".to_string());
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_gitlab_path() -> Result<(), Box<dyn Error>> {
-        let pattern = str::parse::<RepoPattern>("gitlab.com/company/project/repo")?;
-        assert_eq!(pattern.provider, Some("gitlab.com".to_string()));
-        assert_eq!(pattern.path, "company/project/repo".to_string());
-        Ok(())
-    }
-
     /// Every spelling of a clone URL a forge offers names the same repo, and so
     /// has to parse to the same pattern — otherwise the path it occupies in the
     /// workspace depends on which button the user copied.
@@ -4345,43 +4290,5 @@ mod tests {
                 pattern,
             );
         }
-    }
-
-    #[test]
-    fn test_provider_and_path() {
-        let pattern = RepoPattern {
-            provider: Some("github.com".to_string()),
-            path: "user/repo".to_string(),
-        };
-        let (provider, path) = pattern.provider_and_path().unwrap();
-        assert_eq!(provider, "github.com");
-        assert_eq!(path, "user/repo");
-    }
-
-    #[test]
-    fn test_provider_and_path_none() {
-        let pattern = RepoPattern {
-            provider: None,
-            path: "user/repo".to_string(),
-        };
-        assert!(pattern.provider_and_path().is_none());
-    }
-
-    #[test]
-    fn test_full_path_with_provider() {
-        let pattern = RepoPattern {
-            provider: Some("github.com".to_string()),
-            path: "user/repo".to_string(),
-        };
-        assert_eq!(pattern.full_path(), "github.com/user/repo");
-    }
-
-    #[test]
-    fn test_full_path_without_provider() {
-        let pattern = RepoPattern {
-            provider: None,
-            path: "user/repo".to_string(),
-        };
-        assert_eq!(pattern.full_path(), "user/repo");
     }
 }

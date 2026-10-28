@@ -90,8 +90,8 @@ fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<b
     }
 
     // Clone from remote
-    if let Some((provider, repo_path_str)) = pattern.provider_and_path() {
-        let clone_url = format!("https://{}/{}", provider, repo_path_str);
+    if let Some(provider) = &pattern.provider {
+        let clone_url = format!("https://{}/{}", provider, pattern.path);
 
         outln!("Cloning {}", quote_path(&clone_url));
 
