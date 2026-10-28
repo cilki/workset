@@ -509,6 +509,29 @@ testRestoreAlreadyInWorkspaceFails() {
 	[ -d present-repo/.git ]
 }
 
+## A pattern that is a repo's full path restores that repo, not every library
+## entry it happens to be a prefix of
+testRestoreFullPathLeavesPrefixSiblings() {
+	newWorkspace
+	createRepo github.com/user/repo
+	createRepo github.com/user/repo-old
+	workset drop github.com/user
+
+	output=$(workset restore github.com/user/repo)
+	[ "$output" = "Restored github.com/user/repo" ]
+	[ -d github.com/user/repo/.git ]
+	[ ! -e github.com/user/repo-old ]
+
+	# Once it is checked out, naming it again is refused rather than taken
+	# as a request for its sibling
+	output=$(workset restore github.com/user/repo 2>&1) && exit 1
+	echo "$output" | grep "github.com/user/repo is already in the workspace"
+	[ ! -e github.com/user/repo-old ]
+
+	# A partial pattern still matches by substring
+	workset restore repo-old | grep "^Restored github.com/user/repo-old$"
+}
+
 ## --force drops a repo despite its uncommitted changes
 testDropDirtyRepoWithForce() {
 	newWorkspace

@@ -74,6 +74,10 @@ meant:
 ❯ workset restore jq
 ```
 
+A pattern that is a repo's full path — the name `drop` reports and completion
+offers — restores just that repo, even when it is also a prefix of others such
+as `github.com/user/repo-old`.
+
 `clone`, `restore` and `drop` take as many patterns as you want to name, and
 each one is reported on its own:
 

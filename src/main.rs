@@ -228,11 +228,30 @@ fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
         let Ok(pattern) = requested.parse::<workset::RepoPattern>();
         pattern.full_path()
     };
-    let matching_repos: Vec<String> = library_repos
+
+    // Substring matching is for the short patterns a user types by hand; a
+    // pattern that spells out one repo's whole path names that repo alone.
+    // Matching it as a substring too restored every sibling it is a prefix
+    // of — `github.com/user/repo` also pulled back `github.com/user/repo-old`
+    // — even though that full path is exactly what drop reports, what
+    // completion offers, and what clone tells the user to run. And when the
+    // named repo was already checked out, its siblings were restored in its
+    // place instead of the request being refused.
+    let matching_repos: Vec<String> = if library_repos.contains(&pattern_str) {
+        vec![pattern_str.clone()]
+    } else if workspace_repos(workspace)
         .iter()
-        .filter(|repo| repo.contains(&pattern_str))
-        .cloned()
-        .collect();
+        .any(|(name, _)| *name == pattern_str)
+    {
+        eprintln!("{} is already in the workspace", quote_path(&pattern_str));
+        return Ok(false);
+    } else {
+        library_repos
+            .iter()
+            .filter(|repo| repo.contains(&pattern_str))
+            .cloned()
+            .collect()
+    };
 
     if matching_repos.is_empty() {
         // Restoring moves a repo out of the library, so one that's already
