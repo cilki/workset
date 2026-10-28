@@ -549,6 +549,30 @@ testRestoreFullPathLeavesPrefixSiblings() {
 	workset restore repo-old | grep "^Restored github.com/user/repo-old$"
 }
 
+## A pattern matching several library entries restores each one it can, but
+## one whose path is taken by something else stays in the library, and that
+## fails the request instead of being passed over in silence. The leftover is
+## a directory, not a repo, so it isn't reported as the repo being checked out.
+testRestoreReportsRepoWhosePathIsTaken() {
+	newWorkspace
+	createRepo proj/a
+	createRepo proj/b
+	workset drop proj
+	mkdir -p proj/a
+	echo "mine" >proj/a/notes.txt
+
+	output=$(workset restore proj 2>&1) && exit 1
+	echo "$output" | grep "^Restored proj/b$"
+	echo "$output" | grep "^Failed to restore proj/a: something that isn't the repository is already at "
+	! echo "$output" | grep -q "proj/a is already in the workspace"
+
+	# Nothing of either side was disturbed
+	[ "$(cat proj/a/notes.txt)" = "mine" ]
+	[ ! -e proj/a/.git ]
+	[ -d .workset/proj/a ]
+	[ -f proj/b/file0.txt ]
+}
+
 ## --force drops a repo despite its uncommitted changes
 testDropDirtyRepoWithForce() {
 	newWorkspace
