@@ -1451,11 +1451,6 @@ impl Workspace {
         format!("{}/.workset", self.path)
     }
 
-    /// Get the library path as a PathBuf (avoids allocation)
-    fn library_path_buf(&self) -> PathBuf {
-        PathBuf::from(&self.path).join(".workset")
-    }
-
     /// Render a repo's path relative to the workspace root as a display string,
     /// falling back to the full path if it isn't under the workspace.
     pub fn relative_name(&self, repo: &Path) -> String {
@@ -1465,12 +1460,12 @@ impl Workspace {
             .to_string()
     }
 
-    /// Locate the workspace containing the current directory without validating
-    /// it or touching the filesystem beyond the directory search.
+    /// Locate the workspace containing the current directory: the nearest
+    /// directory at or above it holding a `.workset/` library.
     ///
-    /// Suitable for read-only, side-effect-free callers such as shell
-    /// completion, which must be fast and infallible. Use [`load`](Self::load)
-    /// when the workspace is about to be operated on.
+    /// Read-only and infallible, so shell completion can call it on every TAB
+    /// press. Finding the library *is* the check that the workspace exists,
+    /// so there is nothing left to validate or create once this returns one.
     pub fn discover() -> Option<Self> {
         let mut workspace_root = std::env::current_dir().ok()?;
 
@@ -1487,34 +1482,6 @@ impl Workspace {
             // Try parent directory
             workspace_root = workspace_root.parent()?.to_path_buf();
         }
-    }
-
-    /// Load workspace from current directory, validating it and ensuring the
-    /// library directory exists.
-    pub fn load() -> Result<Option<Self>> {
-        match Self::discover() {
-            Some(workspace) => {
-                // Validate the workspace configuration
-                workspace.validate()?;
-
-                // Make sure library directory exists
-                std::fs::create_dir_all(workspace.library_path_buf())
-                    .map_err(|e| anyhow::anyhow!("Failed to create library directory: {}", e))?;
-
-                Ok(Some(workspace))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Validate the workspace configuration
-    fn validate(&self) -> Result<()> {
-        // Check if workspace path exists
-        if !Path::new(&self.path).exists() {
-            bail!("Workspace path does not exist: {}", self.path);
-        }
-
-        Ok(())
     }
 
     /// The path a pattern names inside the workspace, or an error when the
@@ -1743,15 +1710,8 @@ impl Workspace {
     /// Move the given repository into the library.
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
     pub fn store_in_library(&self, relative_path: &str) -> Result<()> {
-        let library_path = self.library_path();
-
-        // Make sure the library directory exists first
-        std::fs::create_dir_all(&library_path).map_err(|e| {
-            anyhow::anyhow!("Failed to create library directory {}: {}", library_path, e)
-        })?;
-
         let source = format!("{}/{}/.git", self.path, relative_path);
-        let dest = format!("{}/{}", library_path, relative_path);
+        let dest = format!("{}/{}", self.library_path(), relative_path);
 
         // Verify the source .git directory exists
         if std::fs::metadata(&source).is_err() {

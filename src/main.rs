@@ -325,11 +325,8 @@ fn main() -> Result<ExitCode> {
         )
         .init();
 
-    // Dispatch shell completions before loading the workspace. Completions run
-    // on every TAB press, so they must be fast, side-effect free, and
-    // infallible: discover the workspace read-only rather than going through
-    // `load`, which validates and creates the library directory and would abort
-    // the whole process on error.
+    // Dispatch shell completions before anything else: they run on every TAB
+    // press, so they must be fast, side-effect free, and infallible.
     if let Ok(shell_type) = std::env::var("_ARGCOMPLETE_") {
         let maybe_workspace = Workspace::discover();
         match shell_type.as_str() {
@@ -439,8 +436,8 @@ fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Load the workspace for a subcommand.
-    let maybe_workspace = Workspace::load()?;
+    // Find the workspace for a subcommand.
+    let maybe_workspace = Workspace::discover();
 
     // Resolve the current workspace or report "not in a workspace" and return
     // failure. Used by every subcommand that operates on an existing workspace.
