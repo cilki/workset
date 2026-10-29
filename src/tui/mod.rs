@@ -30,7 +30,7 @@ use ratatui::{
 use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -220,11 +220,10 @@ struct SyncManager {
     /// selection is handled once rather than re-queued every loop iteration
     last_selection: Option<PathBuf>,
     interrupt: Arc<AtomicBool>,
-    workspace_path: String,
 }
 
 impl SyncManager {
-    fn new(workspace_path: String) -> Self {
+    fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             tx,
@@ -236,7 +235,6 @@ impl SyncManager {
             selection_pending: None,
             last_selection: None,
             interrupt: Arc::new(AtomicBool::new(false)),
-            workspace_path,
         }
     }
 
@@ -351,23 +349,20 @@ impl SyncManager {
     /// Drain finished jobs into the app without blocking
     fn poll(&mut self, app: &mut App) {
         while let Ok((repo, event)) = self.rx.try_recv() {
-            let display_name = workspace_display_name(&self.workspace_path, &repo);
             match event {
                 SyncEvent::Started => {
-                    app.fetching.insert(repo);
-                    app.set_sync_status(&display_name, RepoOperationStatus::Fetching);
+                    app.set_sync_status(&repo, RepoOperationStatus::Fetching);
                 }
                 SyncEvent::Finished(outcome) => {
                     self.finish(&repo);
                     if let Some(status) = outcome.status {
-                        app.apply_scan_result(&display_name, status, outcome.modification_time);
+                        app.apply_scan_result(&repo, status, outcome.modification_time);
                     }
                     if let Some(err) = outcome.error_summary() {
-                        app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err));
+                        app.set_sync_status(&repo, RepoOperationStatus::SyncFailed(err));
                     } else {
-                        app.clear_sync_status(&display_name);
+                        app.clear_sync_status(&repo);
                     }
-                    app.fetching.remove(&repo);
                     // The fetch may have changed what the info panel shows
                     app.details.remove(&repo);
                     // Keep the full outcome for the panel's per-remote rows
@@ -375,8 +370,7 @@ impl SyncManager {
                 }
                 SyncEvent::Failed(err) => {
                     self.finish(&repo);
-                    app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err));
-                    app.fetching.remove(&repo);
+                    app.set_sync_status(&repo, RepoOperationStatus::SyncFailed(err));
                 }
             }
         }
@@ -520,7 +514,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         let mut background = BackgroundTasks {
             loader: Some(RepoLoader::start(workspace, Vec::new(), Vec::new(), true)),
             watcher: Some(watcher_rx),
-            sync: SyncManager::new(workspace.path.clone()),
+            sync: SyncManager::new(),
             details: DetailsLoader::new(),
         };
 
@@ -1095,7 +1089,7 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
                 Span::styled("Remotes:", dim),
             ]));
             let outcome = app.sync_outcomes.get(&repo.path);
-            let fetching = app.fetching.contains(&repo.path);
+            let fetching = app.is_fetching(&repo.path);
             for remote in remotes {
                 let state = remote_sync_state(&remote.name, outcome, fetching);
                 let mut line = remote_status_line(remote, state);
@@ -1466,16 +1460,6 @@ fn render_highlighted_name<'a>(
     spans
 }
 
-/// Workspace-relative display name for a repo path
-fn workspace_display_name(workspace_path: &str, path: &Path) -> String {
-    path.strip_prefix(workspace_path)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-        .trim_start_matches('/')
-        .to_string()
-}
-
 /// Fill in a discovered workspace repo's status and modification time
 fn scan_workspace_repo(mut repo: RepoInfo) -> RepoInfo {
     // Check repo status and get modification time in a single repo open for performance
@@ -1526,7 +1510,7 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
         .into_iter()
         .zip(workspace_tree_paths)
         .map(|(path, tree_path)| RepoInfo {
-            display_name: workspace_display_name(&workspace.path, &path),
+            display_name: workspace.relative_name(&path),
             tree_path,
             path,
             operation_status: RepoOperationStatus::Scanning,
@@ -1969,7 +1953,7 @@ mod tests {
 
     #[test]
     fn sync_manager_dedups_and_requeues() {
-        let mut mgr = SyncManager::new("ws".to_string());
+        let mut mgr = SyncManager::new();
         let repo = PathBuf::from("ws/repo");
 
         mgr.request_sync(repo.clone(), false);
@@ -2020,7 +2004,7 @@ mod tests {
             }],
             Vec::new(),
         );
-        let mut mgr = SyncManager::new("ws".to_string());
+        let mut mgr = SyncManager::new();
 
         mgr.request_watcher_syncs(vec![nested, repo.clone()], &app);
 
@@ -2030,7 +2014,7 @@ mod tests {
     #[test]
     fn sync_manager_selection_fetches_once_with_cooldown() {
         let backdate = |by: Duration| Instant::now().checked_sub(by).expect("clock too young");
-        let mut mgr = SyncManager::new("ws".to_string());
+        let mut mgr = SyncManager::new();
         let repo = PathBuf::from("ws/repo");
         let other = PathBuf::from("ws/other");
 
@@ -2076,7 +2060,7 @@ mod tests {
 
     #[test]
     fn sync_manager_drops_pending_fetch_of_a_row_passed_over() {
-        let mut mgr = SyncManager::new("ws".to_string());
+        let mut mgr = SyncManager::new();
         let repo = PathBuf::from("ws/repo");
         let other = PathBuf::from("ws/other");
         mgr.last_selection = Some(repo.clone());

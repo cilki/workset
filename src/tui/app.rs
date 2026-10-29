@@ -69,14 +69,13 @@ pub struct App {
     pub help_visible: bool,
     /// Pre-rasterized logo for the help overlay; None renders text-only help
     pub help_image: Option<ratatui_image::protocol::StatefulProtocol>,
-    /// Sync status per repo display name (Fetching or SyncFailed), overlaid on
-    /// the repo rows so it survives background data refreshes
-    sync_statuses: std::collections::HashMap<String, RepoOperationStatus>,
+    /// Sync status per repo path (Fetching or SyncFailed), overlaid on the
+    /// repo rows so it survives background data refreshes. A repo is being
+    /// fetched exactly when its entry here is Fetching.
+    sync_statuses: std::collections::HashMap<PathBuf, RepoOperationStatus>,
     /// Full result of each repo's last sync, keyed by path, for the info
     /// panel's per-remote status rows
     pub sync_outcomes: std::collections::HashMap<PathBuf, crate::sync::SyncOutcome>,
-    /// Repos with a fetch currently running, keyed by path
-    pub fetching: std::collections::HashSet<PathBuf>,
     /// Info-panel details computed in the background, keyed by repo path
     pub details: std::collections::HashMap<PathBuf, super::details::RepoDetails>,
     /// Whether the current selection was made automatically (not by the user).
@@ -108,7 +107,6 @@ impl App {
             help_image: None,
             sync_statuses: std::collections::HashMap::new(),
             sync_outcomes: std::collections::HashMap::new(),
-            fetching: std::collections::HashSet::new(),
             details: std::collections::HashMap::new(),
             selection_is_auto: true,
         };
@@ -163,7 +161,7 @@ impl App {
     fn workspace_repos_with_overlays(&self) -> Vec<RepoInfo> {
         let mut repos = self.workspace_repos_list.clone();
         for repo in &mut repos {
-            if let Some(status) = self.sync_statuses.get(&repo.display_name)
+            if let Some(status) = self.sync_statuses.get(&repo.path)
                 && matches!(
                     repo.operation_status,
                     RepoOperationStatus::None | RepoOperationStatus::Scanning
@@ -340,29 +338,34 @@ impl App {
     }
 
     /// Overlay a sync status (Fetching or SyncFailed) on the given repo
-    pub fn set_sync_status(&mut self, display_name: &str, status: RepoOperationStatus) {
-        self.sync_statuses.insert(display_name.to_string(), status);
+    pub fn set_sync_status(&mut self, path: &Path, status: RepoOperationStatus) {
+        self.sync_statuses.insert(path.to_path_buf(), status);
         self.rebuild_preserving_selection();
     }
 
     /// Remove the sync status overlay from the given repo
-    pub fn clear_sync_status(&mut self, display_name: &str) {
-        if self.sync_statuses.remove(display_name).is_some() {
+    pub fn clear_sync_status(&mut self, path: &Path) {
+        if self.sync_statuses.remove(path).is_some() {
             self.rebuild_preserving_selection();
         }
+    }
+
+    /// Whether a fetch of the given repo is running right now
+    pub fn is_fetching(&self, path: &Path) -> bool {
+        self.sync_statuses.get(path) == Some(&RepoOperationStatus::Fetching)
     }
 
     /// Apply a freshly computed git status to the given repo's row
     pub fn apply_scan_result(
         &mut self,
-        display_name: &str,
+        path: &Path,
         status: crate::RepoStatus,
         modification_time: Option<std::time::SystemTime>,
     ) {
         if let Some(repo) = self
             .workspace_repos_list
             .iter_mut()
-            .find(|r| r.display_name == display_name)
+            .find(|r| r.path == path)
         {
             repo.status = Some(status);
             if modification_time.is_some() {
@@ -500,9 +503,14 @@ mod tests {
             Vec::new(),
         );
 
-        app.set_sync_status("github.com/foo/app", RepoOperationStatus::Fetching);
+        app.set_sync_status(
+            Path::new("github.com/foo/app"),
+            RepoOperationStatus::Fetching,
+        );
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
         assert_eq!(info.operation_status, RepoOperationStatus::Fetching);
+        // The info panel reads "fetching" off the same overlay
+        assert!(app.is_fetching(Path::new("github.com/foo/app")));
 
         // A background rescan rebuilds the rows; the overlay must persist
         app.update_repos(vec![repo("github.com/foo/app")], Vec::new());
@@ -510,7 +518,7 @@ mod tests {
         assert_eq!(info.operation_status, RepoOperationStatus::Fetching);
 
         app.set_sync_status(
-            "github.com/foo/app",
+            Path::new("github.com/foo/app"),
             RepoOperationStatus::SyncFailed("unreachable".to_string()),
         );
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
@@ -518,8 +526,9 @@ mod tests {
             info.operation_status,
             RepoOperationStatus::SyncFailed("unreachable".to_string())
         );
+        assert!(!app.is_fetching(Path::new("github.com/foo/app")));
 
-        app.clear_sync_status("github.com/foo/app");
+        app.clear_sync_status(Path::new("github.com/foo/app"));
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
         assert_eq!(info.operation_status, RepoOperationStatus::None);
     }
@@ -531,7 +540,10 @@ mod tests {
             vec![repo("github.com/foo/app"), repo("github.com/foo/tool")],
             vec![repo("github.com/bar/lib"), repo("github.com/bar/tool")],
         );
-        app.set_sync_status("github.com/foo/tool", RepoOperationStatus::Fetching);
+        app.set_sync_status(
+            Path::new("github.com/foo/tool"),
+            RepoOperationStatus::Fetching,
+        );
         assert_eq!(app.count_repos(Section::Workspace), 2);
         assert_eq!(app.count_repos(Section::Library), 2);
 
@@ -567,7 +579,7 @@ mod tests {
 
         let time = std::time::SystemTime::now();
         app.apply_scan_result(
-            "github.com/foo/app",
+            Path::new("github.com/foo/app"),
             crate::RepoStatus::Unpushed,
             Some(time),
         );
