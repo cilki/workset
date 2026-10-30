@@ -1442,13 +1442,13 @@ fn prune_empty_dirs(root: &Path, repo: &Path) {
 #[derive(Clone, Debug)]
 pub struct Workspace {
     /// The workspace directory's filesystem path
-    pub path: String,
+    pub path: PathBuf,
 }
 
 impl Workspace {
     /// Get the library path for this workspace
-    pub fn library_path(&self) -> String {
-        format!("{}/.workset", self.path)
+    pub fn library_path(&self) -> PathBuf {
+        self.path.join(".workset")
     }
 
     /// Render a repo's path relative to the workspace root as a display string,
@@ -1473,9 +1473,9 @@ impl Workspace {
         loop {
             if workspace_root.join(".workset").is_dir() {
                 let workspace = Workspace {
-                    path: workspace_root.display().to_string(),
+                    path: workspace_root,
                 };
-                debug!(workspace_path = %workspace.path, "Found workspace");
+                debug!(workspace_path = %workspace.path.display(), "Found workspace");
                 return Some(workspace);
             }
 
@@ -1502,13 +1502,13 @@ impl Workspace {
         }) {
             bail!("'{}' is outside the workspace", pattern.full_path());
         }
-        Ok(Path::new(&self.path).join(relative))
+        Ok(self.path.join(relative))
     }
 
     /// Every repo in the working set: the repos the workspace holds, found by
     /// walking it from the root.
     pub fn repos(&self) -> Vec<PathBuf> {
-        self.repos_under(Path::new(&self.path))
+        self.repos_under(&self.path)
     }
 
     /// The repos of the working set that live under `path`.
@@ -1537,7 +1537,7 @@ impl Workspace {
     /// symlink are still the same directory.
     fn is_root(&self, path: &Path) -> bool {
         let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        canonical(path) == canonical(Path::new(&self.path))
+        canonical(path) == canonical(&self.path)
     }
 
     /// Search the workspace for local repos matching the given pattern.
@@ -1565,7 +1565,8 @@ impl Workspace {
     /// `[provider]/<path>` sense and is parsed, so a pasted clone URL still
     /// names the repo it was cloned into.
     pub fn resolve_pattern(&self, cwd: &Path, pattern: &str) -> RepoPattern {
-        let resolved = Path::new(&self.path)
+        let resolved = self
+            .path
             .canonicalize()
             .and_then(|root| Ok((root, cwd.join(pattern).canonicalize()?)))
             .ok()
@@ -1625,7 +1626,7 @@ impl Workspace {
         // and a symlink anywhere along the way points wherever it likes while
         // still reading as a path under the root. Resolving both ends settles
         // where the directory about to be moved or deleted really is.
-        let root = std::fs::canonicalize(&self.path).unwrap_or_else(|_| PathBuf::from(&self.path));
+        let root = std::fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
         let relative = std::fs::canonicalize(repo)
             .ok()
             .and_then(|resolved| Some(resolved.strip_prefix(&root).ok()?.to_path_buf()));
@@ -1698,40 +1699,40 @@ impl Workspace {
     pub fn clone_into(&self, url: &str, dest: &Path) -> Result<()> {
         gix_clone(url, dest)
             .map(|_| ())
-            .inspect_err(|_| prune_empty_dirs(Path::new(&self.path), dest))
+            .inspect_err(|_| prune_empty_dirs(&self.path, dest))
     }
 
     /// Attempt to clone a repository from configured remotes or infer the clone URL
     /// Check if a repository exists in the library
     pub fn library_contains(&self, repo_path: &str) -> bool {
-        std::fs::metadata(format!("{}/{}", self.library_path(), repo_path)).is_ok()
+        self.library_path().join(repo_path).exists()
     }
 
     /// Move the given repository into the library.
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
     pub fn store_in_library(&self, relative_path: &str) -> Result<()> {
-        let source = format!("{}/{}/.git", self.path, relative_path);
-        let dest = format!("{}/{}", self.library_path(), relative_path);
+        let source = self.path.join(relative_path).join(".git");
+        let dest = self.library_path().join(relative_path);
 
         // Verify the source .git directory exists
         if std::fs::metadata(&source).is_err() {
-            bail!("Repository .git directory not found: {}", source);
+            bail!("Repository .git directory not found: {}", source.display());
         }
 
         // Set core.bare=true by modifying the config file directly
-        set_bare_in_config(Path::new(&source), true)?;
+        set_bare_in_config(&source, true)?;
 
-        debug!(source = %source, dest = %dest, "Storing repository in library");
+        debug!(source = %source.display(), dest = %dest.display(), "Storing repository in library");
 
         // Create parent directories in library if needed
-        if let Some(parent) = Path::new(&dest).parent() {
+        if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow::anyhow!("Failed to create library parent directory: {}", e))?;
         }
 
         // Clear the library entry if it exists (for re-storing)
         if std::fs::metadata(&dest).is_ok() {
-            debug!("Removing existing library entry: {}", dest);
+            debug!("Removing existing library entry: {}", dest.display());
             std::fs::remove_dir_all(&dest)
                 .map_err(|e| anyhow::anyhow!("Failed to remove existing library entry: {}", e))?;
         }
@@ -1758,9 +1759,8 @@ impl Workspace {
     ///
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
     pub fn restore_from_library(&self, relative_path: &str) -> Result<()> {
-        let library_path = self.library_path();
-        let source = PathBuf::from(&library_path).join(relative_path);
-        let dest = PathBuf::from(&self.path).join(relative_path);
+        let source = self.library_path().join(relative_path);
+        let dest = self.path.join(relative_path);
 
         // Verify the library entry exists
         if std::fs::metadata(&source).is_err() {
@@ -1780,7 +1780,6 @@ impl Workspace {
         }
 
         let git_dir = dest.join(".git");
-        let root = PathBuf::from(&self.path);
         std::fs::create_dir_all(&dest).map_err(|e| {
             anyhow::anyhow!("Failed to create {} in the workspace: {}", relative_path, e)
         })?;
@@ -1789,7 +1788,7 @@ impl Workspace {
         // keeps every branch, tag and reflog the repo had, and it is a rename
         // within the workspace, so it costs nothing per object.
         if let Err(e) = std::fs::rename(&source, &git_dir) {
-            prune_empty_dirs(&root, &dest);
+            prune_empty_dirs(&self.path, &dest);
             bail!("Failed to move repository out of the library: {}", e);
         }
 
@@ -1802,7 +1801,7 @@ impl Workspace {
             let _ = set_bare_in_config(&git_dir, true);
             let _ = std::fs::rename(&git_dir, &source);
             let _ = std::fs::remove_dir_all(&dest);
-            prune_empty_dirs(&root, &dest);
+            prune_empty_dirs(&self.path, &dest);
             return Err(e);
         }
 
@@ -1839,7 +1838,7 @@ impl Workspace {
         // somewhere else and flipping that repository's `core.bare` on the
         // way. A link pointing at one of its own ancestors had no bottom
         // either, and the listing recursed until the stack ran out.
-        let repos: Vec<String> = find_repos(Path::new(&library_path))
+        let repos: Vec<String> = find_repos(&library_path)
             .into_iter()
             .filter_map(|(repo, _)| {
                 // The library root itself isn't an entry in the library, so a
@@ -2135,14 +2134,14 @@ mod tests {
     fn test_library_contains() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().to_string_lossy().to_string(),
+            path: temp_dir.path().to_path_buf(),
         };
 
         let repo_path = "test/repo";
         assert!(!workspace.library_contains(repo_path));
 
         // Create the library directory with a test repo
-        let library_path = format!("{}/{}", workspace.library_path(), repo_path);
+        let library_path = workspace.library_path().join(repo_path);
         fs::create_dir_all(&library_path).unwrap();
 
         assert!(workspace.library_contains(repo_path));
@@ -2152,7 +2151,7 @@ mod tests {
     fn resolve_pattern_is_relative_to_the_current_directory() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().to_string_lossy().to_string(),
+            path: temp_dir.path().to_path_buf(),
         };
         let parent = temp_dir.path().join("github.com/user");
         fs::create_dir_all(parent.join("project")).unwrap();
@@ -2195,7 +2194,7 @@ mod tests {
     fn a_pattern_that_names_a_directory_is_not_read_as_a_url() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().to_string_lossy().to_string(),
+            path: temp_dir.path().to_path_buf(),
         };
         let root = temp_dir.path();
 
@@ -2232,7 +2231,7 @@ mod tests {
     fn a_pattern_that_names_nothing_on_disk_is_still_read_as_a_url() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().to_string_lossy().to_string(),
+            path: temp_dir.path().to_path_buf(),
         };
         let root = temp_dir.path();
 
@@ -2253,7 +2252,7 @@ mod tests {
     fn resolve_pattern_keeps_patterns_it_cannot_place_in_the_workspace() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         let root = temp_dir.path().join("ws");
         fs::create_dir_all(root.join("repo")).unwrap();
@@ -2279,7 +2278,7 @@ mod tests {
     fn search_refuses_patterns_that_point_outside_the_workspace() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(temp_dir.path().join("ws/github.com/user/project/.git")).unwrap();
         let outside = temp_dir.path().join("outside/repo");
@@ -2311,7 +2310,7 @@ mod tests {
     fn drop_leaves_repos_outside_the_workspace_alone() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
         let outside = temp_dir.path().join("outside/repo");
@@ -2329,7 +2328,7 @@ mod tests {
         }
 
         // Nor was the repo smuggled into the workspace on the way out
-        assert!(find_git_repositories(Path::new(&workspace.path)).is_empty());
+        assert!(find_git_repositories(&workspace.path).is_empty());
     }
 
     /// `workset init` in a directory that is already a git repo — a checkout
@@ -2343,7 +2342,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let workspace = Workspace {
-            path: root.to_string_lossy().to_string(),
+            path: root.to_path_buf(),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
         gix::init(root).unwrap();
@@ -2386,7 +2385,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let workspace = Workspace {
-            path: root.to_string_lossy().to_string(),
+            path: root.to_path_buf(),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
         repo_with_a_commit(root);
@@ -2406,7 +2405,7 @@ mod tests {
         // The workspace itself came through untouched: its git directory, the
         // library the drop just wrote to, and the files it was tracking
         assert!(root.join(".git").is_dir());
-        assert!(Path::new(&workspace.library_path()).is_dir());
+        assert!(workspace.library_path().is_dir());
         assert!(root.join("notes.txt").exists());
 
         // And it can't be dropped by naming it either, however it is spelled
@@ -2443,10 +2442,10 @@ mod tests {
     fn drop_refuses_a_commit_less_repo_holding_uncommitted_work() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("fresh");
+        let repo = workspace.path.join("fresh");
         fs::create_dir_all(&repo).unwrap();
         gix::init(&repo).unwrap();
         fs::write(repo.join("notes.txt"), "unfinished").unwrap();
@@ -2469,7 +2468,7 @@ mod tests {
         );
 
         // An empty one has nothing to lose and still drops
-        let empty = PathBuf::from(&workspace.path).join("empty");
+        let empty = workspace.path.join("empty");
         fs::create_dir_all(&empty).unwrap();
         gix::init(&empty).unwrap();
         let report = workspace
@@ -2507,14 +2506,14 @@ mod tests {
     fn drop_refuses_a_linked_worktree() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
 
-        let main_repo = PathBuf::from(&workspace.path).join("main");
+        let main_repo = workspace.path.join("main");
         fs::create_dir_all(&main_repo).unwrap();
         gix::init(&main_repo).unwrap();
-        let worktree = PathBuf::from(&workspace.path).join("feature");
+        let worktree = workspace.path.join("feature");
         add_linked_worktree(&main_repo, &worktree, "feature");
         fs::write(worktree.join("work.txt"), "only here").unwrap();
 
@@ -2546,7 +2545,7 @@ mod tests {
     fn drop_refuses_a_symlinked_git_dir() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
 
@@ -2559,7 +2558,7 @@ mod tests {
         let config = git_dir.join("config");
         let config_before = fs::read_to_string(&config).unwrap();
 
-        let repo = PathBuf::from(&workspace.path).join("tool");
+        let repo = workspace.path.join("tool");
         fs::create_dir_all(&repo).unwrap();
         std::os::unix::fs::symlink(&git_dir, repo.join(".git")).unwrap();
         fs::write(repo.join("notes.txt"), "only here").unwrap();
@@ -2607,10 +2606,10 @@ mod tests {
         for hard in [false, true] {
             let temp_dir = TempDir::new().unwrap();
             let workspace = Workspace {
-                path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+                path: temp_dir.path().join("ws"),
             };
             fs::create_dir_all(workspace.library_path()).unwrap();
-            let repo = PathBuf::from(&workspace.path).join("tool");
+            let repo = workspace.path.join("tool");
             repo_with_a_commit(&repo);
 
             // A file of the user's own, which is what `.git/config` names
@@ -2638,7 +2637,7 @@ mod tests {
             // The repo still reads the config it was reading, as a file of its
             // own: the entry the library holds is bare, and nothing but this
             // git directory was written to say so
-            let entry = PathBuf::from(workspace.library_path()).join("tool");
+            let entry = workspace.library_path().join("tool");
             let stored = entry.join("config");
             assert!(fs::symlink_metadata(&stored).unwrap().file_type().is_file());
             assert!(
@@ -2669,20 +2668,16 @@ mod tests {
     fn drop_refuses_the_main_worktree_of_a_live_linked_worktree() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
 
-        let main_repo = PathBuf::from(&workspace.path).join("main");
+        let main_repo = workspace.path.join("main");
         fs::create_dir_all(&main_repo).unwrap();
         gix::init(&main_repo).unwrap();
         // One inside the workspace and one outside it: either way the drop is
         // what breaks them, so where they sit doesn't decide anything
-        add_linked_worktree(
-            &main_repo,
-            &PathBuf::from(&workspace.path).join("feature"),
-            "feature",
-        );
+        add_linked_worktree(&main_repo, &workspace.path.join("feature"), "feature");
         add_linked_worktree(&main_repo, &temp_dir.path().join("elsewhere"), "elsewhere");
 
         let pattern = "main".parse::<RepoPattern>().unwrap();
@@ -2697,7 +2692,7 @@ mod tests {
         }
 
         // Taking the worktrees away leaves a repo nothing else is using
-        fs::remove_dir_all(PathBuf::from(&workspace.path).join("feature")).unwrap();
+        fs::remove_dir_all(workspace.path.join("feature")).unwrap();
         fs::remove_dir_all(temp_dir.path().join("elsewhere")).unwrap();
         let report = workspace.drop(&pattern, false, false).unwrap();
         assert_eq!(report.dropped, vec!["main".to_string()]);
@@ -2711,11 +2706,11 @@ mod tests {
     fn a_pruned_linked_worktree_does_not_block_a_drop() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
 
-        let main_repo = PathBuf::from(&workspace.path).join("main");
+        let main_repo = workspace.path.join("main");
         fs::create_dir_all(&main_repo).unwrap();
         gix::init(&main_repo).unwrap();
         let worktree = temp_dir.path().join("gone");
@@ -2733,7 +2728,7 @@ mod tests {
     fn drop_repo_refuses_a_path_outside_the_workspace() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
         let outside = temp_dir.path().join("outside/repo");
@@ -2743,7 +2738,7 @@ mod tests {
         // The last gate before a directory is moved or deleted holds on its
         // own, for a path that never went through a pattern
         let mut report = DropReport::default();
-        let through_the_root = PathBuf::from(&workspace.path).join("../outside/repo");
+        let through_the_root = workspace.path.join("../outside/repo");
         for repo in [outside.clone(), through_the_root] {
             assert!(workspace.drop_repo(&repo, true, true, &mut report).is_err());
         }
@@ -2759,10 +2754,10 @@ mod tests {
     fn drop_takes_the_directories_it_leaves_empty_with_it() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let root = PathBuf::from(&workspace.path);
+        let root = workspace.path.clone();
         repo_with_a_commit(&root.join("github.com/user/project"));
 
         let report = workspace
@@ -2794,10 +2789,10 @@ mod tests {
     fn drop_keeps_a_directory_that_still_holds_something() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let root = PathBuf::from(&workspace.path);
+        let root = workspace.path.clone();
         repo_with_a_commit(&root.join("github.com/user/first"));
         repo_with_a_commit(&root.join("github.com/user/second"));
         repo_with_a_commit(&root.join("gitlab.com/group/only"));
@@ -2843,10 +2838,10 @@ mod tests {
     fn restore_writes_the_worktree_and_an_index_that_matches_it() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        let repo = workspace.path.join("github.com/user/project");
         repo_with_a_commit(&repo);
         fs::create_dir_all(repo.join("src/nested")).unwrap();
         fs::write(repo.join("src/nested/one.txt"), "tracked\n").unwrap();
@@ -2897,10 +2892,10 @@ mod tests {
     fn restore_ignores_a_worktree_the_library_entrys_config_names() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        let repo = workspace.path.join("github.com/user/project");
         repo_with_a_commit(&repo);
         fs::write(repo.join("payload.sh"), "echo pwned\n").unwrap();
         git(&repo, &["add", "-A"]);
@@ -2918,7 +2913,7 @@ mod tests {
         // that arrived with it would carry it
         let outside = temp_dir.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
-        let entry = PathBuf::from(workspace.library_path()).join("github.com/user/project");
+        let entry = workspace.library_path().join("github.com/user/project");
         let mut config = fs::read_to_string(entry.join("config")).unwrap();
         config.push_str(&format!("\n[core]\n\tworktree = {}\n", outside.display()));
         fs::write(entry.join("config"), config).unwrap();
@@ -2960,10 +2955,10 @@ mod tests {
     fn restore_ignores_a_worktree_the_entrys_worktree_config_names() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        let repo = workspace.path.join("github.com/user/project");
         repo_with_a_commit(&repo);
         fs::write(repo.join("payload.sh"), "echo pwned\n").unwrap();
         git(&repo, &["add", "-A"]);
@@ -2979,7 +2974,7 @@ mod tests {
 
         let outside = temp_dir.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
-        let entry = PathBuf::from(workspace.library_path()).join("github.com/user/project");
+        let entry = workspace.library_path().join("github.com/user/project");
         let mut config = fs::read_to_string(entry.join("config")).unwrap();
         config.push_str("\n[extensions]\n\tworktreeConfig = true\n");
         fs::write(entry.join("config"), config).unwrap();
@@ -3018,10 +3013,10 @@ mod tests {
     fn a_restore_that_cannot_check_out_leaves_the_repo_in_the_library() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        let repo = workspace.path.join("github.com/user/project");
         repo_with_a_commit(&repo);
         workspace
             .drop(
@@ -3033,7 +3028,7 @@ mod tests {
 
         // HEAD's branch names a commit the object store doesn't hold, so there
         // is no tree for the checkout to write
-        let entry = PathBuf::from(workspace.library_path()).join("github.com/user/project");
+        let entry = workspace.library_path().join("github.com/user/project");
         fs::write(
             entry.join("refs/heads/main"),
             "0000000000000000000000000000000000000001\n",
@@ -3048,7 +3043,7 @@ mod tests {
 
         // Nothing of the restore is left in the workspace, and the library is
         // holding the repo the way it was before: whole, and bare
-        assert!(!PathBuf::from(&workspace.path).join("github.com").exists());
+        assert!(!workspace.path.join("github.com").exists());
         assert!(workspace.library_contains("github.com/user/project"));
         assert!(entry.join("HEAD").is_file());
         assert_eq!(git(&entry, &["config", "core.bare"]), "true");
@@ -3062,10 +3057,10 @@ mod tests {
     fn a_failed_clone_takes_the_directories_it_made_with_it() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let root = PathBuf::from(&workspace.path);
+        let root = workspace.path.clone();
 
         // A local path holding no repository stands in for every way a clone
         // can fail, and needs no network to do it
@@ -3081,7 +3076,7 @@ mod tests {
 
         assert!(!root.join("github.com").exists());
         assert!(root.is_dir());
-        assert!(Path::new(&workspace.library_path()).is_dir());
+        assert!(workspace.library_path().is_dir());
     }
 
     /// The walk upward has to stop somewhere: the workspace root and the
@@ -3166,7 +3161,7 @@ mod tests {
     fn drop_repo_refuses_a_repo_reached_through_a_symlink() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
 
@@ -3177,13 +3172,13 @@ mod tests {
 
         std::os::unix::fs::symlink(
             temp_dir.path().join("outside"),
-            Path::new(&workspace.path).join("linked"),
+            workspace.path.join("linked"),
         )
         .unwrap();
 
         // The path spells out as workspace-relative, but the repo behind it
         // belongs to neither the workspace nor its library
-        let through_the_link = Path::new(&workspace.path).join("linked/repo");
+        let through_the_link = workspace.path.join("linked/repo");
         let mut report = DropReport::default();
         for delete in [false, true] {
             assert!(
@@ -3201,10 +3196,10 @@ mod tests {
     fn drop_repo_refuses_the_workspace_root() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let root = PathBuf::from(&workspace.path);
+        let root = workspace.path.clone();
         gix::init(&root).unwrap();
 
         // A workspace that is itself a git repo is still not a repo the
@@ -3212,7 +3207,7 @@ mod tests {
         let mut report = DropReport::default();
         assert!(workspace.drop_repo(&root, true, true, &mut report).is_err());
         assert!(root.exists());
-        assert!(Path::new(&workspace.library_path()).exists());
+        assert!(workspace.library_path().exists());
         assert!(report.is_empty());
     }
 
@@ -3312,9 +3307,9 @@ mod tests {
     fn drop_takes_the_url_shaped_directory_it_was_given() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
-        let root = PathBuf::from(&workspace.path);
+        let root = workspace.path.clone();
         fs::create_dir_all(workspace.library_path()).unwrap();
 
         // Each pair is (what the user names, what parsing it would reach)
@@ -3337,6 +3332,38 @@ mod tests {
             );
             assert!(workspace.library_contains(named));
         }
+    }
+
+    /// A workspace's root is wherever the user put it, and on Unix that path
+    /// need not be UTF-8. Kept as a lossily converted string it named a
+    /// directory that doesn't exist, so the walk found no repos, a drop
+    /// matched nothing and the library read as empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_whose_path_is_not_utf8_still_holds_its_repos() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join(std::ffi::OsStr::from_bytes(b"ws\xff")),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        repo_with_a_commit(&workspace.path.join("github.com/user/repo"));
+
+        assert_eq!(
+            workspace.repos(),
+            vec![workspace.path.join("github.com/user/repo")]
+        );
+
+        let pattern = RepoPattern::from_relative_path("github.com/user/repo");
+        let report = workspace.drop(&pattern, false, false).unwrap();
+        assert_eq!(report.dropped, vec!["github.com/user/repo".to_string()]);
+        assert_eq!(workspace.list_library(), vec!["github.com/user/repo"]);
+
+        workspace
+            .restore_from_library("github.com/user/repo")
+            .unwrap();
+        assert!(workspace.path.join("github.com/user/repo/.git").is_dir());
     }
 
     #[test]
@@ -3567,10 +3594,10 @@ mod tests {
     fn drop_refuses_a_repo_whose_only_work_is_staged() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("staged");
+        let repo = workspace.path.join("staged");
         repo_with_staged_work(&repo, Some("tracked"), &["add", "tracked"]);
 
         let pattern = "staged".parse::<RepoPattern>().unwrap();
@@ -3675,10 +3702,10 @@ mod tests {
     fn drop_refuses_a_repo_whose_other_branch_is_unpushed() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("repo");
+        let repo = workspace.path.join("repo");
         repo_with_a_remote(temp_dir.path(), &repo);
 
         git(&repo, &["checkout", "--quiet", "-b", "side"]);
@@ -3753,10 +3780,10 @@ mod tests {
     fn drop_refuses_a_repo_it_cannot_read() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("opaque");
+        let repo = workspace.path.join("opaque");
         repo_gix_cannot_open(&repo);
         fs::write(repo.join("work.txt"), "exists nowhere else").unwrap();
 
@@ -3775,7 +3802,7 @@ mod tests {
                 fs::read_to_string(repo.join("work.txt")).unwrap(),
                 "exists nowhere else"
             );
-            assert!(!Path::new(&workspace.library_path()).join("opaque").exists());
+            assert!(!workspace.library_path().join("opaque").exists());
         }
 
         // --force is still the way to say "I know, drop it anyway"
@@ -3832,10 +3859,10 @@ mod tests {
     fn drop_refuses_a_repo_whose_config_names_another_worktree() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        let repo = workspace.path.join("github.com/user/project");
         repo_naming_another_worktree(temp_dir.path(), &repo, "[core]\n\tworktree = {}\n");
 
         // The user's own work, uncommitted, in the directory the workspace
@@ -3879,10 +3906,10 @@ mod tests {
     fn a_forced_drop_leaves_the_worktree_key_out_of_the_library() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("github.com/user/project");
+        let repo = workspace.path.join("github.com/user/project");
         let decoy = repo_naming_another_worktree(temp_dir.path(), &repo, "[core] worktree = {}\n");
 
         let pattern = "github.com/user/project".parse::<RepoPattern>().unwrap();
@@ -3890,7 +3917,7 @@ mod tests {
         assert_eq!(report.dropped, vec!["github.com/user/project".to_string()]);
 
         // Asked of git, because git is what reads it back
-        let entry = PathBuf::from(workspace.library_path()).join("github.com/user/project");
+        let entry = workspace.library_path().join("github.com/user/project");
         let query = ["config", "--default", "", "--get", "core.worktree"];
         assert_eq!(
             git(&entry, &query),
@@ -3952,10 +3979,10 @@ mod tests {
     fn reftable_repo_is_not_reported_empty() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp_dir.path().join("ws").to_string_lossy().to_string(),
+            path: temp_dir.path().join("ws"),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
-        let repo = PathBuf::from(&workspace.path).join("reftable");
+        let repo = workspace.path.join("reftable");
         fs::create_dir_all(&repo).unwrap();
         if try_git(&repo, &["init", "--quiet", "--ref-format=reftable"]).is_none() {
             // Too old a git to make one; nothing to check here
@@ -4057,7 +4084,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let workspace = Workspace {
-            path: root.to_string_lossy().to_string(),
+            path: root.to_path_buf(),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
 
@@ -4068,7 +4095,7 @@ mod tests {
 
         // Only reachable by descending into an entry, and shaped exactly like
         // the repos the listing reports
-        let entry = Path::new(&workspace.library_path()).join("github.com/a/one");
+        let entry = workspace.library_path().join("github.com/a/one");
         fs::create_dir_all(entry.join("objects/decoy/.git")).unwrap();
 
         assert_eq!(
@@ -4086,9 +4113,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let workspace = Workspace {
-            path: root.to_string_lossy().to_string(),
+            path: root.to_path_buf(),
         };
-        let entry = Path::new(&workspace.library_path()).join("github.com/user/repo");
+        let entry = workspace.library_path().join("github.com/user/repo");
         gix::init(&entry).unwrap();
         fs::write(entry.join("tracked.txt"), "hello").unwrap();
 
@@ -4110,9 +4137,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let workspace = Workspace {
-            path: root.to_string_lossy().to_string(),
+            path: root.to_path_buf(),
         };
-        let library = PathBuf::from(workspace.library_path());
+        let library = workspace.library_path();
         fs::create_dir_all(&library).unwrap();
 
         // The one entry the library really holds
@@ -4142,7 +4169,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let workspace = Workspace {
-            path: root.to_string_lossy().to_string(),
+            path: root.to_path_buf(),
         };
         fs::create_dir_all(workspace.library_path()).unwrap();
 
@@ -4155,7 +4182,7 @@ mod tests {
             .store_in_library("github.com/user/dropped")
             .unwrap();
 
-        let library_entry = Path::new(&workspace.library_path()).join("github.com/user/dropped");
+        let library_entry = workspace.library_path().join("github.com/user/dropped");
         assert!(
             library_entry.join("objects").is_dir(),
             "the library entry should be a bare git directory"

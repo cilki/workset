@@ -496,13 +496,13 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         let mut terminal = Terminal::new(backend)?;
 
         // Create app with empty data; repos stream in from the background loader
-        let mut app = App::new(workspace.path.clone(), Vec::new(), Vec::new());
+        let mut app = App::new(workspace.path.display().to_string(), Vec::new(), Vec::new());
         app.loading_progress = Some("loading...".to_string());
 
         // Setup the debounced filesystem watcher on a background thread, since
         // recursively registering a large workspace can take a while and would
         // delay the first frame
-        let workspace_path = PathBuf::from(&workspace.path);
+        let workspace_path = workspace.path.clone();
         let (watcher_tx, watcher_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = watcher_tx.send(FileWatcher::new(
@@ -1614,14 +1614,14 @@ mod tests {
     fn scan_all_repos_scans_every_discovered_row_once() {
         let temp = tempfile::TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp.path().to_string_lossy().to_string(),
+            path: temp.path().to_path_buf(),
         };
 
         let in_workspace = temp.path().join("github.com/fossable/alpha");
         std::fs::create_dir_all(&in_workspace).unwrap();
         gix::init(&in_workspace).unwrap();
 
-        let in_library = PathBuf::from(workspace.library_path()).join("github.com/fossable/beta");
+        let in_library = workspace.library_path().join("github.com/fossable/beta");
         std::fs::create_dir_all(&in_library).unwrap();
         gix::init_bare(&in_library).unwrap();
 
@@ -1681,7 +1681,7 @@ mod tests {
     fn loader_replaces_seeded_rows_and_drops_vanished_ones() {
         let temp = tempfile::TempDir::new().unwrap();
         let workspace = Workspace {
-            path: temp.path().to_string_lossy().to_string(),
+            path: temp.path().to_path_buf(),
         };
         std::fs::create_dir_all(workspace.library_path()).unwrap();
 
@@ -1695,7 +1695,7 @@ mod tests {
             status: Some(crate::RepoStatus::Clean),
             ..Default::default()
         };
-        let mut app = App::new(workspace.path.clone(), Vec::new(), Vec::new());
+        let mut app = App::new(workspace.path.display().to_string(), Vec::new(), Vec::new());
         let mut loader = RepoLoader::start(
             &workspace,
             vec![

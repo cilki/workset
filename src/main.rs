@@ -284,7 +284,7 @@ fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
         // a git repository there is the repo being "in the workspace"; a
         // plain directory or file is just in the way, and saying the repo is
         // checked out would send the user looking for one that isn't.
-        let dest_path = PathBuf::from(&workspace.path).join(&repo_path);
+        let dest_path = workspace.path.join(&repo_path);
         if dest_path.exists() {
             if dest_path.join(".git").exists() {
                 eprintln!("{} is already in the workspace", quote_path(&repo_path));
@@ -503,12 +503,12 @@ fn main() -> Result<ExitCode> {
                 // 'restore' at the real root can find it again
                 if let Some(enclosing) = maybe_workspace
                     .as_ref()
-                    .filter(|workspace| Path::new(&workspace.path) != workspace_path)
+                    .filter(|workspace| workspace.path != workspace_path)
                 {
                     eprintln!(
                         "{} is already inside the workspace at {}",
                         quote_path(&workspace_name),
-                        quote_path(&enclosing.path)
+                        quote_path(&enclosing.path.to_string_lossy())
                     );
                     false
                 } else if library_path.exists() {
@@ -673,12 +673,12 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     if repos.is_empty() {
         outln!(
             "No repositories found in workspace ({})",
-            quote_path(&workspace.path)
+            quote_path(&workspace.path.to_string_lossy())
         );
     } else {
         outln!(
             "Repositories in workspace ({}):",
-            quote_path(&workspace.path)
+            quote_path(&workspace.path.to_string_lossy())
         );
         outln!();
 
@@ -707,7 +707,7 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
     outln!();
     outln!(
         "Library ({}): {} repository(ies)",
-        quote_path(&workspace.library_path()),
+        quote_path(&workspace.library_path().to_string_lossy()),
         workspace.list_library().len()
     );
 
@@ -1019,17 +1019,13 @@ mod tests {
     /// A workspace holding one checked-out repo and one library entry
     fn workspace(root: &Path) -> Workspace {
         let workspace = Workspace {
-            path: root.to_string_lossy().to_string(),
+            path: root.to_path_buf(),
         };
         let checked_out = root.join("github.com/user/alpha");
         std::fs::create_dir_all(&checked_out).unwrap();
         gix::init(&checked_out).unwrap();
-        std::fs::create_dir_all(
-            Path::new(&workspace.library_path()).join("github.com/user/stored"),
-        )
-        .unwrap();
-        gix::init_bare(Path::new(&workspace.library_path()).join("github.com/user/stored"))
-            .unwrap();
+        std::fs::create_dir_all(workspace.library_path().join("github.com/user/stored")).unwrap();
+        gix::init_bare(workspace.library_path().join("github.com/user/stored")).unwrap();
         workspace
     }
 
@@ -1246,7 +1242,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
         let workspace = Workspace {
-            path: root.to_string_lossy().to_string(),
+            path: root.to_path_buf(),
         };
         let paths: Vec<PathBuf> = ["alpha", "beta", "gamma"]
             .iter()
@@ -1298,7 +1294,7 @@ mod tests {
             let checked_out = temp.path().join(name);
             std::fs::create_dir_all(&checked_out).unwrap();
             gix::init(&checked_out).unwrap();
-            let stored = Path::new(&workspace.library_path()).join(name);
+            let stored = workspace.library_path().join(name);
             std::fs::create_dir_all(&stored).unwrap();
             gix::init_bare(&stored).unwrap();
         }
