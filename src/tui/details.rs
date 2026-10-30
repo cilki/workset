@@ -1,7 +1,7 @@
 use super::app::{App, Section};
 use crate::RepoStatus;
-use crate::sync::SyncOutcome;
-use std::path::{Path, PathBuf};
+use crate::sync::{RemoteInfo, SyncOutcome};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -20,18 +20,6 @@ pub struct RepoDetails {
     pub line_changes: Option<(usize, usize)>,
     /// The repo's remotes, as shown in the detail rows
     pub remotes: Option<Vec<RemoteInfo>>,
-}
-
-/// One remote as shown in the repo detail
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RemoteInfo {
-    pub name: String,
-    /// Commits this remote is missing from the newest published id across the
-    /// repo's branches, per the local tracking refs; 0 = up to date
-    pub behind: usize,
-    /// Short id of this remote's tracking ref for the checked-out branch;
-    /// None when HEAD is detached or the remote doesn't track the branch
-    pub commit: Option<String>,
 }
 
 impl RepoDetails {
@@ -165,10 +153,8 @@ impl DetailsLoader {
         // fallback values so the entry completes instead of respawning forever
         std::thread::spawn(move || {
             if current.remotes.is_none() {
-                let _ = tx.send(DetailsEvent::Remotes(
-                    path.clone(),
-                    load_remotes(&path, &interrupt),
-                ));
+                let remotes = crate::sync::remote_info(&path, &interrupt).unwrap_or_default();
+                let _ = tx.send(DetailsEvent::Remotes(path.clone(), remotes));
             }
             if current.line_changes.is_none() {
                 let counts = crate::sync::count_diff_lines(&path, &interrupt).unwrap_or((0, 0));
@@ -203,25 +189,6 @@ impl DetailsLoader {
             }
         }
     }
-}
-
-/// List the repo's remotes, annotating each with how far behind it is and
-/// the id it holds for the checked-out branch
-fn load_remotes(path: &Path, interrupt: &AtomicBool) -> Vec<RemoteInfo> {
-    let names = crate::sync::list_remotes(path, interrupt).unwrap_or_default();
-    let info = crate::sync::remote_ref_info(path, &names, interrupt).unwrap_or_default();
-    names
-        .into_iter()
-        .map(|name| {
-            let info = info.get(&name).cloned().unwrap_or_default();
-            RemoteInfo {
-                behind: info.behind,
-                // Truncation is a display concern; sync keeps full ids
-                commit: info.head_id.map(|id| id.chars().take(7).collect()),
-                name,
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

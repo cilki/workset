@@ -187,11 +187,11 @@ pub fn head_tracking_ids(states: &[RefState], head: Option<&str>) -> BTreeMap<St
         .collect()
 }
 
-/// Per-remote view of the local tracking refs (no network — stale until the
-/// next fetch, which is fine for a UI indicator): how many commits the remote
-/// is behind, and the id it holds for the checked-out branch
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct RemoteRefInfo {
+/// One remote as seen through the local tracking refs (no network — stale
+/// until the next fetch, which is fine for a UI indicator)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInfo {
+    pub name: String,
     /// Commits this remote is missing from the newest published id across the
     /// repo's branches; 0 = up to date
     pub behind: usize,
@@ -200,14 +200,14 @@ pub struct RemoteRefInfo {
     pub head_id: Option<String>,
 }
 
-/// Compute a [`RemoteRefInfo`] per remote from the local tracking refs of the
-/// repo's branches — this never touches the network.
-pub fn remote_ref_info(
-    repo_path: &Path,
-    remotes: &[String],
-    interrupt: &AtomicBool,
-) -> Result<BTreeMap<String, RemoteRefInfo>> {
-    let states = collect_ref_states(repo_path, remotes, interrupt)?;
+/// Every configured remote, in `git remote` order, annotated from the local
+/// tracking refs of the repo's branches — this never touches the network.
+///
+/// Refs that can't be read leave the remotes listed with nothing counted,
+/// rather than hiding remotes that are known to exist.
+pub fn remote_info(repo_path: &Path, interrupt: &AtomicBool) -> Result<Vec<RemoteInfo>> {
+    let remotes = list_remotes(repo_path, interrupt)?;
+    let states = collect_ref_states(repo_path, &remotes, interrupt).unwrap_or_default();
     let mut is_ancestor =
         |ancestor: &str, descendant: &str| is_ancestor(repo_path, ancestor, descendant, interrupt);
     let mut count_range = |behind_id: &str, candidate: &str| {
@@ -225,16 +225,16 @@ pub fn remote_ref_info(
     };
     let behind = plan_behind_counts(&states, &mut is_ancestor, &mut count_range);
     let head = head_branch(repo_path, interrupt);
-    let head_ids = head_tracking_ids(&states, head.as_deref());
+    let mut head_ids = head_tracking_ids(&states, head.as_deref());
 
-    let mut info: BTreeMap<String, RemoteRefInfo> = BTreeMap::new();
-    for (remote, behind) in behind {
-        info.entry(remote).or_default().behind = behind;
-    }
-    for (remote, id) in head_ids {
-        info.entry(remote).or_default().head_id = Some(id);
-    }
-    Ok(info)
+    Ok(remotes
+        .into_iter()
+        .map(|name| RemoteInfo {
+            behind: behind.get(&name).copied().unwrap_or(0),
+            head_id: head_ids.remove(&name),
+            name,
+        })
+        .collect())
 }
 
 /// Name of the checked-out branch, or None when HEAD is detached. An unborn
@@ -658,7 +658,7 @@ mod tests {
     }
 
     /// End-to-end over a real repository: `collect_ref_states` reads the
-    /// branch heads and tracking refs, and `remote_ref_info` turns them into
+    /// branch heads and tracking refs, and `remote_info` turns them into
     /// a per-remote commit distance and checked-out-branch id.
     #[test]
     fn behind_counts_read_from_real_tracking_refs() {
@@ -702,35 +702,29 @@ mod tests {
         git(&repo, &["fetch", "--quiet", "--all"]);
 
         let interrupt = AtomicBool::new(false);
-        let remotes = list_remotes(&repo, &interrupt).unwrap();
-        assert_eq!(remotes, vec!["current".to_string(), "stale".to_string()]);
         assert_eq!(
-            remote_ref_info(&repo, &remotes, &interrupt).unwrap(),
-            BTreeMap::from([
-                (
-                    "current".to_string(),
-                    RemoteRefInfo {
-                        behind: 0,
-                        head_id: Some(second.clone()),
-                    }
-                ),
-                (
-                    "stale".to_string(),
-                    RemoteRefInfo {
-                        behind: 1,
-                        head_id: Some(first.clone()),
-                    }
-                ),
-            ]),
+            remote_info(&repo, &interrupt).unwrap(),
+            vec![
+                RemoteInfo {
+                    name: "current".to_string(),
+                    behind: 0,
+                    head_id: Some(second.clone()),
+                },
+                RemoteInfo {
+                    name: "stale".to_string(),
+                    behind: 1,
+                    head_id: Some(first.clone()),
+                },
+            ],
         );
 
         // Detached HEAD names no branch, so the per-remote ids disappear
         // while the behind counts stay
         git(&repo, &["checkout", "--quiet", "--detach"]);
         assert_eq!(head_branch(&repo, &interrupt), None);
-        let info = remote_ref_info(&repo, &remotes, &interrupt).unwrap();
-        assert!(info.values().all(|i| i.head_id.is_none()));
-        assert_eq!(info.get("stale").unwrap().behind, 1);
+        let info = remote_info(&repo, &interrupt).unwrap();
+        assert!(info.iter().all(|i| i.head_id.is_none()));
+        assert_eq!(info[1].behind, 1);
     }
 
     #[test]

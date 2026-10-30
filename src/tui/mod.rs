@@ -5,7 +5,8 @@ mod tree;
 mod watcher;
 
 use app::{App, AppMode, Section};
-use details::{DetailsLoader, RemoteInfo, RemoteSyncState, remote_sync_state};
+use crate::sync::RemoteInfo;
+use details::{DetailsLoader, RemoteSyncState, remote_sync_state};
 use crate::get_repo_modification_time;
 use metadata::{format_size, format_time_ago_verbose, get_repo_size};
 use tree::{RepoInfo, RepoOperationStatus, TreeNode};
@@ -1131,10 +1132,10 @@ fn remote_status_line(remote: &RemoteInfo, state: RemoteSyncState) -> Line<'stat
         )),
     };
     let mut spans = vec![Span::raw("  "), Span::raw(remote.name.clone())];
-    if let Some(commit) = &remote.commit {
+    if let Some(id) = &remote.head_id {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            commit.clone(),
+            id.chars().take(7).collect::<String>(),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -1883,7 +1884,7 @@ mod tests {
                 remotes: Some(vec![RemoteInfo {
                     name: "origin".to_string(),
                     behind: 0,
-                    commit: None,
+                    head_id: None,
                 }]),
             },
         );
@@ -1924,12 +1925,12 @@ mod tests {
                     RemoteInfo {
                         name: "origin".to_string(),
                         behind: 0,
-                        commit: Some("a1b2c3d".to_string()),
+                        head_id: Some("a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".to_string()),
                     },
                     RemoteInfo {
                         name: "backup".to_string(),
                         behind: 3,
-                        commit: None,
+                        head_id: None,
                     },
                 ]),
             },
@@ -1943,7 +1944,8 @@ mod tests {
         assert!(text.contains("Changes: clean"));
         assert!(text.contains("Remotes:"));
         // The checked-out branch's id follows the remote name when the
-        // remote tracks the branch, and is omitted when it doesn't
+        // remote tracks the branch, shortened to seven characters, and is
+        // omitted when it doesn't
         assert!(text.contains("origin a1b2c3d not synced yet"));
         assert!(text.contains("backup not synced yet"));
         assert!(text.contains("↓ 3 behind"));
