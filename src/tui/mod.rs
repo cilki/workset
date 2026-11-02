@@ -767,6 +767,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 KeyBinding::Key(code) => code,
             };
 
+            // A failed drop or restore says why until the user moves on
+            app.clear_operation_failures();
+
             // While the help overlay is open, it swallows all input except
             // '?'/Esc to close
             if app.help_visible {

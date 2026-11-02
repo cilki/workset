@@ -73,6 +73,11 @@ pub struct App {
     /// repo rows so it survives background data refreshes. A repo is being
     /// fetched exactly when its entry here is Fetching.
     sync_statuses: std::collections::HashMap<PathBuf, RepoOperationStatus>,
+    /// Why the last drop or restore of a repo failed, keyed by display name
+    /// and overlaid on its row until the next keypress. The rescan that
+    /// follows an operation replaces every row, so without this the reason
+    /// a repo stayed where it was shows for half a second and is gone.
+    operation_failures: std::collections::HashMap<String, String>,
     /// Full result of each repo's last sync, keyed by path, for the info
     /// panel's per-remote status rows
     pub sync_outcomes: std::collections::HashMap<PathBuf, crate::sync::SyncOutcome>,
@@ -106,6 +111,7 @@ impl App {
             help_visible: false,
             help_image: None,
             sync_statuses: std::collections::HashMap::new(),
+            operation_failures: std::collections::HashMap::new(),
             sync_outcomes: std::collections::HashMap::new(),
             details: std::collections::HashMap::new(),
             selection_is_auto: true,
@@ -150,6 +156,10 @@ impl App {
                 .iter()
                 .filter(|repo| matches(repo))
                 .cloned()
+                .map(|mut repo| {
+                    self.apply_operation_failure(&mut repo);
+                    repo
+                })
                 .collect(),
             &self.workspace_repos_list,
         );
@@ -157,7 +167,8 @@ impl App {
     }
 
     /// The workspace repos with transient statuses applied: a repo with an
-    /// active sync gets its sync status shown
+    /// active sync gets its sync status shown, and one whose drop just failed
+    /// says why
     fn workspace_repos_with_overlays(&self) -> Vec<RepoInfo> {
         let mut repos = self.workspace_repos_list.clone();
         for repo in &mut repos {
@@ -169,8 +180,16 @@ impl App {
             {
                 repo.operation_status = status.clone();
             }
+            self.apply_operation_failure(repo);
         }
         repos
+    }
+
+    /// Show the reason the repo's last drop or restore failed, if it did
+    fn apply_operation_failure(&self, repo: &mut RepoInfo) {
+        if let Some(reason) = self.operation_failures.get(&repo.display_name) {
+            repo.operation_status = RepoOperationStatus::Failed(reason.clone());
+        }
     }
 
     /// Rebuild both trees after the repo lists or their overlays changed. A
@@ -318,10 +337,25 @@ impl App {
     /// Mark a repo's row with the status of an operation running right now.
     /// Only the rendered trees are touched, so the mark lasts until the next
     /// rebuild — which is all `run_repo_operation` needs: it draws each step
-    /// itself, and the rescan that follows reports the real outcome.
+    /// itself, and the rescan that follows reports the real outcome. A failure
+    /// is the exception, since where the repo sits afterwards doesn't say why
+    /// it is still there: that one is kept until the next keypress.
     pub fn update_repo_status(&mut self, display_name: &str, status: RepoOperationStatus) {
+        if let RepoOperationStatus::Failed(reason) = &status {
+            self.operation_failures
+                .insert(display_name.to_string(), reason.clone());
+        }
         for tree in &mut self.trees {
             update_repo_status_in_tree(tree, display_name, status.clone());
+        }
+    }
+
+    /// Forget why the last drops and restores failed, once the user has had
+    /// the chance to read it
+    pub fn clear_operation_failures(&mut self) {
+        if !self.operation_failures.is_empty() {
+            self.operation_failures.clear();
+            self.rebuild_preserving_selection();
         }
     }
 
@@ -530,6 +564,45 @@ mod tests {
 
         app.clear_sync_status(Path::new("github.com/foo/app"));
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
+        assert_eq!(info.operation_status, RepoOperationStatus::None);
+    }
+
+    #[test]
+    fn operation_failure_survives_the_rescan_that_follows_it() {
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app")],
+            vec![repo("github.com/bar/lib")],
+        );
+        let library_repo_info = |app: &App, name: &str| {
+            flatten_trees(app.trees(Section::Library))
+                .iter()
+                .find(|(_, _, _, p)| p == name)
+                .and_then(|(node, _, _, _)| node.repo_info.clone())
+        };
+        let failed = RepoOperationStatus::Failed("uncommitted changes".to_string());
+
+        // A drop that left the repo in the workspace, and a restore that left
+        // one in the library
+        app.update_repo_status("github.com/foo/app", RepoOperationStatus::Dropping);
+        app.update_repo_status("github.com/foo/app", failed.clone());
+        app.update_repo_status("github.com/bar/lib", failed.clone());
+
+        // The rescan after the operation rebuilds every row; the reason stays
+        app.update_repos(
+            vec![repo("github.com/foo/app")],
+            vec![repo("github.com/bar/lib")],
+        );
+        let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
+        assert_eq!(info.operation_status, failed);
+        let info = library_repo_info(&app, "github.com/bar/lib").unwrap();
+        assert_eq!(info.operation_status, failed);
+
+        // Until the user moves on
+        app.clear_operation_failures();
+        let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
+        assert_eq!(info.operation_status, RepoOperationStatus::None);
+        let info = library_repo_info(&app, "github.com/bar/lib").unwrap();
         assert_eq!(info.operation_status, RepoOperationStatus::None);
     }
 
