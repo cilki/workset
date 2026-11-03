@@ -552,6 +552,28 @@ fn check_out_worktree(worktree: &Path, git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Where `path` points, resolved through the filesystem for as long as it
+/// exists. The first component that doesn't is kept verbatim along with
+/// everything after it: past a missing directory there is nothing for `..` to
+/// climb out of, so it is left in place rather than folded away, and a caller
+/// confining the result to the workspace refuses it.
+fn locate(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        let next = resolved.join(component);
+        match next.canonicalize() {
+            Ok(real) => resolved = real,
+            Err(_) => {
+                resolved = next;
+                resolved.extend(components);
+                break;
+            }
+        }
+    }
+    resolved
+}
+
 /// Tree-grouping path derived from a git remote URL, e.g.
 /// "git@github.com:fossable/workset.git" -> "github.com/fossable/workset".
 /// None for URLs without a host (local paths, file://).
@@ -1564,17 +1586,32 @@ impl Workspace {
     /// clone URL would only rename it. Anything else is a pattern in the
     /// `[provider]/<path>` sense and is parsed, so a pasted clone URL still
     /// names the repo it was cloned into.
+    ///
+    /// A pattern spelled as a path — absolute, or starting with `./` or
+    /// `../` — is never that fallback, though, whether or not it exists. The
+    /// user said where to look, and reading `./repo` from the workspace root
+    /// once nothing called `repo` is under the current directory dropped a
+    /// different repo than the one at the path typed. It is located from the
+    /// current directory as far as the filesystem goes, so a path that names
+    /// nothing in the workspace matches nothing, and one that leaves it is
+    /// reported as outside the workspace.
     pub fn resolve_pattern(&self, cwd: &Path, pattern: &str) -> RepoPattern {
-        let resolved = self
-            .path
-            .canonicalize()
-            .and_then(|root| Ok((root, cwd.join(pattern).canonicalize()?)))
-            .ok()
-            .and_then(|(root, target)| {
-                let relative = target.strip_prefix(root).ok()?;
-                // The workspace root itself isn't a pattern for any repo
-                (!relative.as_os_str().is_empty()).then(|| relative.display().to_string())
-            });
+        let spelled_as_path = Path::new(pattern).is_absolute()
+            || matches!(
+                Path::new(pattern).components().next(),
+                Some(Component::CurDir | Component::ParentDir)
+            );
+        let resolved = self.path.canonicalize().ok().and_then(|root| {
+            let joined = cwd.join(pattern);
+            let target = if spelled_as_path {
+                locate(&joined)
+            } else {
+                joined.canonicalize().ok()?
+            };
+            let relative = target.strip_prefix(root).ok()?;
+            // The workspace root itself isn't a pattern for any repo
+            (!relative.as_os_str().is_empty()).then(|| relative.display().to_string())
+        });
 
         match resolved {
             Some(relative) => RepoPattern::from_relative_path(&relative),
@@ -2183,6 +2220,64 @@ mod tests {
                 .full_path(),
             "github.com/user/project"
         );
+    }
+
+    /// `./` and `../` say where to look. Falling back to reading such a
+    /// pattern from the workspace root once nothing is at it under the current
+    /// directory turned `workset drop ./local/repo`, run from
+    /// `github.com/user`, into a drop of the root's `local/repo`.
+    #[test]
+    fn a_pattern_spelled_as_a_path_is_never_read_from_the_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let root = workspace.path.clone();
+        let cwd = root.join("github.com/user");
+        fs::create_dir_all(&cwd).unwrap();
+        repo_with_a_commit(&root.join("local/repo"));
+
+        // Nothing is at ./local/repo under the current directory, so it
+        // matches nothing — rather than the repo at the root's local/repo
+        let pattern = workspace.resolve_pattern(&cwd, "./local/repo");
+        assert_eq!(pattern.full_path(), "github.com/user/local/repo");
+        let report = workspace.drop(&pattern, true, true).unwrap();
+        assert!(report.is_empty());
+        assert!(root.join("local/repo/.git").exists());
+
+        // A missing path that stays inside the workspace isn't "outside" it,
+        // whether it climbs with '..' or is spelled absolute
+        let pattern = workspace.resolve_pattern(&cwd, "../../local/missing");
+        assert_eq!(pattern.full_path(), "local/missing");
+        assert!(workspace.search(&pattern).unwrap().is_empty());
+        let absolute = root.join("local/missing");
+        let pattern = workspace.resolve_pattern(&cwd, absolute.to_str().unwrap());
+        assert_eq!(pattern.full_path(), "local/missing");
+
+        // A path spelled as one isn't read as a clone URL either
+        let pattern = workspace.resolve_pattern(&root, "./github.com/user/repo.git");
+        assert_eq!(pattern.full_path(), "github.com/user/repo.git");
+
+        // Climbing out of a directory that doesn't exist is refused rather
+        // than folded into a path that might
+        let pattern = workspace.resolve_pattern(&cwd, "./missing/../../../local/repo");
+        assert!(workspace.search(&pattern).is_err());
+        assert!(root.join("local/repo/.git").exists());
+
+        // And leaving the workspace is still reported as such
+        let pattern = workspace.resolve_pattern(&cwd, "../../../elsewhere");
+        let error = workspace.search(&pattern).unwrap_err().to_string();
+        assert!(error.contains("outside the workspace"), "{error}");
+
+        // The repo is still reachable by every spelling that does name it
+        for spelling in ["../../local/repo", "local/repo"] {
+            assert_eq!(
+                workspace.resolve_pattern(&cwd, spelling).full_path(),
+                "local/repo",
+                "resolving {spelling}"
+            );
+        }
     }
 
     /// A directory name is not a URL, however much it looks like one. Parsing
