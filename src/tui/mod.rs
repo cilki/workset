@@ -412,7 +412,8 @@ impl BackgroundTasks {
     }
 }
 
-/// Detect the parent shell by reading /proc/self/status
+/// Detect the parent shell by reading /proc/self/status. Only the shell's name
+/// is returned: `Command::new` looks a bare name up on `PATH` itself.
 fn detect_parent_shell() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -422,21 +423,12 @@ fn detect_parent_shell() -> Option<String> {
         let ppid: u32 = ppid_line.split_whitespace().nth(1)?.parse().ok()?;
 
         // Read the command name of the parent process
-        let cmdline = std::fs::read_to_string(format!("/proc/{}/comm", ppid)).ok()?;
-        let shell_name = cmdline.trim();
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", ppid)).ok()?;
+        let shell_name = comm.trim();
 
         // Check if it's a known shell
-        if matches!(shell_name, "fish" | "bash" | "zsh" | "sh" | "dash" | "ksh") {
-            // Find the full path to this shell
-            if let Ok(output) = std::process::Command::new("which").arg(shell_name).output()
-                && output.status.success()
-            {
-                return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
-            }
-            // Fallback to just the shell name
-            return Some(shell_name.to_string());
-        }
-        None
+        matches!(shell_name, "fish" | "bash" | "zsh" | "sh" | "dash" | "ksh")
+            .then(|| shell_name.to_string())
     }
     #[cfg(not(target_os = "linux"))]
     {
