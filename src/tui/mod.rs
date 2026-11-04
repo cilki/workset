@@ -1087,7 +1087,12 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
             let outcome = app.sync_outcomes.get(&repo.path);
             let fetching = app.is_fetching(&repo.path);
             for remote in remotes {
-                let state = remote_sync_state(&remote.name, outcome, fetching);
+                // Only workspace repos are ever fetched, so a library repo has
+                // no sync state to report: "not synced yet" there promised a
+                // fetch that never comes. What its tracking refs held when it
+                // was dropped (the id and the behind count) is still true.
+                let state = (section == Section::Workspace)
+                    .then(|| remote_sync_state(&remote.name, outcome, fetching));
                 let mut line = remote_status_line(remote, state);
                 line.spans.insert(0, Span::raw(indent.clone()));
                 lines.push(line);
@@ -1099,14 +1104,14 @@ fn repo_detail_lines(app: &App, repo: &RepoInfo, section: Section, depth: usize)
 
 /// One detail row showing a remote, the id its tracking ref holds for the
 /// checked-out branch, its sync state, and how many commits it is behind
-/// (when it is)
-fn remote_status_line(remote: &RemoteInfo, state: RemoteSyncState) -> Line<'static> {
+/// (when it is). `state` is `None` for a repo that is never synced.
+fn remote_status_line(remote: &RemoteInfo, state: Option<RemoteSyncState>) -> Line<'static> {
     // While fetching, the behind count is about to be superseded. The commit
     // id stays: it states what the local tracking ref holds, which remains
     // true until the fetch rewrites it, and hiding it would make the line
     // jump on every fetch.
-    let show_behind = remote.behind > 0 && state != RemoteSyncState::Fetching;
-    let status = match state {
+    let show_behind = remote.behind > 0 && state != Some(RemoteSyncState::Fetching);
+    let status = state.and_then(|state| match state {
         RemoteSyncState::Fetching => Some(Span::styled(
             "fetching…",
             Style::default().fg(Color::DarkGray),
@@ -1125,7 +1130,7 @@ fn remote_status_line(remote: &RemoteInfo, state: RemoteSyncState) -> Line<'stat
             "not synced yet",
             Style::default().fg(Color::DarkGray),
         )),
-    };
+    });
     let mut spans = vec![Span::raw("  "), Span::raw(remote.name.clone())];
     if let Some(id) = &remote.head_id {
         spans.push(Span::raw(" "));
@@ -1946,6 +1951,17 @@ mod tests {
         assert!(text.contains("↓ 3 behind"));
         assert!(!text.contains("↓ 0"));
         assert!(!text.contains("branches:"));
+
+        // A library repo is never fetched, so it reports no sync state at
+        // all — only what its tracking refs held when it was dropped
+        let text = repo_detail_lines(&app, &repo, Section::Library, 0)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("not synced yet"));
+        assert!(text.contains("origin a1b2c3d\n"));
+        assert!(text.contains("backup ↓ 3 behind"));
     }
 
     #[test]
