@@ -840,16 +840,17 @@ fn completions<'line>(
             None => INIT_SUBCOMMAND,
         })
     } else {
-        // Past the subcommand every argument names a repo, which only means
-        // something inside a workspace
-        match maybe_workspace {
-            // `restore` names repos the library holds; every other subcommand
-            // names repos that are checked out
-            Some(workspace) if words.get(1) == Some(&"restore") => {
-                Completions::Library(workspace.list_library())
-            }
-            Some(workspace) => Completions::Workspace(workspace_repos(workspace)),
-            None => Completions::Workspace(Vec::new()),
+        // Past the subcommand an argument names a repo, which only means
+        // something inside a workspace — and only to the subcommands that
+        // take repos at all. `restore` names repos the library holds and
+        // `drop` the ones that are checked out. `clone` names a repo that is
+        // in neither (it refuses one that is checked out or in the library),
+        // and `init`, `list` and `ls` take no argument whatsoever, so
+        // offering them a repo only offers a command that fails.
+        match (maybe_workspace, words.get(1).copied()) {
+            (Some(workspace), Some("restore")) => Completions::Library(workspace.list_library()),
+            (Some(workspace), Some("drop")) => Completions::Workspace(workspace_repos(workspace)),
+            _ => Completions::Workspace(Vec::new()),
         }
     };
 
@@ -1138,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_names_the_library_and_everything_else_the_workspace() {
+    fn restore_names_the_library_and_drop_the_workspace() {
         let temp = tempfile::TempDir::new().unwrap();
         let workspace = workspace(temp.path());
 
@@ -1148,13 +1149,9 @@ mod tests {
             offered(Some(&workspace), "workset restore "),
             ["github.com/user/stored"]
         );
-        // Everything else acts on repos that are checked out, and keeps
-        // offering them after the first one
-        for line in [
-            "workset drop ",
-            "workset clone ",
-            "workset drop github.com/user/alpha ",
-        ] {
+        // A drop acts on repos that are checked out, and keeps offering them
+        // after the first one
+        for line in ["workset drop ", "workset drop github.com/user/alpha "] {
             assert_eq!(
                 offered(Some(&workspace), line),
                 ["github.com/user/alpha"],
@@ -1163,6 +1160,31 @@ mod tests {
         }
         // For bash, a repo name is narrowed by its prefix like anything else
         assert!(offered_to_bash(Some(&workspace), "workset drop gitlab", None).is_empty());
+    }
+
+    /// Every repo workset knows of is one `clone` refuses — it is either
+    /// checked out already or waiting in the library — and `init`, `list` and
+    /// `ls` take no argument at all, so each candidate offered to them was a
+    /// command line that could only fail.
+    #[test]
+    fn subcommands_that_take_no_known_repo_are_offered_none() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = workspace(temp.path());
+
+        for line in [
+            "workset clone ",
+            "workset clone github.com/user/new ",
+            "workset init ",
+            "workset list ",
+            "workset ls ",
+            "workset nope ",
+        ] {
+            assert!(offered(Some(&workspace), line).is_empty(), "line: {line}");
+            assert!(
+                offered_to_bash(Some(&workspace), line, None).is_empty(),
+                "line: {line}"
+            );
+        }
     }
 
     /// Every candidate fish could display has to survive the pass that skips
@@ -1289,7 +1311,7 @@ mod tests {
         let workspace = workspace(temp.path());
 
         // Both candidate sources: a repo checked out in the workspace, which
-        // `drop` and `clone` name, and a library entry, which `restore` does
+        // `drop` names, and a library entry, which `restore` does
         for name in ["evil\ngithub.com", "evil\tgithub.com", "evil\u{1b}[2Kx"] {
             let checked_out = temp.path().join(name);
             std::fs::create_dir_all(&checked_out).unwrap();
