@@ -625,6 +625,21 @@ fn main() -> Result<ExitCode> {
                 #[cfg(feature = "tui")]
                 {
                     let workspace = require_workspace!(maybe_workspace);
+                    // The TUI draws to stdout, so with stdout redirected
+                    // (`workset > file`, `workset | less`) it ran invisibly,
+                    // writing escape codes into the pipe while the terminal
+                    // sat blank in raw mode; and with no terminal at all
+                    // (cron, CI, an ssh command) it failed with a bare
+                    // "No such device or address (os error 6)". Either way the
+                    // user asked for something the TUI can't give them, and
+                    // the subcommands can.
+                    if !std::io::stdout().is_terminal() {
+                        eprintln!("The interactive view needs a terminal, and stdout isn't one");
+                        eprintln!(
+                            "Run 'workset list' for the working set's status, or 'workset --help' for usage information"
+                        );
+                        return Ok(ExitCode::FAILURE);
+                    }
                     // Open TUI for interactive workspace management
                     workset::tui::run_tui(&workspace)?;
                     true
