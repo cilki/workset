@@ -669,6 +669,34 @@ testPatternsAcceptCloneUrls() {
 	done
 }
 
+## A clone refused because the path is taken says what took it. Only a git
+## repository there is the repo being in the workspace: a directory holding
+## other repos, or files left where a dropped repo used to be, is not, and the
+## library entry beneath such leftovers is still pointed out. None of these
+## reach the network, since each is refused before anything is fetched.
+testCloneSaysWhatIsInTheWay() {
+	newWorkspace
+	createRepo github.com/user/repo
+	createRepo github.com/user/dropped
+
+	# The repo itself really is in the workspace
+	output=$(workset clone github.com/user/repo 2>&1) && exit 1
+	echo "$output" | grep "^github.com/user/repo is already in the workspace$"
+
+	# Its parent directory is not a repo, and isn't called one
+	output=$(workset clone github.com/user 2>&1) && exit 1
+	echo "$output" | grep "something that isn't the repository is already at .*/github.com/user"
+	! echo "$output" | grep "already in the workspace"
+
+	# A dropped repo is in the library, even with files left at its path
+	workset drop github.com/user/dropped
+	mkdir -p github.com/user/dropped
+	touch github.com/user/dropped/notes.txt
+	output=$(workset clone github.com/user/dropped 2>&1) && exit 1
+	echo "$output" | grep "^github.com/user/dropped is in the library; run 'workset restore github.com/user/dropped' instead$"
+	[ -f github.com/user/dropped/notes.txt ]
+}
+
 ## Only a pattern that names a provider is URL-shaped, so a bare local name
 ## keeps the '.git' a directory may really end in
 testDropLocalNameEndingInGit() {
