@@ -76,7 +76,10 @@ meant:
 
 A pattern that is a repo's full path — the name `drop` reports and completion
 offers — restores just that repo, even when it is also a prefix of others such
-as `github.com/user/repo-old`.
+as `github.com/user/repo-old`. A pattern spelled as a path — `./repo`,
+`../repo` or an absolute path — is read as one by `restore` too, from the
+current directory, so the spelling that dropped a repo is the one that brings it
+back.
 
 `clone`, `restore` and `drop` take as many patterns as you want to name, and
 each one is reported on its own:

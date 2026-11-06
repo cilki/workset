@@ -212,9 +212,44 @@ fn workspace_matches(workspace: &Workspace, pattern: &str) -> Vec<String> {
 
 /// Restore repositories from library matching the pattern. Returns false when
 /// nothing was restored, so the caller can exit non-zero.
-fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
+fn restore_repos(workspace: &Workspace, cwd: &Path, requested: &str) -> Result<bool> {
     // Get all repos from library
     let library_repos = workspace.list_library();
+
+    // A pattern spelled as a path names a place in the workspace, found from
+    // the current directory exactly as `drop` finds it. Read as a library
+    // substring instead, `./repo` matched nothing — no library path starts
+    // with "./" — so the spelling that had just dropped a repo couldn't bring
+    // it back, and neither could a pasted absolute path. Like `drop`, a path
+    // takes the repo at it or every repo under it.
+    if workset::spelled_as_path(requested) {
+        let pattern = workspace.resolve_pattern(cwd, requested);
+        // A path leaving the workspace is refused, not searched for
+        workspace.repo_path(&pattern)?;
+        let target = pattern.full_path();
+        let matching_repos: Vec<String> = library_repos
+            .into_iter()
+            .filter(|repo| {
+                repo == &target
+                    || repo
+                        .strip_prefix(target.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .collect();
+
+        if matching_repos.is_empty() {
+            if workspace.path.join(&target).join(".git").exists() {
+                eprintln!("{} is already in the workspace", quote_path(&target));
+            } else {
+                eprintln!(
+                    "No repository in the library is at '{}'",
+                    quote_path(requested)
+                );
+            }
+            return Ok(false);
+        }
+        return Ok(restore_each(workspace, matching_repos));
+    }
 
     // A pattern that is exactly one of the library's entries names that entry
     // and nothing else. Parsing it would read it as a clone URL instead, and a
@@ -274,6 +309,12 @@ fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
         return Ok(false);
     }
 
+    Ok(restore_each(workspace, matching_repos))
+}
+
+/// Restore each of the named library entries, reporting every one. Returns
+/// whether all of them came back.
+fn restore_each(workspace: &Workspace, matching_repos: Vec<String>) -> bool {
     let mut restored = 0;
     let mut failed = 0;
 
@@ -312,7 +353,7 @@ fn restore_repos(workspace: &Workspace, requested: &str) -> Result<bool> {
         }
     }
 
-    Ok(restored > 0 && failed == 0)
+    restored > 0 && failed == 0
 }
 
 fn main() -> Result<ExitCode> {
@@ -545,8 +586,9 @@ fn main() -> Result<ExitCode> {
                     eprintln!("Usage: workset restore <pattern>...");
                     false
                 } else {
+                    let cwd = std::env::current_dir()?;
                     for_each_pattern(&patterns, "restore", |requested| {
-                        restore_repos(&workspace, requested)
+                        restore_repos(&workspace, &cwd, requested)
                     })
                 }
             }

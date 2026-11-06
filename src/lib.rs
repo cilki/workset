@@ -552,6 +552,17 @@ fn check_out_worktree(worktree: &Path, git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether the user spelled `pattern` as a path — absolute, or starting with
+/// `./` or `../` — and so said where in the filesystem to look, rather than
+/// giving a `[provider]/<path>` pattern to match.
+pub fn spelled_as_path(pattern: &str) -> bool {
+    Path::new(pattern).is_absolute()
+        || matches!(
+            Path::new(pattern).components().next(),
+            Some(Component::CurDir | Component::ParentDir)
+        )
+}
+
 /// Where `path` points, resolved through the filesystem for as long as it
 /// exists. The first component that doesn't is kept verbatim along with
 /// everything after it: past a missing directory there is nothing for `..` to
@@ -1596,14 +1607,9 @@ impl Workspace {
     /// nothing in the workspace matches nothing, and one that leaves it is
     /// reported as outside the workspace.
     pub fn resolve_pattern(&self, cwd: &Path, pattern: &str) -> RepoPattern {
-        let spelled_as_path = Path::new(pattern).is_absolute()
-            || matches!(
-                Path::new(pattern).components().next(),
-                Some(Component::CurDir | Component::ParentDir)
-            );
         let resolved = self.path.canonicalize().ok().and_then(|root| {
             let joined = cwd.join(pattern);
-            let target = if spelled_as_path {
+            let target = if spelled_as_path(pattern) {
                 locate(&joined)
             } else {
                 joined.canonicalize().ok()?

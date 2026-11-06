@@ -848,6 +848,39 @@ testRestoreFromSubdirectory() {
 	[ -d my-project/.git ]
 }
 
+## A restore pattern spelled as a path is found from the current directory,
+## like a drop's, so the spelling that dropped a repo brings it back
+testRestoreRelativePathFromSubdirectory() {
+	newWorkspace
+	createRepo github.com/user/project
+	createRepo github.com/user/other
+	createRepo github.com/user/project-old
+
+	cd github.com/user
+	workset drop ./project ./project-old
+	workset restore ./project
+	[ -d project/.git ]
+	# A path names that repo, not every library entry it is a prefix of
+	[ ! -e project-old ]
+
+	# An absolute path, and a directory taking every repo under it
+	workset drop ./project
+	workset restore "$(cd ../.. && pwd)/github.com/user/project"
+	[ -d project/.git ]
+	cd ../..
+	workset drop github.com
+	workset restore ./github.com/
+	[ -d github.com/user/project/.git ]
+	[ -d github.com/user/other/.git ]
+	[ -d github.com/user/project-old/.git ]
+
+	# Nothing at the path, or a path leaving the workspace, fails
+	output=$(workset restore ./github.com/user/missing 2>&1) && exit 1
+	echo "$output" | grep "No repository in the library is at './github.com/user/missing'"
+	output=$(workset restore ../project 2>&1) && exit 1
+	echo "$output" | grep "outside the workspace"
+}
+
 ## Repeated drop/restore cycles keep the repo intact
 testRepeatedDropRestoreCycles() {
 	newWorkspace
