@@ -70,8 +70,13 @@ macro_rules! out {
 fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
     let repo_path = workspace.repo_path(pattern)?;
 
-    // Check if repo already exists in workspace
-    if repo_path.exists() {
+    // Only a git repository at the path is the repo being in the workspace.
+    // Anything else there — a directory that merely holds other repos, such
+    // as the 'github.com/user' above 'github.com/user/repo', or files left in
+    // the way of a dropped repo — is not, and saying it is sends the user
+    // looking for a checkout that doesn't exist, or away from the library
+    // entry they could restore.
+    if repo_path.join(".git").exists() {
         eprintln!(
             "{} is already in the workspace",
             quote_path(&pattern.full_path())
@@ -79,7 +84,8 @@ fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<b
         return Ok(false);
     }
 
-    // Check if it exists in library first
+    // A dropped repo comes back from the library, never from the remote;
+    // restore says for itself if something is in its way
     if workspace.library_contains(&pattern.full_path()) {
         eprintln!(
             "{} is in the library; run 'workset restore {}' instead",
@@ -87,6 +93,13 @@ fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<b
             quote_path(&pattern.full_path())
         );
         return Ok(false);
+    }
+
+    if repo_path.exists() {
+        anyhow::bail!(
+            "something that isn't the repository is already at {}",
+            quote_path(&repo_path.to_string_lossy())
+        );
     }
 
     // Clone from remote
