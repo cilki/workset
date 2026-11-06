@@ -526,99 +526,100 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         // takes the image with it
         app.help_image = build_help_image(picker);
 
-        // Inner loop to handle actions without tearing down terminal
-        loop {
-            let action = run_app(&mut terminal, &mut app, &mut file_watcher, &mut background)?;
+        // Handle actions without tearing down the terminal, until one leaves
+        // it: quitting (`None`) or opening a shell in a repo (`Some(path)`)
+        let mut session = || -> Result<Option<PathBuf>> {
+            loop {
+                match run_app(&mut terminal, &mut app, &mut file_watcher, &mut background)? {
+                    Action::None => {
+                        // Stop in-flight sync jobs between git invocations
+                        background.sync.interrupt.store(true, Ordering::Relaxed);
+                        background.details.interrupt.store(true, Ordering::Relaxed);
 
-            // Handle the action
-            match action {
-                Action::None => {
-                    // Stop in-flight sync jobs between git invocations
-                    background.sync.interrupt.store(true, Ordering::Relaxed);
-                    background.details.interrupt.store(true, Ordering::Relaxed);
-
-                    // Drain any pending events before cleanup to avoid issues
-                    while event::poll(Duration::from_millis(0))? {
-                        let _ = event::read()?;
+                        // Drain any pending events before cleanup to avoid issues
+                        while event::poll(Duration::from_millis(0))? {
+                            let _ = event::read()?;
+                        }
+                        return Ok(None);
                     }
-
-                    // Restore terminal before exiting
-                    disable_raw_mode()?;
-                    execute!(
-                        terminal.backend_mut(),
-                        LeaveAlternateScreen,
-                        DisableMouseCapture
-                    )?;
-                    terminal.show_cursor()?;
-                    return Ok(()); // Exit completely
-                }
-                Action::OpenShell(path) => {
-                    // Restore terminal before opening shell
-                    disable_raw_mode()?;
-                    execute!(
-                        terminal.backend_mut(),
-                        LeaveAlternateScreen,
-                        DisableMouseCapture
-                    )?;
-                    terminal.show_cursor()?;
-
-                    // Use $SHELL or try to detect the actual parent shell
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-                        detect_parent_shell().unwrap_or_else(|| "/bin/sh".to_string())
-                    });
-
-                    // Spawn an interactive shell in the repository directory
-                    std::process::Command::new(&shell)
-                        .current_dir(&path)
-                        .status()?;
-
-                    // After shell exits, break inner loop to restart outer loop (recreate terminal)
-                    break;
-                }
-                Action::DropToLibrary(repo_paths) => {
-                    run_repo_operation(
-                        &mut terminal,
-                        &mut app,
-                        &repo_paths,
-                        RepoOperationStatus::Dropping,
-                        |repo_path| {
-                            // Tree paths are already workspace-relative paths,
-                            // so they name their repo verbatim rather than
-                            // being read as a clone URL
-                            let pattern = RepoPattern::from_relative_path(repo_path);
-                            // A repo left in place (uncommitted or unpushed
-                            // changes) is a failure as far as the UI is
-                            // concerned, so the row says why instead of
-                            // silently reporting success
-                            let report = workspace.drop(&pattern, false, false)?;
-                            match report.skipped.first() {
-                                Some((_, blocker)) => bail!("{blocker}"),
-                                None => Ok(()),
-                            }
-                        },
-                    )?;
-                    background.reload(&app, workspace);
-                }
-                Action::RestoreFromLibrary(repo_paths) => {
-                    run_repo_operation(
-                        &mut terminal,
-                        &mut app,
-                        &repo_paths,
-                        RepoOperationStatus::Restoring,
-                        |repo_path| workspace.restore_from_library(repo_path),
-                    )?;
-                    background.reload(&app, workspace);
-                }
-                Action::RefreshData => {
-                    // Filesystem changed - reload repository data in the background
-                    background.reload(&app, workspace);
-                    if let Some(watcher) = file_watcher.as_mut() {
-                        watcher.drain_pending();
+                    Action::OpenShell(path) => return Ok(Some(path)),
+                    Action::DropToLibrary(repo_paths) => {
+                        run_repo_operation(
+                            &mut terminal,
+                            &mut app,
+                            &repo_paths,
+                            RepoOperationStatus::Dropping,
+                            |repo_path| {
+                                // Tree paths are already workspace-relative paths,
+                                // so they name their repo verbatim rather than
+                                // being read as a clone URL
+                                let pattern = RepoPattern::from_relative_path(repo_path);
+                                // A repo left in place (uncommitted or unpushed
+                                // changes) is a failure as far as the UI is
+                                // concerned, so the row says why instead of
+                                // silently reporting success
+                                let report = workspace.drop(&pattern, false, false)?;
+                                match report.skipped.first() {
+                                    Some((_, blocker)) => bail!("{blocker}"),
+                                    None => Ok(()),
+                                }
+                            },
+                        )?;
+                        background.reload(&app, workspace);
+                    }
+                    Action::RestoreFromLibrary(repo_paths) => {
+                        run_repo_operation(
+                            &mut terminal,
+                            &mut app,
+                            &repo_paths,
+                            RepoOperationStatus::Restoring,
+                            |repo_path| workspace.restore_from_library(repo_path),
+                        )?;
+                        background.reload(&app, workspace);
+                    }
+                    Action::RefreshData => {
+                        // Filesystem changed - reload repository data in the background
+                        background.reload(&app, workspace);
+                        if let Some(watcher) = file_watcher.as_mut() {
+                            watcher.drain_pending();
+                        }
                     }
                 }
             }
-        }
+        };
+        let outcome = session();
+
+        // Restore the terminal however the session ended. An error used to
+        // skip this and leave the shell it returns to in raw mode on the
+        // alternate screen, with the error message drawn into it.
+        let restored = restore_terminal(&mut terminal);
+        let Some(path) = outcome? else {
+            return restored;
+        };
+        restored?;
+
+        // Use $SHELL or try to detect the actual parent shell
+        let shell = std::env::var("SHELL")
+            .unwrap_or_else(|_| detect_parent_shell().unwrap_or_else(|| "/bin/sh".to_string()));
+
+        // Spawn an interactive shell in the repository directory, then go
+        // round again to rebuild the terminal once it exits
+        std::process::Command::new(&shell)
+            .current_dir(&path)
+            .status()?;
     }
+}
+
+/// Hand the terminal back the way the shell expects it
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    Ok(())
 }
 
 /// Run a drop/restore operation over the given repos, updating each repo's
