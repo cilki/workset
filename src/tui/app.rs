@@ -212,13 +212,22 @@ impl App {
 
     /// Select the first item in the first section that has any, preferring the
     /// workspace. Marks the selection as automatic.
+    ///
+    /// While a filter is applied, that item is the first matching repo rather
+    /// than the first row, which is only the directory above it: a filter is
+    /// how a repo is found, and Enter on that directory would collapse it
+    /// instead of opening the repo the user just typed.
     fn select_first_available(&mut self) {
         self.selected = None;
-        for section in Section::ALL {
-            if !self.trees(section).is_empty() {
-                self.select(section, 0);
-                break;
-            }
+        let is_wanted = |node: &TreeNode| self.search_query.is_empty() || node.repo_info.is_some();
+        let first = Section::ALL.into_iter().find_map(|section| {
+            flatten_trees(self.trees(section))
+                .iter()
+                .position(|(node, _, _, _)| is_wanted(node))
+                .map(|index| (section, index))
+        });
+        if let Some((section, index)) = first {
+            self.select(section, index);
         }
         self.selection_is_auto = true;
     }
@@ -640,6 +649,46 @@ mod tests {
         app.clear_search();
         assert_eq!(app.count_repos(Section::Workspace), 2);
         assert_eq!(app.count_repos(Section::Library), 2);
+    }
+
+    /// Typing a filter and pressing Enter opens the repo it found: the
+    /// selection is on that repo, not on the directory row above it, and stays
+    /// there when the sync the selection starts rebuilds the rows
+    #[test]
+    fn search_selects_the_first_matching_repo() {
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app"), repo("github.com/foo/tool")],
+            vec![repo("github.com/bar/lib")],
+        );
+        // Without a filter the first row is selected, directory or not
+        assert_eq!(selected_path(&app).as_deref(), Some("github.com"));
+
+        app.search_query = "tool".to_string();
+        app.filter_repos();
+        assert_eq!(app.active_section, Section::Workspace);
+        assert_eq!(selected_path(&app).as_deref(), Some("github.com/foo/tool"));
+        assert_eq!(
+            app.selected_syncable_repo_path(),
+            Some(PathBuf::from("github.com/foo/tool"))
+        );
+
+        app.set_sync_status(
+            Path::new("github.com/foo/tool"),
+            RepoOperationStatus::Fetching,
+        );
+        assert_eq!(selected_path(&app).as_deref(), Some("github.com/foo/tool"));
+
+        // A match only the library holds is selected there
+        app.search_query = "lib".to_string();
+        app.filter_repos();
+        assert_eq!(app.active_section, Section::Library);
+        assert_eq!(selected_path(&app).as_deref(), Some("github.com/bar/lib"));
+
+        // Clearing the filter goes back to the first row
+        app.clear_search();
+        assert_eq!(app.active_section, Section::Workspace);
+        assert_eq!(selected_path(&app).as_deref(), Some("github.com"));
     }
 
     #[test]
