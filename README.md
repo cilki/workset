@@ -149,6 +149,13 @@ plain drop stores it in the library like any other. `--delete` is the exception,
 since every commit in such a repo may exist nowhere else; it keeps the repo
 (`no remote has its commits`) unless you pass `--force` as well.
 
+The library holds one repo per path, so a repo you `git clone` or `git init`
+yourself at a path whose earlier repo is still in the library is kept where it
+is (`the library already holds a repo at this path`): storing it would
+replace the library's copy, and with it whatever that copy held. `--force`
+replaces it; `--delete` discards the workspace copy and leaves the library's
+alone.
+
 A submodule is half-kept. Its git directory lives under the parent's `.git`, so
 it travels into the library with everything else, but its checkout is part of
 the parent's working tree, which the drop deletes. A round trip therefore brings

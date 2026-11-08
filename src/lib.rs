@@ -683,6 +683,14 @@ pub enum DropBlocker {
     /// the only copy of every commit in it, which is what `--force` is for.
     Unpublished,
 
+    /// The library already holds a repository at this path: one dropped
+    /// earlier, and since replaced in the workspace by a `git clone` or
+    /// `git init` of its own rather than a `workset restore`. Storing this
+    /// one would delete that one, branches, stashes and unpushed commits
+    /// included, and nothing about *this* repo's status says whether the
+    /// stored one held anything worth keeping. `--force` replaces it.
+    InLibrary,
+
     /// The repo doesn't own its git directory: `.git` is a file holding
     /// `gitdir: <path>`, which is how git writes a linked worktree (`git
     /// worktree add`) and a submodule. The library holds git directories, so
@@ -716,6 +724,9 @@ impl DropBlocker {
         match self {
             Self::Outstanding(_) => "use --force to drop anyway",
             Self::Unpublished => "use --force to delete anyway, or drop it without --delete",
+            Self::InLibrary => {
+                "use --force to replace the library's copy, or --delete to discard this one"
+            }
             Self::BorrowedGitDir => "drop that repository instead",
             Self::LinkedGitDir => "replace the link with the git directory it points at",
             Self::MainWorktree(1) => "remove it with 'git worktree remove' first",
@@ -733,6 +744,7 @@ impl std::fmt::Display for DropBlocker {
             // drop only ever blocks on the three statuses above
             Self::Outstanding(_) => f.write_str("outstanding changes"),
             Self::Unpublished => f.write_str("no remote has its commits"),
+            Self::InLibrary => f.write_str("the library already holds a repo at this path"),
             Self::BorrowedGitDir => f.write_str("git directory belongs to another repository"),
             Self::LinkedGitDir => f.write_str("git directory is a symlink to somewhere else"),
             Self::MainWorktree(1) => f.write_str("git directory shared with 1 linked worktree"),
@@ -1753,6 +1765,15 @@ impl Workspace {
                 report
                     .skipped
                     .push((relative_path, DropBlocker::Unpublished));
+                return Ok(());
+            }
+
+            // Storing replaces whatever the library holds at this path, and
+            // that is a different repository's history, not this one's
+            // outstanding work: the checks above can't vouch for it.
+            if !delete && self.library_contains(&relative_path) {
+                debug!(repo = %repo.display(), "Refusing to overwrite library entry");
+                report.skipped.push((relative_path, DropBlocker::InLibrary));
                 return Ok(());
             }
         }
@@ -3925,6 +3946,62 @@ mod tests {
         let pattern = "empty".parse::<RepoPattern>().unwrap();
         let report = workspace.drop(&pattern, true, false).unwrap();
         assert_eq!(report.dropped, vec!["empty".to_string()]);
+    }
+
+    /// A repo dropped into the library, then replaced in the workspace by a
+    /// fresh `git init` (or `git clone`) at the same path: dropping the new
+    /// one used to delete the stored one to make room, losing every commit
+    /// it held without a word, and with no `--force` asked for.
+    #[test]
+    fn drop_keeps_a_repo_the_library_already_holds_at_that_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let pattern = "local".parse::<RepoPattern>().unwrap();
+        let repo = workspace.path.join("local");
+
+        repo_with_a_commit(&repo);
+        let stored = git(&repo, &["rev-parse", "HEAD"]);
+        let report = workspace.drop(&pattern, false, false).unwrap();
+        assert_eq!(report.dropped, vec!["local".to_string()]);
+
+        // A history of its own, so its commits can't coincide with the
+        // stored repo's
+        let commit_a_file = |name: &str| {
+            repo_with_a_commit(&repo);
+            fs::write(repo.join(name), name).unwrap();
+            git(&repo, &["add", name]);
+            git(&repo, &["commit", "--quiet", "-m", name]);
+            git(&repo, &["rev-parse", "HEAD"])
+        };
+        let replacement = commit_a_file("other.txt");
+        assert_ne!(stored, replacement);
+
+        let report = workspace.drop(&pattern, false, false).unwrap();
+        assert!(report.dropped.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![("local".to_string(), DropBlocker::InLibrary)]
+        );
+        // Both repos are where they were, untouched
+        assert!(repo.join("other.txt").exists());
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), replacement);
+        let library_entry = workspace.library_path().join("local");
+        assert_eq!(git(&library_entry, &["rev-parse", "HEAD"]), stored);
+
+        // Deleting the workspace copy doesn't touch the library's
+        let report = workspace.drop(&pattern, true, true).unwrap();
+        assert_eq!(report.dropped, vec!["local".to_string()]);
+        assert_eq!(git(&library_entry, &["rev-parse", "HEAD"]), stored);
+
+        // --force is how you say the library's copy can go
+        let forced = commit_a_file("forced.txt");
+        assert_ne!(stored, forced);
+        let report = workspace.drop(&pattern, false, true).unwrap();
+        assert_eq!(report.dropped, vec!["local".to_string()]);
+        assert_eq!(git(&library_entry, &["rev-parse", "HEAD"]), forced);
     }
 
     /// Once a remote holds the repo's history, `--delete` needs no `--force`
