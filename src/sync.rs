@@ -212,16 +212,10 @@ pub fn remote_info(repo_path: &Path, interrupt: &AtomicBool) -> Result<Vec<Remot
         |ancestor: &str, descendant: &str| is_ancestor(repo_path, ancestor, descendant, interrupt);
     let mut count_range = |behind_id: &str, candidate: &str| {
         let range = format!("{}..{}", behind_id, candidate);
-        run_git(
-            repo_path,
-            &["rev-list", "--count", &range],
-            interrupt,
-            LOCAL_TIMEOUT,
-        )
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
-        .unwrap_or(0)
+        git_stdout(repo_path, &["rev-list", "--count", &range], interrupt)
+            .ok()
+            .and_then(|out| out.trim().parse().ok())
+            .unwrap_or(0)
     };
     let behind = plan_behind_counts(&states, &mut is_ancestor, &mut count_range);
     let head = head_branch(repo_path, interrupt);
@@ -242,15 +236,13 @@ pub fn remote_info(repo_path: &Path, interrupt: &AtomicBool) -> Result<Vec<Remot
 /// what the remote holds for the branch you're on, so reporting it is
 /// truthful.
 pub fn head_branch(repo_path: &Path, interrupt: &AtomicBool) -> Option<String> {
-    run_git(
+    git_stdout(
         repo_path,
         &["symbolic-ref", "--quiet", "--short", "HEAD"],
         interrupt,
-        LOCAL_TIMEOUT,
     )
     .ok()
-    .filter(|out| out.status.success())
-    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    .map(|out| out.trim().to_string())
     .filter(|name| !name.is_empty())
 }
 
@@ -310,19 +302,15 @@ fn collect_ref_states(
     remotes: &[String],
     interrupt: &AtomicBool,
 ) -> Result<Vec<RefState>> {
-    let out = run_git(
+    let out = git_stdout(
         repo_path,
         &["for-each-ref", "--format=%(objectname) %(refname)"],
         interrupt,
-        LOCAL_TIMEOUT,
     )?;
-    if !out.status.success() {
-        bail!("git for-each-ref failed: {}", stderr_summary(&out));
-    }
 
     let mut branches: BTreeMap<String, String> = BTreeMap::new();
     let mut tracking: BTreeMap<(String, String), String> = BTreeMap::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in out.lines() {
         let Some((id, refname)) = line.split_once(' ') else {
             continue;
         };
@@ -374,23 +362,17 @@ fn is_ancestor(
     descendant: &str,
     interrupt: &AtomicBool,
 ) -> bool {
-    run_git(
+    git_stdout(
         repo_path,
         &["merge-base", "--is-ancestor", ancestor, descendant],
         interrupt,
-        LOCAL_TIMEOUT,
     )
-    .map(|out| out.status.success())
-    .unwrap_or(false)
+    .is_ok()
 }
 
 /// List the repository's configured remotes
 pub fn list_remotes(repo_path: &Path, interrupt: &AtomicBool) -> Result<Vec<String>> {
-    let out = run_git(repo_path, &["remote"], interrupt, LOCAL_TIMEOUT)?;
-    if !out.status.success() {
-        bail!("git remote failed: {}", stderr_summary(&out));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    Ok(git_stdout(repo_path, &["remote"], interrupt)?
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
@@ -406,14 +388,8 @@ pub fn count_diff_lines(repo_path: &Path, interrupt: &AtomicBool) -> Result<(usi
 
     // Binary files show "-" in numstat and count as 0 lines; a failing diff
     // (no commits yet, so no HEAD) just means there is no diff to count
-    if let Ok(out) = run_git(
-        repo_path,
-        &["diff", "HEAD", "--numstat"],
-        interrupt,
-        LOCAL_TIMEOUT,
-    ) && out.status.success()
-    {
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
+    if let Ok(out) = git_stdout(repo_path, &["diff", "HEAD", "--numstat"], interrupt) {
+        for line in out.lines() {
             let mut fields = line.split('\t');
             let count = |field: Option<&str>| field.and_then(|f| f.parse().ok()).unwrap_or(0);
             added += count(fields.next());
@@ -421,20 +397,16 @@ pub fn count_diff_lines(repo_path: &Path, interrupt: &AtomicBool) -> Result<(usi
         }
     }
 
-    let out = run_git(
+    let out = git_stdout(
         repo_path,
         &["ls-files", "--others", "--exclude-standard", "-z"],
         interrupt,
-        LOCAL_TIMEOUT,
     )?;
-    if !out.status.success() {
-        bail!("git ls-files failed: {}", stderr_summary(&out));
-    }
-    for file in out.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()) {
+    for file in out.split('\0').filter(|f| !f.is_empty()) {
         if interrupt.load(Ordering::Relaxed) {
             bail!("interrupted");
         }
-        let path = repo_path.join(String::from_utf8_lossy(file).as_ref());
+        let path = repo_path.join(file);
         added += count_lines(&path, UNTRACKED_SCAN_LIMIT, interrupt).unwrap_or(0);
     }
     Ok((added, removed))
@@ -489,6 +461,20 @@ fn stderr_summary(out: &Output) -> String {
         .unwrap_or("unknown error")
         .trim()
         .to_string()
+}
+
+/// Stdout of a purely local git command, or an error naming the command and
+/// the first line of its stderr when it exits unsuccessfully
+fn git_stdout(repo_path: &Path, args: &[&str], interrupt: &AtomicBool) -> Result<String> {
+    let out = run_git(repo_path, args, interrupt, LOCAL_TIMEOUT)?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            stderr_summary(&out)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Run a git command with output capture, a timeout, and interrupt support.
