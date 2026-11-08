@@ -433,7 +433,7 @@ fn main() -> Result<ExitCode> {
                                        Without pattern: drops every repo under the cwd
                                        With --delete: permanently delete (don't store)
                                        With --force: drop despite uncommitted changes or
-                                       unpushed commits{reset}
+                                       unpushed commits, or delete a repo never pushed{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
 {dim}                                       Ends with how many repos the library holds{reset}
 

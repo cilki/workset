@@ -675,6 +675,14 @@ pub enum DropBlocker {
     /// Work that exists nowhere but this worktree, which `--force` discards
     Outstanding(RepoStatus),
 
+    /// A `--delete` of a repo whose commits were never published: it has
+    /// history, but no remote-tracking ref at all (no remote, or one nothing
+    /// was ever fetched from). Such a repo reads as clean, because there is
+    /// nothing to measure "unpushed" against, and a plain drop loses nothing
+    /// since the library keeps its git directory. Deleting it, though, removes
+    /// the only copy of every commit in it, which is what `--force` is for.
+    Unpublished,
+
     /// The repo doesn't own its git directory: `.git` is a file holding
     /// `gitdir: <path>`, which is how git writes a linked worktree (`git
     /// worktree add`) and a submodule. The library holds git directories, so
@@ -707,6 +715,7 @@ impl DropBlocker {
     pub fn remedy(&self) -> &'static str {
         match self {
             Self::Outstanding(_) => "use --force to drop anyway",
+            Self::Unpublished => "use --force to delete anyway, or drop it without --delete",
             Self::BorrowedGitDir => "drop that repository instead",
             Self::LinkedGitDir => "replace the link with the git directory it points at",
             Self::MainWorktree(1) => "remove it with 'git worktree remove' first",
@@ -723,6 +732,7 @@ impl std::fmt::Display for DropBlocker {
             Self::Outstanding(RepoStatus::Unknown) => f.write_str("unreadable repository"),
             // drop only ever blocks on the three statuses above
             Self::Outstanding(_) => f.write_str("outstanding changes"),
+            Self::Unpublished => f.write_str("no remote has its commits"),
             Self::BorrowedGitDir => f.write_str("git directory belongs to another repository"),
             Self::LinkedGitDir => f.write_str("git directory is a symlink to somewhere else"),
             Self::MainWorktree(1) => f.write_str("git directory shared with 1 linked worktree"),
@@ -1181,6 +1191,23 @@ fn unpublished_work(repo: &gix::Repository) -> Unpublished {
             Unpublished::Unreadable
         }
     }
+}
+
+/// Whether any remote is known to hold some of this repository's history: it
+/// has at least one remote-tracking ref pointing at a commit. A repo without
+/// one has nothing [`unpublished_work`] can measure against, so every commit
+/// in it may exist nowhere else. A repo that can't be read is not vouched for.
+fn has_published_history(repo_path: &Path) -> bool {
+    let Some(repo) = open_repo(repo_path) else {
+        return false;
+    };
+    let Ok(references) = repo.references() else {
+        return false;
+    };
+    let Ok(mut remotes) = references.remote_branches() else {
+        return false;
+    };
+    remotes.any(|reference| reference.ok().and_then(|r| r.try_id()).is_some())
 }
 
 /// Format a SystemTime as a human-readable "time ago" string
@@ -1715,6 +1742,17 @@ impl Workspace {
                 report
                     .skipped
                     .push((relative_path, DropBlocker::Outstanding(status)));
+                return Ok(());
+            }
+
+            // A repo no remote was ever fetched from is reported clean, since
+            // there is nothing to call its commits "unpushed" against. Storing
+            // it in the library keeps them; deleting it destroys the only copy.
+            if delete && status == RepoStatus::Clean && !has_published_history(repo) {
+                debug!(repo = %repo.display(), "Refusing to delete never-published repository");
+                report
+                    .skipped
+                    .push((relative_path, DropBlocker::Unpublished));
                 return Ok(());
             }
         }
@@ -3836,6 +3874,75 @@ mod tests {
         let report = workspace.drop(&pattern, false, false).unwrap();
         assert_eq!(report.dropped, vec!["repo".to_string()]);
         assert!(!repo.exists());
+    }
+
+    /// A repo no remote was ever fetched from reads as clean, because there
+    /// is nothing to measure "unpushed" against. Its commits exist nowhere
+    /// else, so `--delete` keeps it unless forced; storing it in the library
+    /// loses nothing and goes ahead.
+    #[test]
+    fn delete_refuses_a_repo_no_remote_has_seen() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let pattern = "local".parse::<RepoPattern>().unwrap();
+        let repo = workspace.path.join("local");
+        repo_with_a_commit(&repo);
+        // A remote that was added but never fetched holds nothing either
+        git(
+            &repo,
+            &["remote", "add", "origin", "https://example.invalid/r"],
+        );
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
+
+        let report = workspace.drop(&pattern, true, false).unwrap();
+        assert!(report.dropped.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![("local".to_string(), DropBlocker::Unpublished)]
+        );
+        assert!(repo.join(".git").is_dir());
+
+        // Into the library it goes, history and all
+        let report = workspace.drop(&pattern, false, false).unwrap();
+        assert_eq!(report.dropped, vec!["local".to_string()]);
+        assert!(workspace.library_contains("local"));
+
+        // --force is how you say you meant to delete it
+        let repo = workspace.path.join("scratch");
+        repo_with_a_commit(&repo);
+        let pattern = "scratch".parse::<RepoPattern>().unwrap();
+        let report = workspace.drop(&pattern, true, true).unwrap();
+        assert_eq!(report.dropped, vec!["scratch".to_string()]);
+        assert!(!repo.exists());
+
+        // An empty repo has no history to lose
+        let repo = workspace.path.join("empty");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        let pattern = "empty".parse::<RepoPattern>().unwrap();
+        let report = workspace.drop(&pattern, true, false).unwrap();
+        assert_eq!(report.dropped, vec!["empty".to_string()]);
+    }
+
+    /// Once a remote holds the repo's history, `--delete` needs no `--force`
+    #[test]
+    fn delete_takes_a_published_repo() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = workspace.path.join("repo");
+        repo_with_a_remote(temp_dir.path(), &repo);
+
+        let pattern = "repo".parse::<RepoPattern>().unwrap();
+        let report = workspace.drop(&pattern, true, false).unwrap();
+        assert_eq!(report.dropped, vec!["repo".to_string()]);
+        assert!(!repo.exists());
+        assert!(!workspace.library_contains("repo"));
     }
 
     /// A repository whose config gix refuses to load, which is what

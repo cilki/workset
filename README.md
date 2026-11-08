@@ -144,7 +144,10 @@ it is until you pass `--force`. Every ref counts, not just the branch you have
 checked out: a branch you left behind and a `git stash` hold commits that exist
 nowhere else just as much as `HEAD` does. A repo that was never pushed anywhere
 — no remote, or nothing fetched from one yet — has no published history to
-compare against, so it isn't measured this way at all.
+compare against, so it isn't measured this way at all: it reads as clean, and a
+plain drop stores it in the library like any other. `--delete` is the exception,
+since every commit in such a repo may exist nowhere else; it keeps the repo
+(`no remote has its commits`) unless you pass `--force` as well.
 
 A submodule is half-kept. Its git directory lives under the parent's `.git`, so
 it travels into the library with everything else, but its checkout is part of

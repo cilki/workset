@@ -585,15 +585,43 @@ testDropDirtyRepoWithForce() {
 	[ -d .workset/dirty-repo ]
 }
 
+## Create a repo at $1 with one commit, pushed to a bare remote outside the
+## workspace so that a remote holds all of its history
+createPublishedRepo() {
+	git init -q --bare "$PWD/../$1-remote.git"
+	createRepo "$1" 1
+	git -C "$1" remote add origin "$PWD/../$1-remote.git"
+	git -C "$1" push -q -u origin main
+}
+
 ## --delete removes a repo instead of storing it in the library
 testDropWithDelete() {
 	newWorkspace
-	createRepo delete-me 1
+	createPublishedRepo delete-me
 
 	workset drop --delete delete-me
 
 	[ ! -e delete-me ]
 	[ ! -e .workset/delete-me ]
+}
+
+## A repo no remote has ever seen reads as clean, but deleting it would destroy
+## the only copy of its commits: --delete keeps it unless forced, while a plain
+## drop still stores it in the library
+testDropWithDeleteRefusesNeverPublishedRepo() {
+	newWorkspace
+	createRepo local-only 1
+
+	output=$(workset drop --delete local-only 2>&1) && exit 1
+	echo "$output" | grep -- "local-only - ⚠ kept (no remote has its commits, use --force to delete anyway"
+	[ -d local-only/.git ]
+
+	workset drop local-only | grep -- "local-only - ✓ dropped"
+	[ -d .workset/local-only ]
+
+	createRepo scratch 1
+	workset drop --delete --force scratch | grep -- "scratch - ✓ deleted"
+	[ ! -e scratch ]
 }
 
 ## Without a pattern, every repo in the current directory is dropped
@@ -827,7 +855,7 @@ testDropOutsideWorkspaceFails() {
 ## --delete says so instead of claiming the repo was dropped to the library
 testDropWithDeleteReportsDeletion() {
 	newWorkspace
-	createRepo delete-me
+	createPublishedRepo delete-me
 
 	workset drop --delete delete-me | grep -- "delete-me - ✓ deleted"
 }
