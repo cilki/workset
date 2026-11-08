@@ -691,6 +691,19 @@ pub enum DropBlocker {
     /// stored one held anything worth keeping. `--force` replaces it.
     InLibrary,
 
+    /// The library holds repos below this path, so the path is a directory
+    /// of entries there rather than one entry. Storing this repo makes room
+    /// for its git directory by removing whatever the library has at the
+    /// path, which is every one of those repos. `--force` can't decide that,
+    /// since what it would discard are other repos, not anything of this one.
+    LibraryHoldsReposBelow,
+
+    /// A repo the library holds sits at a directory above this path. This
+    /// repo's git directory would be moved inside that repo's git directory,
+    /// where the library listing never looks. Restoring that repo would then
+    /// carry this one into its `.git` with it.
+    UnderLibraryEntry,
+
     /// The repo doesn't own its git directory: `.git` is a file holding
     /// `gitdir: <path>`, which is how git writes a linked worktree (`git
     /// worktree add`) and a submodule. The library holds git directories, so
@@ -727,6 +740,12 @@ impl DropBlocker {
             Self::InLibrary => {
                 "use --force to replace the library's copy, or --delete to discard this one"
             }
+            Self::LibraryHoldsReposBelow => {
+                "restore those repos first, or use --delete to discard this one"
+            }
+            Self::UnderLibraryEntry => {
+                "move this repo to another path, or use --delete to discard it"
+            }
             Self::BorrowedGitDir => "drop that repository instead",
             Self::LinkedGitDir => "replace the link with the git directory it points at",
             Self::MainWorktree(1) => "remove it with 'git worktree remove' first",
@@ -745,6 +764,10 @@ impl std::fmt::Display for DropBlocker {
             Self::Outstanding(_) => f.write_str("outstanding changes"),
             Self::Unpublished => f.write_str("no remote has its commits"),
             Self::InLibrary => f.write_str("the library already holds a repo at this path"),
+            Self::LibraryHoldsReposBelow => f.write_str("the library holds repos under this path"),
+            Self::UnderLibraryEntry => {
+                f.write_str("the library holds a repo at a directory above this path")
+            }
             Self::BorrowedGitDir => f.write_str("git directory belongs to another repository"),
             Self::LinkedGitDir => f.write_str("git directory is a symlink to somewhere else"),
             Self::MainWorktree(1) => f.write_str("git directory shared with 1 linked worktree"),
@@ -1740,6 +1763,22 @@ impl Workspace {
             return Ok(());
         }
 
+        // Storing has to find room in the library. An entry already at this
+        // exact path is one `--force` may replace (checked with the status
+        // below). Entries nested under the path, or one the path is nested
+        // under, are other repos, and storing here would destroy or bury them
+        // whatever `--force` says.
+        let library_collision = (!delete)
+            .then(|| self.library_collision(&relative))
+            .flatten();
+        if let Some(blocker) = library_collision
+            && blocker != DropBlocker::InLibrary
+        {
+            debug!(repo = %repo.display(), %blocker, "Refusing to drop repository");
+            report.skipped.push((relative_path, blocker));
+            return Ok(());
+        }
+
         // Check for uncommitted or unpushed changes unless --force is given.
         // A repo whose status couldn't be read at all is kept as well: this
         // step exists to find work that would be lost, and a repo workset
@@ -1771,7 +1810,7 @@ impl Workspace {
             // Storing replaces whatever the library holds at this path, and
             // that is a different repository's history, not this one's
             // outstanding work: the checks above can't vouch for it.
-            if !delete && self.library_contains(&relative_path) {
+            if library_collision == Some(DropBlocker::InLibrary) {
                 debug!(repo = %repo.display(), "Refusing to overwrite library entry");
                 report.skipped.push((relative_path, DropBlocker::InLibrary));
                 return Ok(());
@@ -1804,7 +1843,43 @@ impl Workspace {
             .inspect_err(|_| prune_empty_dirs(&self.path, dest))
     }
 
-    /// Attempt to clone a repository from configured remotes or infer the clone URL
+    /// What storing the repo at workspace-relative `relative` in the library
+    /// would run into, if anything.
+    ///
+    /// The library is a tree of git directories, each one ending the walk
+    /// that lists it. So a path is free only if no entry sits at or above it
+    /// and none sits below it. Checking only for something at the exact path
+    /// caused two problems. First, when the library held `host/x/inner`, a
+    /// drop of `host/x` was refused as if the library held `host/x` itself,
+    /// and the `--force` the message suggested deleted `host/x/inner`'s only
+    /// copy to make room. Second, once `host/x` was stored, a drop of
+    /// `host/x/inner` moved that repo into `host/x`'s git directory, where no
+    /// listing or restore ever found it again.
+    fn library_collision(&self, relative: &Path) -> Option<DropBlocker> {
+        let library = self.library_path();
+        let under_entry = relative
+            .ancestors()
+            .skip(1)
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .any(|ancestor| repo_kind(&library.join(ancestor)).is_some());
+        if under_entry {
+            return Some(DropBlocker::UnderLibraryEntry);
+        }
+
+        let dest = library.join(relative);
+        if repo_kind(&dest).is_some() {
+            Some(DropBlocker::InLibrary)
+        } else if !find_repos(&dest).is_empty() {
+            Some(DropBlocker::LibraryHoldsReposBelow)
+        } else if std::fs::symlink_metadata(&dest).is_ok() {
+            // Not a repo and holding none, but still something storing would
+            // remove: treated as the entry `--force` is asked to replace
+            Some(DropBlocker::InLibrary)
+        } else {
+            None
+        }
+    }
+
     /// Check if a repository exists in the library
     pub fn library_contains(&self, repo_path: &str) -> bool {
         self.library_path().join(repo_path).exists()
@@ -4002,6 +4077,89 @@ mod tests {
         let report = workspace.drop(&pattern, false, true).unwrap();
         assert_eq!(report.dropped, vec!["local".to_string()]);
         assert_eq!(git(&library_entry, &["rev-parse", "HEAD"]), forced);
+    }
+
+    /// The library holding `host/x/inner` is not the library holding
+    /// `host/x`. A drop of `host/x` used to be refused as though it were,
+    /// and the `--force` that refusal suggested deleted `host/x/inner`'s
+    /// stored git directory to make room for `host/x`'s.
+    #[test]
+    fn drop_keeps_the_repos_the_library_holds_under_its_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        let inner = workspace.path.join("host/x/inner");
+        repo_with_a_commit(&inner);
+        let stored = git(&inner, &["rev-parse", "HEAD"]);
+        let report = workspace
+            .drop(&"host/x/inner".parse().unwrap(), false, false)
+            .unwrap();
+        assert_eq!(report.dropped, vec!["host/x/inner".to_string()]);
+
+        let outer = workspace.path.join("host/x");
+        repo_with_a_commit(&outer);
+        for force in [false, true] {
+            let report = workspace
+                .drop(&"host/x".parse().unwrap(), false, force)
+                .unwrap();
+            assert!(report.dropped.is_empty(), "force: {force}");
+            assert_eq!(
+                report.skipped,
+                vec![("host/x".to_string(), DropBlocker::LibraryHoldsReposBelow)],
+                "force: {force}"
+            );
+        }
+        assert!(outer.join(".git").is_dir());
+        assert_eq!(workspace.list_library(), vec!["host/x/inner"]);
+        let entry = workspace.library_path().join("host/x/inner");
+        assert_eq!(git(&entry, &["rev-parse", "HEAD"]), stored);
+
+        // Deleting writes nothing to the library, so it has nothing to clash with
+        let report = workspace
+            .drop(&"host/x".parse().unwrap(), true, true)
+            .unwrap();
+        assert_eq!(report.dropped, vec!["host/x".to_string()]);
+        assert_eq!(git(&entry, &["rev-parse", "HEAD"]), stored);
+    }
+
+    /// Once `host/x` is in the library, its entry is a git directory, so a
+    /// repo later dropped from `host/x/inner` would land inside it, where
+    /// the library listing never looks and a restore of `host/x` would carry
+    /// it into that repo's `.git`.
+    #[test]
+    fn drop_refuses_to_store_a_repo_inside_a_library_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        let outer = workspace.path.join("host/x");
+        repo_with_a_commit(&outer);
+        let report = workspace
+            .drop(&"host/x".parse().unwrap(), false, false)
+            .unwrap();
+        assert_eq!(report.dropped, vec!["host/x".to_string()]);
+
+        let inner = workspace.path.join("host/x/inner");
+        repo_with_a_commit(&inner);
+        for force in [false, true] {
+            let report = workspace
+                .drop(&"host/x/inner".parse().unwrap(), false, force)
+                .unwrap();
+            assert!(report.dropped.is_empty(), "force: {force}");
+            assert_eq!(
+                report.skipped,
+                vec![("host/x/inner".to_string(), DropBlocker::UnderLibraryEntry)],
+                "force: {force}"
+            );
+        }
+        assert!(inner.join(".git").is_dir());
+        assert!(!workspace.library_path().join("host/x/inner").exists());
+        assert_eq!(workspace.list_library(), vec!["host/x"]);
     }
 
     /// Once a remote holds the repo's history, `--delete` needs no `--force`
