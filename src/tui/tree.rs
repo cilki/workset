@@ -123,15 +123,20 @@ impl TreeNode {
 
 /// Build a tree structure from a flat list of repos
 pub fn build_tree(repos: Vec<RepoInfo>) -> Vec<TreeNode> {
-    // Sort repos by modification time (most recent first)
+    // Sort repos by modification time (most recent first), repos without one
+    // last. Equal times fall back to the name: the rows arrive in whatever
+    // order the scan workers finish them, so leaving ties to that order made
+    // repos of the same age swap places from one reload to the next — and
+    // decided which of two clones of one URL got the remote's node.
     let mut sorted_repos = repos;
     sorted_repos.sort_by(|a, b| {
-        match (a.modification_time, b.modification_time) {
-            (Some(a_time), Some(b_time)) => b_time.cmp(&a_time), // Most recent first
-            (Some(_), None) => std::cmp::Ordering::Less,         // Items with time come first
-            (None, Some(_)) => std::cmp::Ordering::Greater,      // Items without time come last
-            (None, None) => a.display_name.cmp(&b.display_name), // Fallback to name
-        }
+        let by_time = match (a.modification_time, b.modification_time) {
+            (Some(a_time), Some(b_time)) => b_time.cmp(&a_time),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        by_time.then_with(|| a.display_name.cmp(&b.display_name))
     });
 
     let mut root_nodes: Vec<TreeNode> = Vec::new();
@@ -300,5 +305,58 @@ mod tests {
             fallback.repo_info.as_ref().unwrap().path,
             PathBuf::from("/ws/b/two")
         );
+    }
+
+    /// The scan hands rows over in the order its workers finish, which
+    /// differs from one reload to the next. Repos of the same age — two clones
+    /// of one URL at the same commit, say — must come out the same way from
+    /// any of those orders.
+    #[test]
+    fn repos_of_the_same_age_are_ordered_by_name() {
+        let at = |display_name, tree_path, seconds| RepoInfo {
+            modification_time: Some(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            ),
+            ..repo(display_name, tree_path)
+        };
+        let rows = || {
+            vec![
+                at("work/old", None, 10),
+                at("b/two", Some("github.com/x/y"), 20),
+                at("work/zeta", None, 20),
+                at("a/one", Some("github.com/x/y"), 20),
+                at("work/alpha", None, 20),
+                at("work/new", None, 30),
+            ]
+        };
+        let order = |tree: &[TreeNode]| -> Vec<String> {
+            flatten_trees(tree)
+                .into_iter()
+                .filter_map(|(node, ..)| Some(node.repo_info.as_ref()?.display_name.clone()))
+                .collect()
+        };
+
+        let forward = build_tree(rows());
+        let mut reversed_rows = rows();
+        reversed_rows.reverse();
+        let reversed = build_tree(reversed_rows);
+
+        assert_eq!(order(&forward), order(&reversed));
+        // Newest first, ties by name, within each directory; the first clone
+        // by name owns the remote's node and the other falls back to where it
+        // sits on disk
+        assert_eq!(
+            order(&forward),
+            [
+                "work/new",
+                "work/alpha",
+                "work/zeta",
+                "work/old",
+                "a/one",
+                "b/two"
+            ]
+        );
+        let primary = node_at(&forward, &["github.com", "x", "y"]).unwrap();
+        assert_eq!(primary.repo_info.as_ref().unwrap().display_name, "a/one");
     }
 }
