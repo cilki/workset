@@ -794,6 +794,26 @@ testDropKeepsTheCurrentDirectory() {
 	[ -d ../../.workset/github.com/user/project ]
 }
 
+## Standing in the repo itself, the drop empties its directory rather than
+## removing it, and the directories above it stay: deleting the shell's own
+## directory used to hide it from the pruning too, which then took every
+## parent along, so not even 'cd ..' had anywhere to go
+testDropFromInsideTheRepoKeepsTheCurrentDirectory() {
+	newWorkspace
+	createRepo github.com/user/project
+
+	cd github.com/user/project
+	workset drop
+
+	[ -d . ]
+	[ -z "$(ls -A .)" ]
+	[ -d ../../../.workset/github.com/user/project ]
+
+	# The empty directory left behind is no obstacle to bringing it back
+	workset restore github.com/user/project
+	[ -d .git ]
+}
+
 ## Drop patterns are workspace-relative, so a full path works from anywhere
 testDropFullPathFromSubdirectory() {
 	newWorkspace

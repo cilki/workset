@@ -1493,12 +1493,17 @@ fn dirty_files_time(
 /// exists to clear.
 ///
 /// Tidying up is not worth pulling the ground out from under the caller's
-/// shell, so the current directory and everything above it is left alone:
-/// `cd github.com/user && workset drop project` empties the directory it is
-/// standing in rather than removing it.
-fn prune_empty_dirs(root: &Path, repo: &Path) {
+/// shell, so the current directory `cwd` and everything above it is left
+/// alone: `cd github.com/user && workset drop project` empties the directory
+/// it is standing in rather than removing it.
+///
+/// `cwd` is the caller's to supply because by the time a drop prunes, the
+/// directory it names may be gone: [`std::env::current_dir`] fails for a
+/// process whose working directory was deleted, and reading it here instead
+/// turned a drop from inside the repo into one that pruned as if nobody were
+/// standing anywhere.
+fn prune_empty_dirs(root: &Path, repo: &Path, cwd: Option<&Path>) {
     let library = root.join(".workset");
-    let cwd = std::env::current_dir().ok();
     let mut candidate = Some(repo);
 
     while let Some(dir) = candidate {
@@ -1510,7 +1515,7 @@ fn prune_empty_dirs(root: &Path, repo: &Path) {
 
         // Nor the current directory or any of its parents, which the caller is
         // still standing in
-        if cwd.as_deref().is_some_and(|cwd| cwd.starts_with(dir)) {
+        if cwd.is_some_and(|cwd| cwd.starts_with(dir)) {
             break;
         }
 
@@ -1526,6 +1531,34 @@ fn prune_empty_dirs(root: &Path, repo: &Path) {
 
         candidate = dir.parent();
     }
+}
+
+/// Delete a dropped repo's worktree at `repo`, keeping the directory itself
+/// (empty) when `keep_dir` says the caller's working directory is in it.
+///
+/// `cd github.com/user/project && workset drop` removed the very directory
+/// the shell was standing in. Worse, a process whose working directory is
+/// gone can't name it any more, so the pruning that followed saw nobody
+/// standing anywhere and took `github.com/user` and `github.com` with it,
+/// leaving even `cd ..` nowhere to go. Emptying the directory instead leaves
+/// the shell somewhere real, and since the directory still exists the
+/// pruning above it stops right there. An empty directory is no obstacle to
+/// a restore, which checks the repo back out into it.
+fn remove_worktree(repo: &Path, keep_dir: bool) -> std::io::Result<()> {
+    if !keep_dir {
+        return std::fs::remove_dir_all(repo);
+    }
+    for entry in std::fs::read_dir(repo)? {
+        let entry = entry?;
+        // The entry's own type, not its target's: a symlink to a directory is
+        // removed as the link, never followed into what it points at
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// A `Workspace` is filesystem directory containing git repositories checked out
@@ -1822,10 +1855,16 @@ impl Workspace {
             self.store_in_library(&relative_path)?;
         }
 
-        // Remove the directory
+        // Remove the directory. The caller's working directory is read before
+        // anything is deleted, since afterwards it may no longer exist to be
+        // read. It is reported resolved, so it is compared with the repo's
+        // resolved path.
         debug!(path = ?repo, "Removing directory");
-        std::fs::remove_dir_all(repo)?;
-        prune_empty_dirs(&root, &root.join(&relative));
+        let cwd = std::env::current_dir().ok();
+        let resolved = root.join(&relative);
+        let standing_in_repo = cwd.as_deref().is_some_and(|cwd| cwd.starts_with(&resolved));
+        remove_worktree(repo, standing_in_repo)?;
+        prune_empty_dirs(&root, &resolved, cwd.as_deref());
         report.dropped.push(relative_path);
         Ok(())
     }
@@ -1838,9 +1877,9 @@ impl Workspace {
     /// them back out on the way, or a typo leaves a piece of workspace behind
     /// for good.
     pub fn clone_into(&self, url: &str, dest: &Path) -> Result<()> {
-        gix_clone(url, dest)
-            .map(|_| ())
-            .inspect_err(|_| prune_empty_dirs(&self.path, dest))
+        gix_clone(url, dest).map(|_| ()).inspect_err(|_| {
+            prune_empty_dirs(&self.path, dest, std::env::current_dir().ok().as_deref())
+        })
     }
 
     /// What storing the repo at workspace-relative `relative` in the library
@@ -1976,8 +2015,9 @@ impl Workspace {
         // The git directory moves, rather than being copied: that is what
         // keeps every branch, tag and reflog the repo had, and it is a rename
         // within the workspace, so it costs nothing per object.
+        let cwd = std::env::current_dir().ok();
         if let Err(e) = std::fs::rename(&source, &git_dir) {
-            prune_empty_dirs(&self.path, &dest);
+            prune_empty_dirs(&self.path, &dest, cwd.as_deref());
             bail!("Failed to move repository out of the library: {}", e);
         }
 
@@ -1989,8 +2029,14 @@ impl Workspace {
         if let Err(e) = check_out_worktree(&dest, &git_dir) {
             let _ = set_bare_in_config(&git_dir, true);
             let _ = std::fs::rename(&git_dir, &source);
-            let _ = std::fs::remove_dir_all(&dest);
-            prune_empty_dirs(&self.path, &dest);
+            // The directory may be the empty one a drop from inside the repo
+            // kept, with the caller's shell still standing in it
+            let standing_in_dest = cwd
+                .as_deref()
+                .zip(std::fs::canonicalize(&dest).ok())
+                .is_some_and(|(cwd, dest)| cwd.starts_with(dest));
+            let _ = remove_worktree(&dest, standing_in_dest);
+            prune_empty_dirs(&self.path, &dest, cwd.as_deref());
             return Err(e);
         }
 
@@ -3394,19 +3440,66 @@ mod tests {
 
         // A repo directly under the root, already removed: there is nothing
         // above it to prune but the root
-        prune_empty_dirs(&root, &root.join("repo"));
+        prune_empty_dirs(&root, &root.join("repo"), None);
         assert!(root.is_dir());
         assert!(library.is_dir());
 
         // An empty library is still the workspace's library
-        prune_empty_dirs(&root, &library.join("github.com/user/project"));
+        prune_empty_dirs(&root, &library.join("github.com/user/project"), None);
         assert!(library.is_dir());
 
         // Nothing outside the workspace is removed, however empty
         let outside = temp_dir.path().join("outside/dir");
         fs::create_dir_all(&outside).unwrap();
-        prune_empty_dirs(&root, &outside);
+        prune_empty_dirs(&root, &outside, None);
         assert!(outside.is_dir());
+    }
+
+    /// The working directory a prune is handed is kept whether or not it
+    /// still exists: a drop from inside the repo has deleted it by the time
+    /// it prunes, and the directories above it are where the caller's shell
+    /// goes next.
+    #[test]
+    fn pruning_stops_at_the_working_directory_even_once_it_is_gone() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("ws");
+        fs::create_dir_all(root.join(".workset")).unwrap();
+        let repo = root.join("github.com/user/project");
+        fs::create_dir_all(root.join("github.com/user")).unwrap();
+
+        // The repo's directory is already gone, and the caller stood in a
+        // subdirectory of it
+        prune_empty_dirs(&root, &repo, Some(&repo.join("src")));
+        assert!(root.join("github.com/user").is_dir());
+
+        // Standing elsewhere, the same directories are workset's to remove
+        prune_empty_dirs(&root, &repo, Some(&root));
+        assert!(!root.join("github.com").exists());
+    }
+
+    /// Removing a worktree the caller is standing in empties it instead, so
+    /// the shell is left somewhere that exists — without following a link
+    /// out of the repo to empty what it points at.
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_worktree_the_caller_stands_in_keeps_its_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(repo.join("src/nested")).unwrap();
+        fs::write(repo.join("src/nested/file.txt"), "x").unwrap();
+        fs::write(repo.join("README"), "x").unwrap();
+        let elsewhere = temp_dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("keep.txt"), "mine").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, repo.join("link")).unwrap();
+
+        remove_worktree(&repo, true).unwrap();
+        assert!(repo.is_dir());
+        assert_eq!(fs::read_dir(&repo).unwrap().count(), 0);
+        assert!(elsewhere.join("keep.txt").exists());
+
+        remove_worktree(&repo, false).unwrap();
+        assert!(!repo.exists());
     }
 
     /// A symlinked directory in the workspace is a path that reads as
