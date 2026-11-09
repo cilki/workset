@@ -321,26 +321,7 @@ fn restore_each(workspace: &Workspace, matching_repos: Vec<String>) -> bool {
     for repo_path in matching_repos {
         // Something already occupying the repo's path keeps the repo in the
         // library, and that is a repo the user asked for and didn't get: it
-        // fails the request like any other restore that couldn't happen. Only
-        // a git repository there is the repo being "in the workspace"; a
-        // plain directory or file is just in the way, and saying the repo is
-        // checked out would send the user looking for one that isn't.
-        let dest_path = workspace.path.join(&repo_path);
-        if dest_path.exists() {
-            if dest_path.join(".git").exists() {
-                eprintln!("{} is already in the workspace", quote_path(&repo_path));
-            } else {
-                eprintln!(
-                    "Failed to restore {}: something that isn't the repository is already at {}",
-                    quote_path(&repo_path),
-                    quote_path(&dest_path.to_string_lossy())
-                );
-            }
-            failed += 1;
-            continue;
-        }
-
-        // Restore from library
+        // fails the request like any other restore that couldn't happen
         match workspace.restore_from_library(&repo_path) {
             Ok(_) => {
                 outln!("Restored {}", quote_path(&repo_path));

@@ -1949,11 +1949,23 @@ impl Workspace {
 
         // A restore materializes a worktree where the workspace has none, so a
         // path already holding something is not this repo's to write over —
-        // and the rollback below would take whatever is there with it. The
-        // clone this replaced refused a non-empty destination for the same
-        // reason.
-        if std::fs::read_dir(&dest).is_ok_and(|mut entries| entries.next().is_some()) {
-            bail!("{} already exists in the workspace", relative_path);
+        // and the rollback below would take whatever is there with it. Only
+        // an empty directory (not a link to one) holds nothing to lose. A git
+        // repository there is the repo being checked out already; anything
+        // else is just in the way, and calling it the repo would send the
+        // user looking for one that isn't there.
+        let in_the_way = std::fs::symlink_metadata(&dest).is_ok_and(|metadata| {
+            !metadata.is_dir()
+                || std::fs::read_dir(&dest).map_or(true, |mut entries| entries.next().is_some())
+        });
+        if in_the_way {
+            if dest.join(".git").exists() {
+                bail!("{} is already in the workspace", quote_path(relative_path));
+            }
+            bail!(
+                "something that isn't the repository is already at {}",
+                quote_path(&dest.to_string_lossy())
+            );
         }
 
         let git_dir = dest.join(".git");
@@ -3282,6 +3294,62 @@ mod tests {
         assert!(workspace.library_contains("github.com/user/project"));
         assert!(entry.join("HEAD").is_file());
         assert_eq!(git(&entry, &["config", "core.bare"]), "true");
+    }
+
+    /// A restore writes only where the workspace holds nothing: an empty
+    /// directory is filled, but a file, a directory with something in it, or
+    /// a link standing at the repo's path keeps the repo in the library, and
+    /// the refusal says which of those it found.
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_refuses_a_path_something_else_holds() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let repo = workspace.path.join("github.com/user/project");
+        repo_with_a_commit(&repo);
+        let pattern = "github.com/user/project".parse::<RepoPattern>().unwrap();
+        workspace.drop(&pattern, false, false).unwrap();
+        let entry = workspace.library_path().join("github.com/user/project");
+
+        let refusal = |workspace: &Workspace| {
+            workspace
+                .restore_from_library("github.com/user/project")
+                .unwrap_err()
+                .to_string()
+        };
+
+        // A file the user left at the path
+        fs::create_dir_all(repo.parent().unwrap()).unwrap();
+        fs::write(&repo, "mine").unwrap();
+        assert!(refusal(&workspace).contains("something that isn't the repository"));
+        assert_eq!(fs::read_to_string(&repo).unwrap(), "mine");
+        fs::remove_file(&repo).unwrap();
+
+        // A link to an empty directory: the git directory would move through
+        // it to wherever it points
+        let elsewhere = temp_dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &repo).unwrap();
+        assert!(refusal(&workspace).contains("something that isn't the repository"));
+        assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+        fs::remove_file(&repo).unwrap();
+
+        // A checkout of the repo already there
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        assert!(refusal(&workspace).contains("is already in the workspace"));
+        fs::remove_dir_all(&repo).unwrap();
+        assert!(entry.join("HEAD").is_file());
+
+        // An empty directory holds nothing to lose, so the repo goes there
+        fs::create_dir_all(&repo).unwrap();
+        workspace
+            .restore_from_library("github.com/user/project")
+            .unwrap();
+        assert!(repo.join(".git").is_dir());
+        assert!(!workspace.library_contains("github.com/user/project"));
     }
 
     /// The directories leading to a repo are made before the clone knows
