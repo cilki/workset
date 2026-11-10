@@ -1750,20 +1750,23 @@ impl Workspace {
     /// Drop the repositories matching a pattern from this workspace
     pub fn drop(&self, pattern: &RepoPattern, delete: bool, force: bool) -> Result<DropReport> {
         debug!("Drop requested for pattern: {:?}", pattern);
-        self.drop_repos(self.search(pattern)?, delete, force)
+        self.drop_paths(&self.search(pattern)?, delete, force)
     }
 
     /// Drop every repository of the working set under `path` — the caller's
     /// current directory, for a `workset drop` given no pattern.
     pub fn drop_under(&self, path: &Path, delete: bool, force: bool) -> Result<DropReport> {
-        self.drop_repos(self.repos_under(path), delete, force)
+        self.drop_paths(&self.repos_under(path), delete, force)
     }
 
-    /// Drop each of `repos`, recording what happened to every one of them.
-    fn drop_repos(&self, repos: Vec<PathBuf>, delete: bool, force: bool) -> Result<DropReport> {
+    /// Drop each of the given repos, as found by [`search`](Self::search) or
+    /// [`repos_under`](Self::repos_under), recording what happened to every
+    /// one of them. Every path still goes through the same checks a pattern's
+    /// matches do, so a path outside the workspace is refused here too.
+    pub fn drop_paths(&self, repos: &[PathBuf], delete: bool, force: bool) -> Result<DropReport> {
         let mut report = DropReport::default();
         for repo in repos {
-            self.drop_repo(&repo, delete, force, &mut report)?;
+            self.drop_repo(repo, delete, force, &mut report)?;
         }
         Ok(report)
     }
