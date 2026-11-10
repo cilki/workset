@@ -2040,6 +2040,13 @@ impl Workspace {
             return Err(e);
         }
 
+        // The entry's directories in the library existed only to hold it, the
+        // same way its workspace directories do for a drop: left in place,
+        // every restore of `github.com/user/repo` kept `.workset/github.com/user`
+        // standing empty, and the library accumulated a tree of every repo it
+        // had ever held
+        prune_empty_dirs(&self.path, &source, cwd.as_deref());
+
         Ok(())
     }
 
@@ -3169,6 +3176,54 @@ mod tests {
         assert_eq!(git(&repo, &["config", "core.bare"]), "false");
         // The library hands the repo over rather than keeping a stale copy
         assert!(!workspace.library_contains("github.com/user/project"));
+    }
+
+    /// The directories above a library entry exist only to hold it, so a
+    /// restore takes the ones it empties with it — and stops at the first one
+    /// still holding another entry, and at the library itself.
+    #[test]
+    fn restore_removes_the_library_directories_it_empties() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let one = workspace.path.join("github.com/user/one");
+        let two = workspace.path.join("github.com/user/two");
+        let other = workspace.path.join("example.com/someone/other");
+        for repo in [&one, &two, &other] {
+            repo_with_a_commit(repo);
+        }
+        for pattern in ["github.com", "example.com"] {
+            let report = workspace
+                .drop(&pattern.parse::<RepoPattern>().unwrap(), false, false)
+                .unwrap();
+            assert!(report.skipped.is_empty());
+        }
+        let library = workspace.library_path();
+
+        // A sibling entry keeps the directory they share
+        workspace
+            .restore_from_library("github.com/user/one")
+            .unwrap();
+        assert!(!library.join("github.com/user/one").exists());
+        assert!(library.join("github.com/user").is_dir());
+
+        // The last entry under a directory takes it, and its parents, along
+        workspace
+            .restore_from_library("github.com/user/two")
+            .unwrap();
+        assert!(!library.join("github.com").exists());
+        assert!(library.join("example.com/someone/other").exists());
+
+        workspace
+            .restore_from_library("example.com/someone/other")
+            .unwrap();
+        assert!(!library.join("example.com").exists());
+
+        // An empty library is still what makes this a workspace
+        assert!(library.is_dir());
+        assert_eq!(workspace.repos(), vec![other, one, two]);
     }
 
     /// A restore writes files, and where it writes them must not be up to the
