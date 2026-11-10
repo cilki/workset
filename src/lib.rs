@@ -1725,11 +1725,7 @@ impl Workspace {
     pub fn drop(&self, pattern: &RepoPattern, delete: bool, force: bool) -> Result<DropReport> {
         debug!("Drop requested for pattern: {:?}", pattern);
 
-        let mut report = DropReport::default();
-        for repo in self.search(pattern)? {
-            self.drop_repo(&repo, delete, force, &mut report)?;
-        }
-        Ok(report)
+        self.drop_paths(&self.search(pattern)?, delete, force)
     }
 
     /// Drop all repositories in the current directory
@@ -1737,9 +1733,17 @@ impl Workspace {
         debug!("Drop all requested in current directory");
 
         let cwd = std::env::current_dir()?;
+        self.drop_paths(&self.repos_under(&cwd), delete, force)
+    }
+
+    /// Drop each of the given repos, as found by [`search`](Self::search) or
+    /// [`repos_under`](Self::repos_under). Every path still goes through the
+    /// same checks a pattern's matches do, so a path outside the workspace is
+    /// refused here too.
+    pub fn drop_paths(&self, repos: &[PathBuf], delete: bool, force: bool) -> Result<DropReport> {
         let mut report = DropReport::default();
-        for repo in self.repos_under(&cwd) {
-            self.drop_repo(&repo, delete, force, &mut report)?;
+        for repo in repos {
+            self.drop_repo(repo, delete, force, &mut report)?;
         }
         Ok(report)
     }

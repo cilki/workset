@@ -366,6 +366,52 @@ testDropSeveralPatternsReportsPartialSuccess() {
 	[ -d dirty-repo/.git ]
 }
 
+## Patterns that name the same repo drop it once and succeed: the later one
+## isn't reported as matching nothing because the earlier one already moved it
+testDropOverlappingPatterns() {
+	newWorkspace
+	createRepo github.com/user/repo1
+	createRepo github.com/user/repo2
+
+	output=$(workset drop github.com github.com/user/repo1 2>&1)
+	echo "$output" | grep -- "repo1 - ✓ dropped"
+	echo "$output" | grep -- "repo2 - ✓ dropped"
+	[ "$(echo "$output" | grep -c "repo1")" -eq 1 ]
+
+	workset restore github.com/user/repo1
+	workset drop github.com/user/repo1 github.com/user/repo1
+	[ ! -e github.com/user/repo1 ]
+}
+
+## A repo kept for its outstanding changes is reported once, however many of
+## the patterns name it
+testDropOverlappingPatternsReportsKeptRepoOnce() {
+	newWorkspace
+	createRepo github.com/user/repo
+	echo "uncommitted changes" >github.com/user/repo/dirty.txt
+
+	output=$(workset drop github.com github.com/user/repo 2>&1) && exit 1
+	[ "$(echo "$output" | grep -c "repo - ⚠ kept")" -eq 1 ]
+	[ -d github.com/user/repo/.git ]
+}
+
+## Patterns that name the same library entry restore it once and succeed
+testRestoreOverlappingPatterns() {
+	newWorkspace
+	createRepo github.com/user/repo1
+	createRepo github.com/user/repo2
+	workset drop github.com
+
+	output=$(workset restore github.com github.com/user/repo1 2>&1)
+	[ "$(echo "$output" | grep -c "Restored github.com/user/repo1")" -eq 1 ]
+	echo "$output" | grep "Restored github.com/user/repo2"
+	! echo "$output" | grep -q "already in the workspace"
+
+	workset drop github.com
+	workset restore repo1 repo1
+	[ -f github.com/user/repo1/file0.txt ]
+}
+
 ## A mistyped flag is reported as the unrecognized argument it is, instead of
 ## being taken for a repo pattern (which, for --force, would have dropped a
 ## repo nobody asked about)

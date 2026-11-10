@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -212,10 +213,21 @@ fn workspace_matches(workspace: &Workspace, pattern: &str) -> Vec<String> {
 
 /// Restore repositories from library matching the pattern. Returns false when
 /// nothing was restored, so the caller can exit non-zero.
-fn restore_repos(workspace: &Workspace, cwd: &Path, requested: &str) -> Result<bool> {
-    // Get all repos from library
-    let library_repos = workspace.list_library();
-
+///
+/// `library_repos` is what the library held before the request started, and
+/// `claimed` the entries an earlier pattern of the same request already
+/// restored (or tried to). Matching against the library as it shrank made
+/// patterns that overlap — `restore github.com github.com/user`, or one repo
+/// named twice — fail the request: the later pattern found its repo gone
+/// from the library, reported it as already in the workspace and exited
+/// non-zero, though everything asked for had been restored.
+fn restore_repos(
+    workspace: &Workspace,
+    cwd: &Path,
+    requested: &str,
+    library_repos: &[String],
+    claimed: &mut HashSet<String>,
+) -> Result<bool> {
     // A pattern spelled as a path names a place in the workspace, found from
     // the current directory exactly as `drop` finds it. Read as a library
     // substring instead, `./repo` matched nothing — no library path starts
@@ -228,13 +240,14 @@ fn restore_repos(workspace: &Workspace, cwd: &Path, requested: &str) -> Result<b
         workspace.repo_path(&pattern)?;
         let target = pattern.full_path();
         let matching_repos: Vec<String> = library_repos
-            .into_iter()
+            .iter()
             .filter(|repo| {
-                repo == &target
+                **repo == target
                     || repo
                         .strip_prefix(target.as_str())
                         .is_some_and(|rest| rest.starts_with('/'))
             })
+            .cloned()
             .collect();
 
         if matching_repos.is_empty() {
@@ -248,7 +261,7 @@ fn restore_repos(workspace: &Workspace, cwd: &Path, requested: &str) -> Result<b
             }
             return Ok(false);
         }
-        return Ok(restore_each(workspace, matching_repos));
+        return Ok(restore_each(workspace, matching_repos, claimed));
     }
 
     // A pattern that is exactly one of the library's entries names that entry
@@ -309,23 +322,30 @@ fn restore_repos(workspace: &Workspace, cwd: &Path, requested: &str) -> Result<b
         return Ok(false);
     }
 
-    Ok(restore_each(workspace, matching_repos))
+    Ok(restore_each(workspace, matching_repos, claimed))
 }
 
 /// Restore each of the named library entries, reporting every one. Returns
-/// whether all of them came back.
-fn restore_each(workspace: &Workspace, matching_repos: Vec<String>) -> bool {
-    let mut restored = 0;
+/// whether all of them came back. An entry in `claimed` was already restored
+/// (or reported as failing) for an earlier pattern and is not tried again.
+fn restore_each(
+    workspace: &Workspace,
+    matching_repos: Vec<String>,
+    claimed: &mut HashSet<String>,
+) -> bool {
     let mut failed = 0;
 
     for repo_path in matching_repos {
+        if !claimed.insert(repo_path.clone()) {
+            continue;
+        }
+
         // Something already occupying the repo's path keeps the repo in the
         // library, and that is a repo the user asked for and didn't get: it
         // fails the request like any other restore that couldn't happen
         match workspace.restore_from_library(&repo_path) {
             Ok(_) => {
                 outln!("Restored {}", quote_path(&repo_path));
-                restored += 1;
             }
             Err(e) => {
                 failed += 1;
@@ -334,7 +354,7 @@ fn restore_each(workspace: &Workspace, matching_repos: Vec<String>) -> bool {
         }
     }
 
-    restored > 0 && failed == 0
+    failed == 0
 }
 
 fn main() -> Result<ExitCode> {
@@ -568,8 +588,10 @@ fn main() -> Result<ExitCode> {
                     false
                 } else {
                     let cwd = std::env::current_dir()?;
+                    let library = workspace.list_library();
+                    let mut claimed = HashSet::new();
                     for_each_pattern(&patterns, "restore", |requested| {
-                        restore_repos(&workspace, &cwd, requested)
+                        restore_repos(&workspace, &cwd, requested, &library, &mut claimed)
                     })
                 }
             }
@@ -669,18 +691,40 @@ fn drop_repos(
     // so 'workset drop ./repo' works from the repo's parent.
     let cwd = std::env::current_dir()?;
 
-    Ok(for_each_pattern(patterns, "drop", |requested| {
-        let pattern = workspace.resolve_pattern(&cwd, requested);
+    // Every pattern is matched before anything is dropped, and a repo is
+    // acted on once however many patterns name it. Matching as the drop went
+    // made patterns that overlap — `drop github.com github.com/user/repo`, or
+    // the same repo typed twice — fail the whole request: by the time the
+    // later pattern was searched, the earlier one had already taken its repo
+    // out of the workspace, so it was reported as matching nothing and the
+    // drop exited non-zero having done everything that was asked.
+    let mut matches = patterns
+        .iter()
+        .map(|requested| workspace.search(&workspace.resolve_pattern(&cwd, requested)))
+        .collect::<Vec<_>>()
+        .into_iter();
+    let mut claimed = HashSet::new();
 
-        let report = workspace.drop(&pattern, delete, force)?;
-        report_drop(&report, delete);
-        if report.is_empty() {
+    Ok(for_each_pattern(patterns, "drop", |requested| {
+        let matched = matches.next().expect("one search per pattern")?;
+        if matched.is_empty() {
             eprintln!(
                 "No repository in the workspace matches '{}'",
                 quote_path(requested)
             );
+            return Ok(false);
         }
-        Ok(!report.is_empty() && report.skipped.is_empty())
+
+        // A repo an earlier pattern already named was dropped (or kept, and
+        // reported) there; this pattern asked for nothing more
+        let unclaimed: Vec<PathBuf> = matched
+            .into_iter()
+            .filter(|repo| claimed.insert(repo.clone()))
+            .collect();
+
+        let report = workspace.drop_paths(&unclaimed, delete, force)?;
+        report_drop(&report, delete);
+        Ok(report.skipped.is_empty())
     }))
 }
 
