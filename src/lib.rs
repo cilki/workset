@@ -1926,6 +1926,18 @@ impl Workspace {
 
     /// Move the given repository into the library.
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
+    ///
+    /// The git directory moves first and becomes bare second, so that a
+    /// store that fails leaves the repo in the workspace exactly as it was.
+    /// It used to be the other way around: `core.bare = true` was written
+    /// into the repo's own config before anything else, and when the move
+    /// then failed — the library on another filesystem (`.workset` is a
+    /// symlink to a bigger disk, say), a file sitting where the entry's
+    /// parent directory has to go — the drop reported the failure and left
+    /// the repo behind bare. Every git command in it then answered "fatal:
+    /// this operation must be run in a work tree", `list` called it
+    /// unreadable, and nothing said that `git config core.bare false` was the
+    /// way out.
     pub fn store_in_library(&self, relative_path: &str) -> Result<()> {
         let source = self.path.join(relative_path).join(".git");
         let dest = self.library_path().join(relative_path);
@@ -1934,9 +1946,6 @@ impl Workspace {
         if std::fs::metadata(&source).is_err() {
             bail!("Repository .git directory not found: {}", source.display());
         }
-
-        // Set core.bare=true by modifying the config file directly
-        set_bare_in_config(&source, true)?;
 
         debug!(source = %source.display(), dest = %dest.display(), "Storing repository in library");
 
@@ -1953,9 +1962,29 @@ impl Workspace {
                 .map_err(|e| anyhow::anyhow!("Failed to remove existing library entry: {}", e))?;
         }
 
-        // Move the repository to the library
-        std::fs::rename(&source, &dest)
-            .map_err(|e| anyhow::anyhow!("Failed to move repository to library: {}", e))?;
+        // Move the repository to the library, then make it bare. Should
+        // either step fail, the directories just made above the entry go
+        // again — they exist only to hold it, and nothing else collects them
+        // — and the git directory stays, or goes back, where the repo's
+        // worktree expects it.
+        let cwd = std::env::current_dir().ok();
+        if let Err(e) = std::fs::rename(&source, &dest) {
+            prune_empty_dirs(&self.path, &dest, cwd.as_deref());
+            // A rename never crosses a filesystem, and the OS's own wording
+            // for that ("Invalid cross-device link") doesn't say which two
+            if e.kind() == std::io::ErrorKind::CrossesDevices {
+                bail!(
+                    "Failed to move repository to library: {} is on a different filesystem from the workspace",
+                    self.library_path().display()
+                );
+            }
+            bail!("Failed to move repository to library: {}", e);
+        }
+        if let Err(e) = set_bare_in_config(&dest, true) {
+            let _ = std::fs::rename(&dest, &source);
+            prune_empty_dirs(&self.path, &dest, cwd.as_deref());
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -4376,6 +4405,110 @@ mod tests {
         assert!(inner.join(".git").is_dir());
         assert!(!workspace.library_path().join("host/x/inner").exists());
         assert_eq!(workspace.list_library(), vec!["host/x"]);
+    }
+
+    /// What a drop must look like after storing the repo failed: the repo
+    /// where it was, readable, and the library holding nothing of it. A
+    /// store used to write `core.bare = true` into the repo's own config
+    /// before trying to move it, so a move that failed left the repo behind
+    /// bare — every git command in it refused to run ("this operation must
+    /// be run in a work tree"), `list` called it unreadable, and nothing said
+    /// why.
+    fn assert_failed_store_left_the_repo_alone(workspace: &Workspace, repo: &Path, error: &str) {
+        assert!(error.contains("Failed to"), "unexpected error: {error}");
+        assert!(
+            repo.join(".git").is_dir(),
+            "the repo lost its git directory"
+        );
+        assert_eq!(
+            git(
+                repo,
+                &["config", "--default", "false", "--get", "core.bare"]
+            ),
+            "false",
+            "the repo was left bare"
+        );
+        // Asked of git, because git is what the user runs in it next
+        assert_eq!(git(repo, &["status", "--porcelain"]), "");
+        assert_eq!(check_repo_status(repo), RepoStatus::Clean);
+        assert!(workspace.list_library().is_empty());
+    }
+
+    /// The library has to make room for the entry's parent directories, and
+    /// can't when something that isn't a directory is already at one of
+    /// them. The drop fails, and the repo it failed to store is untouched.
+    #[test]
+    fn a_drop_that_cannot_make_room_in_the_library_leaves_the_repo_as_it_was() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        let library = workspace.library_path();
+        fs::create_dir_all(&library).unwrap();
+        fs::write(library.join("github.com"), "not a directory").unwrap();
+
+        let repo = workspace.path.join("github.com/user/project");
+        repo_with_a_commit(&repo);
+
+        let error = workspace
+            .drop(&"github.com/user/project".parse().unwrap(), false, false)
+            .unwrap_err()
+            .to_string();
+        assert_failed_store_left_the_repo_alone(&workspace, &repo, &error);
+        assert!(library.join("github.com").is_file());
+    }
+
+    /// A rename can't cross a filesystem, and a library on a different one
+    /// from the workspace — `.workset` as a symlink to a bigger disk — is a
+    /// setup nothing refuses. The drop fails, says which directory is on the
+    /// other filesystem rather than quoting the OS ("Invalid cross-device
+    /// link"), leaves the repo as it was, and takes back the directories it
+    /// made in the library on the way.
+    ///
+    /// Needs a second filesystem to move across; `/dev/shm` is one on every
+    /// Linux this runs on, and the test says so and stops when it isn't.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_drop_into_a_library_on_another_filesystem_leaves_the_repo_as_it_was() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(&workspace.path).unwrap();
+
+        let elsewhere = TempDir::new_in("/dev/shm").unwrap();
+        let probe = temp_dir.path().join("probe");
+        fs::create_dir(&probe).unwrap();
+        match fs::rename(&probe, elsewhere.path().join("probe")) {
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
+            _ => {
+                eprintln!("skipping: /dev/shm is not on a different filesystem from the temp dir");
+                return;
+            }
+        }
+        let library = workspace.library_path();
+        std::os::unix::fs::symlink(elsewhere.path(), &library).unwrap();
+
+        let repo = workspace.path.join("github.com/user/project");
+        repo_with_a_commit(&repo);
+
+        let error = workspace
+            .drop(&"github.com/user/project".parse().unwrap(), false, false)
+            .unwrap_err()
+            .to_string();
+        assert_failed_store_left_the_repo_alone(&workspace, &repo, &error);
+        assert_eq!(
+            error,
+            format!(
+                "Failed to move repository to library: {} is on a different filesystem from the workspace",
+                library.display()
+            )
+        );
+        assert_eq!(
+            fs::read_dir(elsewhere.path()).unwrap().count(),
+            0,
+            "the library kept the directories made for an entry that never arrived"
+        );
     }
 
     /// Once a remote holds the repo's history, `--delete` needs no `--force`
