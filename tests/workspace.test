@@ -814,6 +814,64 @@ testDropFromInsideTheRepoKeepsTheCurrentDirectory() {
 	[ -d .git ]
 }
 
+## Standing further down inside the repo, the shell's directory is kept the
+## same way, along with the directories between it and the repo. Only the
+## repo's own directory used to be kept, so a drop from 'project/src' deleted
+## the directory the shell was in, and every command run there afterwards --
+## the restore included -- answered "Not in a workspace", since a process
+## whose working directory is gone can't find the workspace above it
+testDropFromARepoSubdirectoryKeepsTheCurrentDirectory() {
+	newWorkspace
+	createRepo github.com/user/project
+	mkdir -p github.com/user/project/src/nested
+	echo "content" >github.com/user/project/src/nested/file.txt
+	echo "content" >github.com/user/project/src/other.txt
+	git -C github.com/user/project add src
+	git -C github.com/user/project commit -q -m "src"
+
+	cd github.com/user/project/src/nested
+	workset drop ../.. | grep -- "github.com/user/project - ✓ dropped"
+
+	# The shell's directory and the ones down to it stand, emptied; nothing
+	# else of the worktree does
+	[ -d . ]
+	[ -z "$(ls -A .)" ]
+	[ "$(ls -A ..)" = "nested" ]
+	[ "$(ls -A ../..)" = "src" ]
+	[ -d ../../../../../.workset/github.com/user/project ]
+	workset list | grep "No repositories found in workspace"
+
+	# And the restore checks the repo back out around the shell
+	workset restore github.com/user/project | grep "^Restored github.com/user/project$"
+	[ -f file.txt ]
+	[ -f ../other.txt ]
+	[ -d ../../.git ]
+	workset list | grep -- "github.com/user/project - ✓ clean"
+}
+
+## A drop with no pattern from a subdirectory of the repo names nothing to
+## drop (the repo isn't under the current directory), but the one spelled
+## with the repo's path works from there, and keeps the shell's directory
+## even when that directory isn't part of what the repo checks out
+testDropByPathFromAnUntrackedSubdirectoryKeepsTheCurrentDirectory() {
+	newWorkspace
+	createRepo github.com/user/project
+	mkdir -p github.com/user/project/target/debug
+
+	cd github.com/user/project/target/debug
+	workset drop github.com/user/project | grep -- "github.com/user/project - ✓ dropped"
+	[ -d . ]
+	[ -z "$(ls -A .)" ]
+	[ "$(ls -A ../..)" = "target" ]
+	[ ! -e ../../file0.txt ]
+
+	# The empty directories the shell stood in are no obstacle to the
+	# restore, and don't make the restored repo look modified
+	workset restore github.com/user/project | grep "^Restored github.com/user/project$"
+	[ -f ../../file0.txt ]
+	workset list | grep -- "github.com/user/project - ✓ clean"
+}
+
 ## Drop patterns are workspace-relative, so a full path works from anywhere
 testDropFullPathFromSubdirectory() {
 	newWorkspace

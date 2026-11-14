@@ -1533,8 +1533,10 @@ fn prune_empty_dirs(root: &Path, repo: &Path, cwd: Option<&Path>) {
     }
 }
 
-/// Delete a dropped repo's worktree at `repo`, keeping the directory itself
-/// (empty) when `keep_dir` says the caller's working directory is in it.
+/// Delete a dropped repo's worktree at `repo`. When the caller's working
+/// directory is inside the repo, `standing_in` is where, relative to `repo`
+/// (empty for the repo's own directory): that directory and each one between
+/// it and `repo` are emptied and kept, so the shell is left somewhere real.
 ///
 /// `cd github.com/user/project && workset drop` removed the very directory
 /// the shell was standing in. Worse, a process whose working directory is
@@ -1542,23 +1544,59 @@ fn prune_empty_dirs(root: &Path, repo: &Path, cwd: Option<&Path>) {
 /// standing anywhere and took `github.com/user` and `github.com` with it,
 /// leaving even `cd ..` nowhere to go. Emptying the directory instead leaves
 /// the shell somewhere real, and since the directory still exists the
-/// pruning above it stops right there. An empty directory is no obstacle to
-/// a restore, which checks the repo back out into it.
-fn remove_worktree(repo: &Path, keep_dir: bool) -> std::io::Result<()> {
-    if !keep_dir {
+/// pruning above it stops right there.
+///
+/// Keeping only the repo's own directory was not enough: standing one level
+/// further down, in `project/src`, the same drop (`workset drop ..`, or the
+/// repo's path) still deleted the shell's directory, and until the user
+/// noticed and left it every command run there — `workset restore` included
+/// — answered "Not in a workspace", because a process whose working
+/// directory is gone can't find the workspace above it either. Directories
+/// holding nothing are no obstacle to a restore, which checks the repo back
+/// out into them.
+fn remove_worktree(repo: &Path, standing_in: Option<&Path>) -> std::io::Result<()> {
+    let Some(standing_in) = standing_in else {
         return std::fs::remove_dir_all(repo);
-    }
-    for entry in std::fs::read_dir(repo)? {
-        let entry = entry?;
-        // The entry's own type, not its target's: a symlink to a directory is
-        // removed as the link, never followed into what it points at
-        if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
+    };
+    let mut dir = repo.to_path_buf();
+    let mut below = standing_in.components();
+    loop {
+        // The next directory down towards the shell, if there is one
+        let next = below.next().map(|component| dir.join(component));
+        let mut descend = None;
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            // The entry's own type, not its target's: a symlink to a directory
+            // is removed as the link, never followed into what it points at
+            let is_dir = entry.file_type()?.is_dir();
+            if is_dir && Some(&path) == next.as_ref() {
+                descend = Some(path);
+            } else if is_dir {
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+        }
+        match descend {
+            Some(path) => dir = path,
+            None => return Ok(()),
         }
     }
-    Ok(())
+}
+
+/// Whether `path` is a directory holding nothing but directories that hold
+/// nothing — what a drop leaves behind for a shell standing inside the repo,
+/// and so what a restore may check the repo back out into.
+///
+/// Decided without following links: a link to a directory is a path to
+/// somewhere else, whatever the directory there holds, and a path that
+/// can't be read may hold anything.
+fn holds_nothing(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && std::fs::read_dir(path).is_ok_and(|mut entries| {
+            entries.all(|entry| entry.is_ok_and(|entry| holds_nothing(&entry.path())))
+        })
 }
 
 /// A `Workspace` is filesystem directory containing git repositories checked out
@@ -1862,8 +1900,10 @@ impl Workspace {
         debug!(path = ?repo, "Removing directory");
         let cwd = std::env::current_dir().ok();
         let resolved = root.join(&relative);
-        let standing_in_repo = cwd.as_deref().is_some_and(|cwd| cwd.starts_with(&resolved));
-        remove_worktree(repo, standing_in_repo)?;
+        let standing_in = cwd
+            .as_deref()
+            .and_then(|cwd| cwd.strip_prefix(&resolved).ok());
+        remove_worktree(repo, standing_in)?;
         prune_empty_dirs(&root, &resolved, cwd.as_deref());
         report.dropped.push(relative_path);
         Ok(())
@@ -2018,18 +2058,17 @@ impl Workspace {
         // A restore materializes a worktree where the workspace has none, so a
         // path already holding something is not this repo's to write over —
         // and the rollback below would take whatever is there with it. Only
-        // an empty directory (not a link to one) holds nothing to lose. A git
-        // repository there is the repo being checked out already; anything
-        // else is just in the way, and calling it the repo would send the
-        // user looking for one that isn't there.
-        let in_the_way = std::fs::symlink_metadata(&dest).is_ok_and(|metadata| {
-            !metadata.is_dir()
-                || std::fs::read_dir(&dest).map_or(true, |mut entries| entries.next().is_some())
-        });
-        if in_the_way {
-            if dest.join(".git").exists() {
-                bail!("{} is already in the workspace", quote_path(relative_path));
-            }
+        // directories holding nothing (and not a link to one) hold nothing to
+        // lose: the empty directory a drop from inside the repo keeps for the
+        // shell, with the empty directories down to the one it stood in. A
+        // git repository there is the repo being checked out already,
+        // whatever else it holds; anything else is just in the way, and
+        // calling it the repo would send the user looking for one that isn't
+        // there.
+        if dest.join(".git").exists() {
+            bail!("{} is already in the workspace", quote_path(relative_path));
+        }
+        if std::fs::symlink_metadata(&dest).is_ok() && !holds_nothing(&dest) {
             bail!(
                 "something that isn't the repository is already at {}",
                 quote_path(&dest.to_string_lossy())
@@ -2060,11 +2099,11 @@ impl Workspace {
             let _ = std::fs::rename(&git_dir, &source);
             // The directory may be the empty one a drop from inside the repo
             // kept, with the caller's shell still standing in it
-            let standing_in_dest = cwd
+            let standing_in = cwd
                 .as_deref()
                 .zip(std::fs::canonicalize(&dest).ok())
-                .is_some_and(|(cwd, dest)| cwd.starts_with(dest));
-            let _ = remove_worktree(&dest, standing_in_dest);
+                .and_then(|(cwd, dest)| Some(cwd.strip_prefix(dest).ok()?.to_path_buf()));
+            let _ = remove_worktree(&dest, standing_in.as_deref());
             prune_empty_dirs(&self.path, &dest, cwd.as_deref());
             return Err(e);
         }
@@ -3473,8 +3512,20 @@ mod tests {
         fs::remove_dir_all(&repo).unwrap();
         assert!(entry.join("HEAD").is_file());
 
-        // An empty directory holds nothing to lose, so the repo goes there
-        fs::create_dir_all(&repo).unwrap();
+        // A file further down, under directories a drop might have kept
+        fs::create_dir_all(repo.join("src/nested")).unwrap();
+        fs::write(repo.join("src/nested/notes.txt"), "mine").unwrap();
+        assert!(refusal(&workspace).contains("something that isn't the repository"));
+        assert_eq!(
+            fs::read_to_string(repo.join("src/nested/notes.txt")).unwrap(),
+            "mine"
+        );
+        fs::remove_dir_all(&repo).unwrap();
+
+        // Directories holding nothing hold nothing to lose, so the repo goes
+        // there: the empty directory a drop from the repo keeps for the
+        // shell, or the chain of them a drop from a subdirectory keeps
+        fs::create_dir_all(repo.join("src/nested")).unwrap();
         workspace
             .restore_from_library("github.com/user/project")
             .unwrap();
@@ -3577,13 +3628,82 @@ mod tests {
         fs::write(elsewhere.join("keep.txt"), "mine").unwrap();
         std::os::unix::fs::symlink(&elsewhere, repo.join("link")).unwrap();
 
-        remove_worktree(&repo, true).unwrap();
+        remove_worktree(&repo, Some(Path::new(""))).unwrap();
         assert!(repo.is_dir());
         assert_eq!(fs::read_dir(&repo).unwrap().count(), 0);
         assert!(elsewhere.join("keep.txt").exists());
 
-        remove_worktree(&repo, false).unwrap();
+        remove_worktree(&repo, None).unwrap();
         assert!(!repo.exists());
+    }
+
+    /// Standing below the repo's own directory, the shell's directory and
+    /// each one down to it are kept, emptied, and nothing else is: a sibling
+    /// at any level goes, and so does a link standing where the shell's
+    /// directory would be, since the shell is never in a link.
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_worktree_keeps_the_directories_down_to_the_caller() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(repo.join("src/nested/deeper")).unwrap();
+        fs::write(repo.join("src/nested/file.txt"), "x").unwrap();
+        fs::write(repo.join("src/sibling.txt"), "x").unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(repo.join("README"), "x").unwrap();
+
+        remove_worktree(&repo, Some(Path::new("src/nested"))).unwrap();
+        assert!(repo.join("src/nested").is_dir());
+        assert_eq!(fs::read_dir(repo.join("src/nested")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(repo.join("src")).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&repo).unwrap().count(), 1);
+        assert!(holds_nothing(&repo));
+
+        // A link where the next directory down would be is removed as the
+        // link, and the descent stops there
+        let elsewhere = temp_dir.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("inner")).unwrap();
+        fs::write(elsewhere.join("keep.txt"), "mine").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, repo.join("link")).unwrap();
+        remove_worktree(&repo, Some(Path::new("link/inner"))).unwrap();
+        assert_eq!(fs::read_dir(&repo).unwrap().count(), 0);
+        assert!(elsewhere.join("keep.txt").exists());
+        assert!(elsewhere.join("inner").is_dir());
+
+        // A directory the shell stood in that is gone already is no error
+        remove_worktree(&repo, Some(Path::new("src/nested"))).unwrap();
+        assert!(repo.is_dir());
+    }
+
+    /// What a restore may write into is decided by whether anything is there
+    /// to lose, not by whether the directory is literally empty: the chain
+    /// of empty directories a drop keeps for the shell counts as nothing,
+    /// while a file at any depth, or a link, does not.
+    #[cfg(unix)]
+    #[test]
+    fn holds_nothing_sees_through_empty_directories_and_nothing_else() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().join("dir");
+        fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        fs::create_dir_all(dir.join("a/d")).unwrap();
+        assert!(holds_nothing(&dir));
+
+        fs::write(dir.join("a/b/c/file"), "x").unwrap();
+        assert!(!holds_nothing(&dir));
+        fs::remove_file(dir.join("a/b/c/file")).unwrap();
+        assert!(holds_nothing(&dir));
+
+        // A link to an empty directory is not an empty directory
+        let elsewhere = temp_dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join("a/d/link")).unwrap();
+        assert!(!holds_nothing(&dir));
+        assert!(!holds_nothing(&dir.join("a/d/link")));
+
+        // Nor is a file, or a path that isn't there
+        assert!(!holds_nothing(&temp_dir.path().join("missing")));
+        fs::write(temp_dir.path().join("file"), "x").unwrap();
+        assert!(!holds_nothing(&temp_dir.path().join("file")));
     }
 
     /// A symlinked directory in the workspace is a path that reads as
