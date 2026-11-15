@@ -141,17 +141,35 @@ pub fn build_tree(repos: Vec<RepoInfo>) -> Vec<TreeNode> {
 
     let mut root_nodes: Vec<TreeNode> = Vec::new();
 
-    // Build the tree, grouping repos by remote URL when known. Two
-    // clones of the same URL collide on the same node; the later one falls
-    // back to its on-disk placement so both stay visible.
+    // Build the tree, grouping repos by remote URL when known. Two clones of
+    // the same URL collide on the same node, and the one that loses the node
+    // falls back to where it sits on disk so both stay visible.
     for repo in sorted_repos {
         let grouping = repo
             .tree_path
             .clone()
             .unwrap_or_else(|| repo.display_name.clone());
-        if !insert_repo_at(&mut root_nodes, &grouping, &repo) && repo.tree_path.is_some() {
-            let fallback = repo.display_name.clone();
-            insert_repo_at(&mut root_nodes, &fallback, &repo);
+        let mut unplaced = insert_repo_at(&mut root_nodes, &grouping, repo);
+        // On-disk paths are distinct, so a repo sent to its own is only ever
+        // contested by a clone grouped there from elsewhere, which it
+        // displaces; that clone is sent to its own path in turn, and each
+        // round leaves one more repo at a path nothing else can claim. The
+        // fallback used to be attempted once and its outcome dropped, so a
+        // repo whose on-disk path was the node a newer clone of the same URL
+        // had already taken vanished from the tree, while the row spelling
+        // its path acted on the other clone.
+        while let Some(repo) = unplaced {
+            let own_path = repo.display_name.clone();
+            unplaced = insert_repo_at(&mut root_nodes, &own_path, repo);
+            // Only a second repo at this very path could come back out of it,
+            // which a workspace can't hold; stop rather than swap the two
+            // forever if one ever does
+            if unplaced
+                .as_ref()
+                .is_some_and(|repo| repo.display_name == own_path)
+            {
+                break;
+            }
         }
     }
 
@@ -159,11 +177,13 @@ pub fn build_tree(repos: Vec<RepoInfo>) -> Vec<TreeNode> {
 }
 
 /// Insert a repo at the slash-separated path, creating directory nodes along
-/// the way. Returns false when another repo already occupies the target node.
-fn insert_repo_at(root_nodes: &mut Vec<TreeNode>, path: &str, repo: &RepoInfo) -> bool {
+/// the way. When another repo already occupies the target node, the one whose
+/// on-disk path is that node keeps it, and the other is handed back to be
+/// placed elsewhere.
+fn insert_repo_at(root_nodes: &mut Vec<TreeNode>, path: &str, repo: RepoInfo) -> Option<RepoInfo> {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     if parts.is_empty() {
-        return true;
+        return None;
     }
 
     let mut current_level = root_nodes;
@@ -173,29 +193,34 @@ fn insert_repo_at(root_nodes: &mut Vec<TreeNode>, path: &str, repo: &RepoInfo) -
 
         if let Some(idx) = node_idx {
             if is_last {
-                if current_level[idx].repo_info.is_some() {
-                    return false;
-                }
-                current_level[idx].repo_info = Some(repo.clone());
+                let node = &mut current_level[idx];
+                return match node.repo_info.take() {
+                    Some(incumbent) if repo.display_name != path => {
+                        node.repo_info = Some(incumbent);
+                        Some(repo)
+                    }
+                    displaced => {
+                        node.repo_info = Some(repo);
+                        displaced
+                    }
+                };
             }
             current_level = &mut current_level[idx].children;
+        } else if is_last {
+            current_level.push(TreeNode {
+                name: (*part).to_string(),
+                repo_info: Some(repo),
+                children: Vec::new(),
+                expanded: false,
+            });
+            return None;
         } else {
-            let new_node = if is_last {
-                TreeNode {
-                    name: (*part).to_string(),
-                    repo_info: Some(repo.clone()),
-                    children: Vec::new(),
-                    expanded: false,
-                }
-            } else {
-                TreeNode::new_directory((*part).to_string())
-            };
-            current_level.push(new_node);
+            current_level.push(TreeNode::new_directory((*part).to_string()));
             let new_idx = current_level.len() - 1;
             current_level = &mut current_level[new_idx].children;
         }
     }
-    true
+    None
 }
 
 /// Build library tree, excluding repos that exist in workspace
@@ -270,7 +295,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn repos_grouped_by_remote_tree_path() {
         let tree = build_tree(vec![repo("work/foo", Some("github.com/fossable/foo"))]);
@@ -285,7 +309,12 @@ mod tests {
     #[test]
     fn repos_without_remote_fall_back_to_disk_layout() {
         let tree = build_tree(vec![repo("work/foo", None)]);
-        assert!(node_at(&tree, &["work", "foo"]).unwrap().repo_info.is_some());
+        assert!(
+            node_at(&tree, &["work", "foo"])
+                .unwrap()
+                .repo_info
+                .is_some()
+        );
     }
 
     #[test]
@@ -305,6 +334,78 @@ mod tests {
             fallback.repo_info.as_ref().unwrap().path,
             PathBuf::from("/ws/b/two")
         );
+    }
+
+    /// A second clone of a repo already checked out at its remote's path —
+    /// `git clone` into a scratch directory, say — groups onto the node the
+    /// first one sits at. The newer clone is placed first, and the repo whose
+    /// on-disk path that node spells used to fall back to... the same path,
+    /// fail again, and vanish: the panel counted one repo fewer than `list`,
+    /// and the row reading `github.com/x/y` dropped the scratch clone.
+    #[test]
+    fn the_repo_at_the_remotes_path_keeps_its_node() {
+        let at = |display_name, tree_path, seconds| RepoInfo {
+            modification_time: Some(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            ),
+            ..repo(display_name, tree_path)
+        };
+        let tree = build_tree(vec![
+            at("github.com/x/y", Some("github.com/x/y"), 10),
+            at("scratch/y-experiment", Some("github.com/x/y"), 20),
+        ]);
+
+        assert_eq!(count_repos_in_trees(&tree), 2);
+        let home = node_at(&tree, &["github.com", "x", "y"]).unwrap();
+        assert_eq!(
+            home.repo_info.as_ref().unwrap().display_name,
+            "github.com/x/y"
+        );
+        let scratch = node_at(&tree, &["scratch", "y-experiment"]).unwrap();
+        assert_eq!(
+            scratch.repo_info.as_ref().unwrap().display_name,
+            "scratch/y-experiment"
+        );
+
+        // The same when the repo at that path has no remote to group by, so
+        // its on-disk path is the only one it ever asks for
+        let tree = build_tree(vec![
+            at("github.com/x/y", None, 10),
+            at("scratch/y-experiment", Some("github.com/x/y"), 20),
+        ]);
+        assert_eq!(count_repos_in_trees(&tree), 2);
+        let home = node_at(&tree, &["github.com", "x", "y"]).unwrap();
+        assert_eq!(
+            home.repo_info.as_ref().unwrap().display_name,
+            "github.com/x/y"
+        );
+        assert!(node_at(&tree, &["scratch", "y-experiment"]).is_some());
+    }
+
+    /// A displaced clone falls back to its own path, which may itself be the
+    /// node another repo grouped onto, and so on; every repo ends up somewhere
+    #[test]
+    fn displaced_repos_make_room_for_each_other() {
+        let at = |display_name, tree_path, seconds| RepoInfo {
+            modification_time: Some(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            ),
+            ..repo(display_name, tree_path)
+        };
+        // Newest first: a takes q/b, b takes r/c, then c claims r/c and
+        // displaces b to q/b, which displaces a to p/a
+        let tree = build_tree(vec![
+            at("p/a", Some("q/b"), 30),
+            at("q/b", Some("r/c"), 20),
+            at("r/c", None, 10),
+        ]);
+
+        assert_eq!(count_repos_in_trees(&tree), 3);
+        for path in ["p/a", "q/b", "r/c"] {
+            let parts: Vec<&str> = path.split('/').collect();
+            let node = node_at(&tree, &parts).unwrap();
+            assert_eq!(node.repo_info.as_ref().unwrap().display_name, path);
+        }
     }
 
     /// The scan hands rows over in the order its workers finish, which
