@@ -377,13 +377,47 @@ impl App {
 
         self.workspace_repos_list = workspace_repos;
         self.library_repos_list = library_repos;
+
+        // A repo's sync state goes with the row it was computed for. A repo
+        // that left the working set — dropped, or deleted from another
+        // terminal — may still have a fetch queued or running against the
+        // directory it no longer occupies, and what that fetch reports
+        // ("No such file or directory") says nothing about the repo. Kept
+        // here by path, it was what a later restore of the same repo showed
+        // on its row and in its info panel, until a fetch replaced it.
+        let rows = &self.workspace_repos_list;
+        let is_row = |path: &PathBuf| rows.iter().any(|repo| repo.path == *path);
+        self.sync_statuses.retain(|path, _| is_row(path));
+        self.sync_outcomes.retain(|path, _| is_row(path));
+
         self.rebuild_preserving_selection();
     }
 
-    /// Overlay a sync status (Fetching or SyncFailed) on the given repo
+    /// Whether the given path is one of the rows the workspace panel holds,
+    /// spelled the way the rows spell it
+    fn has_workspace_row(&self, path: &Path) -> bool {
+        self.workspace_repos_list.iter().any(|repo| repo.path == path)
+    }
+
+    /// Overlay a sync status (Fetching or SyncFailed) on the given repo. A
+    /// repo that is no longer a row has no row to overlay, and the status
+    /// would otherwise wait for the row a restore brings back.
     pub fn set_sync_status(&mut self, path: &Path, status: RepoOperationStatus) {
+        if !self.has_workspace_row(path) {
+            return;
+        }
         self.sync_statuses.insert(path.to_path_buf(), status);
         self.rebuild_preserving_selection();
+    }
+
+    /// Keep the full result of a repo's last sync for the info panel's
+    /// per-remote rows — for a repo that is still a row, as with
+    /// [`Self::set_sync_status`]
+    pub fn record_sync_outcome(&mut self, path: &Path, outcome: crate::sync::SyncOutcome) {
+        if !self.has_workspace_row(path) {
+            return;
+        }
+        self.sync_outcomes.insert(path.to_path_buf(), outcome);
     }
 
     /// Remove the sync status overlay from the given repo
@@ -574,6 +608,43 @@ mod tests {
         app.clear_sync_status(Path::new("github.com/foo/app"));
         let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
         assert_eq!(info.operation_status, RepoOperationStatus::None);
+    }
+
+    /// A fetch queued for a repo the user then drops runs against a directory
+    /// that is gone, and its failure used to be kept under the repo's path:
+    /// the row a restore brought back read "sync failed: No such file or
+    /// directory", and the info panel showed the remotes as the fetch before
+    /// the drop had left them, until the next fetch of that repo replaced
+    /// both. What was computed for a row goes when the row does.
+    #[test]
+    fn sync_state_leaves_the_working_set_with_its_repo() {
+        let path = Path::new("github.com/foo/app");
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app")],
+            Vec::new(),
+        );
+        app.set_sync_status(path, RepoOperationStatus::Fetching);
+        app.record_sync_outcome(path, crate::sync::SyncOutcome::default());
+        assert!(app.is_fetching(path));
+        assert!(app.sync_outcomes.contains_key(path));
+
+        // The rescan after the drop lists the repo in the library only
+        app.update_repos(Vec::new(), vec![repo("github.com/foo/app")]);
+        assert!(!app.is_fetching(path));
+        assert!(!app.sync_outcomes.contains_key(path));
+
+        // The fetch's result arrives after the repo has left: there is no row
+        // for it, and the next one is not its row either
+        app.set_sync_status(
+            path,
+            RepoOperationStatus::SyncFailed("No such file or directory".to_string()),
+        );
+        app.record_sync_outcome(path, crate::sync::SyncOutcome::default());
+        app.update_repos(vec![repo("github.com/foo/app")], Vec::new());
+        let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
+        assert_eq!(info.operation_status, RepoOperationStatus::None);
+        assert!(!app.sync_outcomes.contains_key(path));
     }
 
     #[test]

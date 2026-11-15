@@ -367,7 +367,7 @@ impl SyncManager {
                     // The fetch may have changed what the info panel shows
                     app.details.remove(&repo);
                     // Keep the full outcome for the panel's per-remote rows
-                    app.sync_outcomes.insert(repo, outcome);
+                    app.record_sync_outcome(&repo, outcome);
                 }
                 SyncEvent::Failed(err) => {
                     self.finish(&repo);
@@ -2007,6 +2007,62 @@ mod tests {
         mgr.request_watcher_syncs(vec![nested, repo.clone()], &app);
 
         assert_eq!(mgr.queue.iter().collect::<Vec<_>>(), vec![&repo]);
+    }
+
+    /// A fetch spawned for a repo the user dropped a moment later runs in a
+    /// directory that is gone, and fails saying so. The rescan the drop
+    /// started may land before or after that result; either way nothing of it
+    /// may wait under the repo's path for the row a restore brings back.
+    #[test]
+    fn sync_result_for_a_dropped_repo_does_not_outlive_its_row() {
+        let repo = PathBuf::from("ws/repo");
+        let row = || RepoInfo {
+            path: PathBuf::from("ws/repo"),
+            display_name: "repo".to_string(),
+            ..Default::default()
+        };
+        let row_status = |app: &App| {
+            app.flattened(Section::Workspace)
+                .iter()
+                .find_map(|(node, _, _, _)| node.repo_info.as_ref())
+                .map(|info| info.operation_status.clone())
+        };
+        let mut mgr = SyncManager::new();
+
+        // The result lands while the rescan still lists the repo (its rows are
+        // seeded from before the drop), and the rescan then takes it away
+        let mut app = App::new("ws".to_string(), vec![row()], Vec::new());
+        mgr.in_flight.insert(repo.clone());
+        mgr.tx
+            .send((
+                repo.clone(),
+                SyncEvent::Failed("No such file or directory".into()),
+            ))
+            .unwrap();
+        mgr.poll(&mut app);
+        assert!(matches!(
+            row_status(&app),
+            Some(RepoOperationStatus::SyncFailed(_))
+        ));
+        app.update_repos(Vec::new(), vec![row()]);
+        app.update_repos(vec![row()], Vec::new());
+        assert_eq!(row_status(&app), Some(RepoOperationStatus::None));
+
+        // The result lands after the rescan has taken the repo away
+        let mut app = App::new("ws".to_string(), Vec::new(), vec![row()]);
+        mgr.in_flight.insert(repo.clone());
+        mgr.tx.send((repo.clone(), SyncEvent::Started)).unwrap();
+        mgr.tx
+            .send((
+                repo.clone(),
+                SyncEvent::Finished(crate::sync::SyncOutcome::default()),
+            ))
+            .unwrap();
+        mgr.poll(&mut app);
+        assert!(!app.is_fetching(&repo));
+        assert!(!app.sync_outcomes.contains_key(&repo));
+        app.update_repos(vec![row()], Vec::new());
+        assert!(!app.sync_outcomes.contains_key(&repo));
     }
 
     #[test]
