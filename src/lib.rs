@@ -301,31 +301,18 @@ fn find_repos_below(path: &Path) -> Vec<(PathBuf, RepoKind)> {
 }
 
 /// Just the paths of the repositories that have a worktree, dropping the bare
-/// ones the walk stopped at along the way
+/// ones the walk stopped at along the way.
+///
+/// A bare repository is a repository too, so the walk stops at one as well —
+/// it just isn't reported, because every caller of this wants the working
+/// set: repos with a worktree to show a status for, to drop, to open a shell
+/// in.
 fn worktrees(repos: Vec<(PathBuf, RepoKind)>) -> Vec<PathBuf> {
     repos
         .into_iter()
         .filter(|(_, kind)| *kind == RepoKind::Worktree)
         .map(|(repo, _)| repo)
         .collect()
-}
-
-/// Recursively find "top-level" git repositories: the directories holding a
-/// `.git`.
-/// This function will not traverse into .git directories or nested git repositories.
-///
-/// A bare repository is a repository too, so the walk stops at one as well —
-/// it just isn't reported, because every caller here wants the working set:
-/// repos with a worktree to show a status for, to drop, to open a shell in.
-pub fn find_git_repositories(path: &Path) -> Vec<PathBuf> {
-    debug!(path = %path.display(), "Recursively searching for git repositories");
-    worktrees(find_repos(path))
-}
-
-/// The repos under `path`, without `path` itself ever being one of them; see
-/// [`find_repos_below`].
-fn find_git_repositories_below(path: &Path) -> Vec<PathBuf> {
-    worktrees(find_repos_below(path))
 }
 
 /// Return the config text with every `worktree` entry removed from its
@@ -800,7 +787,7 @@ impl DropReport {
 /// either because its git directory isn't its own or because other worktrees
 /// are using it.
 ///
-/// `find_git_repositories` reports anything with a `.git` in it, and the two
+/// The workspace walk reports anything with a `.git` in it, and the two
 /// ends of a `git worktree add` both qualify, so both end up as repos of the
 /// workspace that `drop` will act on. Neither is a repo the library can hold
 /// on its own: one half has no git directory and the other half's git
@@ -811,7 +798,7 @@ fn worktree_blocker(repo: &Path) -> Option<DropBlocker> {
     // directory it points at, and `is_file`/`is_dir` can't tell the two apart.
     let git_path = repo.join(".git");
     let Ok(git_kind) = std::fs::symlink_metadata(&git_path).map(|m| m.file_type()) else {
-        // Nothing there to classify, which `find_git_repositories` doesn't
+        // Nothing there to classify, which the workspace walk doesn't
         // report, so the `.git` went away between the walk and now. Not a
         // shape of repo to refuse — the drop runs into the same missing
         // directory a moment later and says so — and refusing it here would
@@ -1691,11 +1678,12 @@ impl Workspace {
     /// one nameless row and nothing else, and `workset drop` with no pattern
     /// failed on it without dropping anything.
     pub fn repos_under(&self, path: &Path) -> Vec<PathBuf> {
-        if self.is_root(path) {
-            find_git_repositories_below(path)
+        debug!(path = %path.display(), "Recursively searching for git repositories");
+        worktrees(if self.is_root(path) {
+            find_repos_below(path)
         } else {
-            find_git_repositories(path)
-        }
+            find_repos(path)
+        })
     }
 
     /// Whether `path` is this workspace's root directory, compared on
@@ -1762,21 +1750,19 @@ impl Workspace {
     /// Drop the repositories matching a pattern from this workspace
     pub fn drop(&self, pattern: &RepoPattern, delete: bool, force: bool) -> Result<DropReport> {
         debug!("Drop requested for pattern: {:?}", pattern);
-
-        let mut report = DropReport::default();
-        for repo in self.search(pattern)? {
-            self.drop_repo(&repo, delete, force, &mut report)?;
-        }
-        Ok(report)
+        self.drop_repos(self.search(pattern)?, delete, force)
     }
 
-    /// Drop all repositories in the current directory
-    pub fn drop_all(&self, delete: bool, force: bool) -> Result<DropReport> {
-        debug!("Drop all requested in current directory");
+    /// Drop every repository of the working set under `path` — the caller's
+    /// current directory, for a `workset drop` given no pattern.
+    pub fn drop_under(&self, path: &Path, delete: bool, force: bool) -> Result<DropReport> {
+        self.drop_repos(self.repos_under(path), delete, force)
+    }
 
-        let cwd = std::env::current_dir()?;
+    /// Drop each of `repos`, recording what happened to every one of them.
+    fn drop_repos(&self, repos: Vec<PathBuf>, delete: bool, force: bool) -> Result<DropReport> {
         let mut report = DropReport::default();
-        for repo in self.repos_under(&cwd) {
+        for repo in repos {
             self.drop_repo(&repo, delete, force, &mut report)?;
         }
         Ok(report)
@@ -2128,7 +2114,7 @@ impl Workspace {
     /// restorable.
     ///
     /// The walk reports whatever it could reach, the way the workspace walk
-    /// in [`find_git_repositories`] does: a library that isn't there yet
+    /// in [`repos_under`](Self::repos_under) does: a library that isn't there yet
     /// yields nothing, and a directory inside one that can't be read is
     /// skipped rather than failing the listing. So there is no error to
     /// return, and returning one anyway meant every caller had to invent its
@@ -2167,7 +2153,6 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error;
     use std::fs;
     use tempfile::TempDir;
 
@@ -2441,23 +2426,6 @@ mod tests {
     }
 
     #[test]
-    fn test_library_contains() {
-        let temp_dir = TempDir::new().unwrap();
-        let workspace = Workspace {
-            path: temp_dir.path().to_path_buf(),
-        };
-
-        let repo_path = "test/repo";
-        assert!(!workspace.library_contains(repo_path));
-
-        // Create the library directory with a test repo
-        let library_path = workspace.library_path().join(repo_path);
-        fs::create_dir_all(&library_path).unwrap();
-
-        assert!(workspace.library_contains(repo_path));
-    }
-
-    #[test]
     fn resolve_pattern_is_relative_to_the_current_directory() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = Workspace {
@@ -2696,7 +2664,7 @@ mod tests {
         }
 
         // Nor was the repo smuggled into the workspace on the way out
-        assert!(find_git_repositories(&workspace.path).is_empty());
+        assert!(workspace.repos().is_empty());
     }
 
     /// `workset init` in a directory that is already a git repo — a checkout
@@ -3712,7 +3680,7 @@ mod tests {
     /// directory into the library and delete a worktree that was never here.
     #[cfg(unix)]
     #[test]
-    fn find_git_repositories_does_not_follow_symlinks() {
+    fn the_workspace_walk_does_not_follow_symlinks() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path().join("ws");
         fs::create_dir_all(root.join("inside/.git")).unwrap();
@@ -3724,8 +3692,8 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("linked-dir")).unwrap();
         std::os::unix::fs::symlink(outside.join("repo"), root.join("linked-repo")).unwrap();
 
-        let repos = find_git_repositories(&root);
-        assert_eq!(repos, vec![root.join("inside")]);
+        let workspace = Workspace { path: root.clone() };
+        assert_eq!(workspace.repos(), vec![root.join("inside")]);
     }
 
     /// Every caller of `scan_repos` pairs what came back with the repo list it
@@ -4923,35 +4891,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_find_git_repositories() {
-        let temp_dir = TempDir::new().unwrap();
-        let base_path = temp_dir.path();
-
-        // Create a git directory structure
-        let repo1 = base_path.join("repo1");
-        fs::create_dir_all(repo1.join(".git")).unwrap();
-
-        let repo2 = base_path.join("nested/repo2");
-        fs::create_dir_all(repo2.join(".git")).unwrap();
-
-        let not_repo = base_path.join("not_a_repo");
-        fs::create_dir_all(&not_repo).unwrap();
-
-        let repos = find_git_repositories(base_path);
-
-        assert_eq!(repos.len(), 2);
-        assert!(repos.iter().any(|p| p.ends_with("repo1")));
-        assert!(repos.iter().any(|p| p.ends_with("repo2")));
-    }
-
     /// Repos come back in path order, not in whichever order the filesystem
     /// happened to store the directory entries, so everything that prints the
-    /// list prints the same thing on every machine.
+    /// list prints the same thing on every machine. A directory holding no
+    /// `.git` is walked through, not reported.
     #[test]
-    fn find_git_repositories_reports_repos_in_path_order() {
+    fn repos_are_reported_in_path_order() {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path();
+        let workspace = Workspace {
+            path: base_path.to_path_buf(),
+        };
 
         // Created in an order that is neither alphabetical nor reverse, so a
         // filesystem that keeps insertion order fails this too
@@ -4964,8 +4914,10 @@ mod tests {
         ] {
             fs::create_dir_all(base_path.join(name).join(".git")).unwrap();
         }
+        fs::create_dir_all(base_path.join("github.com/not_a_repo")).unwrap();
 
-        let repos: Vec<_> = find_git_repositories(base_path)
+        let repos: Vec<_> = workspace
+            .repos()
             .iter()
             .map(|repo| {
                 repo.strip_prefix(base_path)
@@ -5077,7 +5029,7 @@ mod tests {
     /// whole runtime, once a library has grown — and anything found inside is
     /// not a repo the workspace contains.
     #[test]
-    fn find_git_repositories_stops_at_a_library_entry() {
+    fn the_workspace_walk_stops_at_a_library_entry() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let workspace = Workspace {
@@ -5105,24 +5057,7 @@ mod tests {
         // is exactly the shape the walk reports as a workspace repo.
         fs::create_dir_all(library_entry.join("objects/decoy/.git")).unwrap();
 
-        let repos = find_git_repositories(root);
-        assert_eq!(repos, vec![kept]);
-    }
-
-    #[test]
-    fn test_parse_with_provider() -> Result<(), Box<dyn Error>> {
-        let pattern = str::parse::<RepoPattern>("github.com/user/repo")?;
-        assert_eq!(pattern.provider, Some("github.com".to_string()));
-        assert_eq!(pattern.path, "user/repo".to_string());
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_without_provider() -> Result<(), Box<dyn Error>> {
-        let pattern = str::parse::<RepoPattern>("user/repo")?;
-        assert_eq!(pattern.provider, None);
-        assert_eq!(pattern.path, "user/repo".to_string());
-        Ok(())
+        assert_eq!(workspace.repos(), vec![kept]);
     }
 
     /// Every spelling of a clone URL a forge offers names the same repo, and so

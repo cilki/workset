@@ -437,7 +437,7 @@ impl App {
     /// filesystem watcher, which reports every path under the workspace —
     /// has to ask, because "somewhere in the workspace directory" is not the
     /// same thing as "a repo workset manages". The working set is what
-    /// [`crate::find_git_repositories`] reports, and it deliberately stops at
+    /// [`crate::Workspace::repos`] reports, and it deliberately stops at
     /// the first repo on each branch of the walk: a git directory nested
     /// inside another repo's worktree is that repo's content, not a repo of
     /// ours, and a repo reached through a symlink lives somewhere the

@@ -651,8 +651,10 @@ fn drop_repos(
     delete: bool,
     force: bool,
 ) -> Result<bool> {
+    let cwd = std::env::current_dir()?;
+
     if patterns.is_empty() {
-        let report = workspace.drop_all(delete, force)?;
+        let report = workspace.drop_under(&cwd, delete, force)?;
         report_drop(&report, delete);
 
         if report.is_empty() {
@@ -667,8 +669,6 @@ fn drop_repos(
     // instead of vanishing into a combined total, and the ones that do match
     // are still dropped. Patterns are relative to the current directory first,
     // so 'workset drop ./repo' works from the repo's parent.
-    let cwd = std::env::current_dir()?;
-
     Ok(for_each_pattern(patterns, "drop", |requested| {
         let pattern = workspace.resolve_pattern(&cwd, requested);
 
