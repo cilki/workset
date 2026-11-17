@@ -33,12 +33,22 @@ pub struct RepoPattern {
 ///
 /// The transport (scheme, credentials, and the `:` the SSH form puts between
 /// host and path) says nothing a pattern records, so it is dropped here rather
-/// than becoming part of a repo's name in the workspace. A port is not
-/// transport: it belongs to the provider, and the clone URL needs it back.
+/// than becoming part of a repo's name in the workspace. An HTTP(S) port is not
+/// transport: it belongs to the provider, and the clone URL needs it back. The
+/// port of any other scheme is that transport's — the SSH daemon's `2222`, the
+/// git daemon's `9418` — and the clone, which always goes over HTTPS, can't
+/// reach the forge there. Kept, it sent `workset clone
+/// ssh://git@host:2222/owner/repo` to `https://host:2222/...`, where nothing
+/// answers HTTPS, and filed the repo under `host:2222/` besides.
 fn strip_url_syntax(pattern: &str) -> String {
     let pattern = pattern.trim();
     // https://, ssh://, git://, git+ssh://
-    let pattern = pattern.split_once("://").map_or(pattern, |(_, rest)| rest);
+    let (scheme, pattern) = pattern
+        .split_once("://")
+        .map_or((None, pattern), |(scheme, rest)| (Some(scheme), rest));
+    let keeps_port = scheme.is_none_or(|scheme| {
+        scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")
+    });
 
     // The host is everything up to the first '/' — or, in the SSH form
     // `git@host:owner/repo`, up to the ':' inside that first component
@@ -50,6 +60,7 @@ fn strip_url_syntax(pattern: &str) -> String {
         Some((host, rest)) if !rest.is_empty() && !rest.bytes().all(|b| b.is_ascii_digit()) => {
             format!("{}/{}", host, rest)
         }
+        Some((host, _)) if !keeps_port => host.to_string(),
         _ => host.to_string(),
     };
 
@@ -5101,8 +5112,34 @@ mod tests {
             path: "cilki/workset".to_string(),
         };
         for url in [
+            "git.example.com:3000/cilki/workset",
             "https://git.example.com:3000/cilki/workset.git",
-            "ssh://git@git.example.com:3000/cilki/workset.git",
+            "HTTP://git.example.com:3000/cilki/workset.git",
+        ] {
+            assert_eq!(
+                str::parse::<RepoPattern>(url).unwrap(),
+                expected,
+                "parsing {url}"
+            );
+        }
+    }
+
+    /// The port of an SSH or git-daemon URL is where that daemon listens, not
+    /// where the forge serves HTTPS, which is the only way workset clones.
+    /// Kept, it aimed the clone at a port that never answers HTTPS and filed
+    /// the repo under a `host:port` directory no other spelling of the same
+    /// repo reaches.
+    #[test]
+    fn a_non_http_port_is_left_with_its_transport() {
+        let expected = RepoPattern {
+            provider: Some("git.example.com".to_string()),
+            path: "cilki/workset".to_string(),
+        };
+        for url in [
+            "ssh://git@git.example.com:2222/cilki/workset.git",
+            "git+ssh://git@git.example.com:2222/cilki/workset.git",
+            "git://git.example.com:9418/cilki/workset.git",
+            "git@git.example.com:cilki/workset.git",
         ] {
             assert_eq!(
                 str::parse::<RepoPattern>(url).unwrap(),
