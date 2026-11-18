@@ -681,6 +681,15 @@ pub enum DropBlocker {
     /// the only copy of every commit in it, which is what `--force` is for.
     Unpublished,
 
+    /// A `--delete` of a repo one of whose submodules holds commits none of
+    /// the submodule's remotes have: a branch made inside the submodule, a
+    /// stash, or a commit HEAD has since moved off. A submodule's git
+    /// directory lives under the parent's `.git/modules`, so the parent's
+    /// own status never sees them, and a plain drop keeps them in the
+    /// library along with the rest of `.git`. Deleting the parent deletes
+    /// the only copy, which is what `--force` is for.
+    SubmoduleUnpublished,
+
     /// The library already holds a repository at this path: one dropped
     /// earlier, and since replaced in the workspace by a `git clone` or
     /// `git init` of its own rather than a `workset restore`. Storing this
@@ -734,7 +743,9 @@ impl DropBlocker {
     pub fn remedy(&self) -> &'static str {
         match self {
             Self::Outstanding(_) => "use --force to drop anyway",
-            Self::Unpublished => "use --force to delete anyway, or drop it without --delete",
+            Self::Unpublished | Self::SubmoduleUnpublished => {
+                "use --force to delete anyway, or drop it without --delete"
+            }
             Self::InLibrary => {
                 "use --force to replace the library's copy, or --delete to discard this one"
             }
@@ -761,6 +772,7 @@ impl std::fmt::Display for DropBlocker {
             // drop only ever blocks on the three statuses above
             Self::Outstanding(_) => f.write_str("outstanding changes"),
             Self::Unpublished => f.write_str("no remote has its commits"),
+            Self::SubmoduleUnpublished => f.write_str("a submodule holds unpushed commits"),
             Self::InLibrary => f.write_str("the library already holds a repo at this path"),
             Self::LibraryHoldsReposBelow => f.write_str("the library holds repos under this path"),
             Self::UnderLibraryEntry => {
@@ -1241,6 +1253,51 @@ fn has_published_history(repo_path: &Path) -> bool {
         return false;
     };
     remotes.any(|reference| reference.ok().and_then(|r| r.try_id()).is_some())
+}
+
+/// Whether a submodule git directory under `modules` (a repo's
+/// `.git/modules`, or a submodule's own, for nested submodules) holds commits
+/// none of that submodule's remotes have — or can't be read well enough to
+/// say it doesn't.
+///
+/// A submodule's git directory is named after the submodule, and a name may
+/// contain slashes, so a directory that isn't a git directory itself is
+/// searched for ones below it. Nothing here follows symlinks: what a drop
+/// deletes is what is physically inside `.git`.
+fn modules_hold_unpublished_work(modules: &Path) -> bool {
+    let entries = match std::fs::read_dir(modules) {
+        Ok(entries) => entries,
+        // No submodule was ever initialized here
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        // A directory that can't be listed may hold anything
+        Err(_) => return true,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        let held = if path.join("HEAD").is_file() {
+            let unpublished = match gix::open(&path) {
+                Ok(submodule) => unpublished_work(&submodule),
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "Failed to open submodule");
+                    Unpublished::Unreadable
+                }
+            };
+            !matches!(unpublished, Unpublished::None)
+                || modules_hold_unpublished_work(&path.join("modules"))
+        } else {
+            modules_hold_unpublished_work(&path)
+        };
+        if held {
+            return true;
+        }
+    }
+    false
 }
 
 /// Format a SystemTime as a human-readable "time ago" string
@@ -1872,6 +1929,17 @@ impl Workspace {
                 report
                     .skipped
                     .push((relative_path, DropBlocker::Unpublished));
+                return Ok(());
+            }
+
+            // A submodule's commits live in its git directory under the
+            // parent's `.git/modules`, which the status above never looks
+            // into. The library keeps that directory; deleting destroys it.
+            if delete && modules_hold_unpublished_work(&repo.join(".git").join("modules")) {
+                debug!(repo = %repo.display(), "Refusing to delete repository whose submodule holds unpushed commits");
+                report
+                    .skipped
+                    .push((relative_path, DropBlocker::SubmoduleUnpublished));
                 return Ok(());
             }
 
@@ -4365,6 +4433,77 @@ mod tests {
         let pattern = "empty".parse::<RepoPattern>().unwrap();
         let report = workspace.drop(&pattern, true, false).unwrap();
         assert_eq!(report.dropped, vec!["empty".to_string()]);
+    }
+
+    /// A submodule's commits live in its git directory under the parent's
+    /// `.git/modules`, where the parent's status never looks: a branch made
+    /// inside a submodule left the parent reading clean, and `--delete`
+    /// destroyed the only copy of it without asking for `--force`.
+    #[test]
+    fn delete_refuses_a_repo_whose_submodule_holds_unpushed_commits() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        // The submodule's upstream, with one published commit
+        let upstream = temp_dir.path().join("upstream");
+        repo_with_a_commit(&upstream);
+
+        let repo = workspace.path.join("parent");
+        repo_with_a_remote(temp_dir.path(), &repo);
+        git(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                &upstream.to_string_lossy(),
+                "vendor/sub",
+            ],
+        );
+        git(&repo, &["commit", "--quiet", "-m", "add submodule"]);
+        git(&repo, &["push", "--quiet", "origin", "main"]);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
+
+        // A submodule holding only what its remote has is no obstacle
+        let pattern = "parent".parse::<RepoPattern>().unwrap();
+        assert!(!modules_hold_unpublished_work(&repo.join(".git/modules")));
+
+        // A branch committed to inside the submodule and left behind, so the
+        // submodule is back at the commit the parent records
+        let sub = repo.join("vendor/sub");
+        git(&sub, &["config", "user.name", "workset"]);
+        git(&sub, &["config", "user.email", "workset@example.com"]);
+        git(&sub, &["checkout", "--quiet", "-b", "work"]);
+        git(
+            &sub,
+            &["commit", "--quiet", "--allow-empty", "-m", "only here"],
+        );
+        git(&sub, &["checkout", "--quiet", "--detach", "HEAD~1"]);
+        assert_eq!(check_repo_status(&repo), RepoStatus::Clean);
+
+        let report = workspace.drop(&pattern, true, false).unwrap();
+        assert!(report.dropped.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![("parent".to_string(), DropBlocker::SubmoduleUnpublished)]
+        );
+        assert!(repo.join(".git/modules").is_dir());
+
+        // A plain drop keeps the submodule's git directory in the library
+        let report = workspace.drop(&pattern, false, false).unwrap();
+        assert_eq!(report.dropped, vec!["parent".to_string()]);
+        workspace.restore_from_library("parent").unwrap();
+        assert!(repo.join(".git/modules/vendor/sub").is_dir());
+
+        // --force is how you say you meant to delete it
+        let report = workspace.drop(&pattern, true, true).unwrap();
+        assert_eq!(report.dropped, vec!["parent".to_string()]);
+        assert!(!repo.exists());
     }
 
     /// A repo dropped into the library, then replaced in the workspace by a

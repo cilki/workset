@@ -162,7 +162,10 @@ the parent's working tree, which the drop deletes. A round trip therefore brings
 the submodule's history back and leaves its directory empty, and neither `list`
 nor `git status` in the parent points that out — both call the repo clean.
 `git submodule update` fills the directory in again from the git directory that
-came back, without fetching anything:
+came back, without fetching anything. Because that git directory is the only
+place a branch or stash you made inside the submodule lives, `--delete` keeps
+the repo (`a submodule holds unpushed commits`) while any submodule holds
+commits its remotes don't, unless you pass `--force` as well:
 
 ```sh
 ❯ git -C github.com/jqlang/jq submodule update --init
