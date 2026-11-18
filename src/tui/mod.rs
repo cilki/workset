@@ -52,14 +52,6 @@ const WATCHER_SYNC_COOLDOWN: Duration = Duration::from_secs(2);
 /// Below this terminal width only the active panel is shown (Tab toggles)
 const SINGLE_PANEL_THRESHOLD: u16 = 80;
 
-enum Action {
-    None,
-    OpenShell(PathBuf),
-    DropToLibrary(Vec<String>),
-    RestoreFromLibrary(Vec<String>),
-    RefreshData,
-}
-
 /// Results streamed from the background repo scan
 enum LoadEvent {
     /// Fast filesystem enumeration finished: placeholder rows for every repo,
@@ -391,7 +383,9 @@ struct BackgroundTasks {
     loader: Option<RepoLoader>,
     /// Delivers the file watcher once its (potentially slow) recursive
     /// registration of the workspace tree completes
-    watcher: Option<mpsc::Receiver<Result<FileWatcher, notify::Error>>>,
+    watcher_starting: Option<mpsc::Receiver<Result<FileWatcher, notify::Error>>>,
+    /// The file watcher, once registered
+    watcher: Option<FileWatcher>,
     /// Fetches each repo's remotes and refreshes its status
     sync: SyncManager,
     /// Computes info-panel details for the selected repo
@@ -502,11 +496,10 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 Duration::from_millis(500),
             ));
         });
-        let mut file_watcher: Option<FileWatcher> = None;
-
         let mut background = BackgroundTasks {
             loader: Some(RepoLoader::start(workspace, Vec::new(), Vec::new(), true)),
-            watcher: Some(watcher_rx),
+            watcher_starting: Some(watcher_rx),
+            watcher: None,
             sync: SyncManager::new(),
             details: DetailsLoader::new(),
         };
@@ -517,77 +510,16 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         // held the scan back and left the screen blank for as long as it took
         // to give up. The query still has to happen before the event loop
         // reads stdin, since it reads the replies off stdin itself.
-        terminal
-            .draw(|f| ui(f, &mut app))
-            .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
+        draw(&mut terminal, &mut app)?;
         let picker = graphics.get_or_insert_with(graphics_picker);
         // Rebuilt each time around: the protocol carries the state of what is
         // currently on screen, and leaving the alternate screen for a shell
         // takes the image with it
         app.help_image = build_help_image(picker);
 
-        // Handle actions without tearing down the terminal, until one leaves
-        // it: quitting (`None`) or opening a shell in a repo (`Some(path)`)
-        let mut session = || -> Result<Option<PathBuf>> {
-            loop {
-                match run_app(&mut terminal, &mut app, &mut file_watcher, &mut background)? {
-                    Action::None => {
-                        // Stop in-flight sync jobs between git invocations
-                        background.sync.interrupt.store(true, Ordering::Relaxed);
-                        background.details.interrupt.store(true, Ordering::Relaxed);
-
-                        // Drain any pending events before cleanup to avoid issues
-                        while event::poll(Duration::from_millis(0))? {
-                            let _ = event::read()?;
-                        }
-                        return Ok(None);
-                    }
-                    Action::OpenShell(path) => return Ok(Some(path)),
-                    Action::DropToLibrary(repo_paths) => {
-                        run_repo_operation(
-                            &mut terminal,
-                            &mut app,
-                            &repo_paths,
-                            RepoOperationStatus::Dropping,
-                            |repo_path| {
-                                // Tree paths are already workspace-relative paths,
-                                // so they name their repo verbatim rather than
-                                // being read as a clone URL
-                                let pattern = RepoPattern::from_relative_path(repo_path);
-                                // A repo left in place (uncommitted or unpushed
-                                // changes) is a failure as far as the UI is
-                                // concerned, so the row says why instead of
-                                // silently reporting success
-                                let report = workspace.drop(&pattern, false, false)?;
-                                match report.skipped.first() {
-                                    Some((_, blocker)) => bail!("{blocker}"),
-                                    None => Ok(()),
-                                }
-                            },
-                        )?;
-                        background.reload(&app, workspace);
-                    }
-                    Action::RestoreFromLibrary(repo_paths) => {
-                        run_repo_operation(
-                            &mut terminal,
-                            &mut app,
-                            &repo_paths,
-                            RepoOperationStatus::Restoring,
-                            |repo_path| workspace.restore_from_library(repo_path),
-                        )?;
-                        background.reload(&app, workspace);
-                    }
-                    Action::RefreshData => {
-                        // Filesystem changed - reload repository data in the background
-                        background.reload(&app, workspace);
-                        if let Some(watcher) = file_watcher.as_mut() {
-                            watcher.drain_pending();
-                        }
-                    }
-                }
-            }
-        };
-        let outcome = session();
+        // Runs until the user leaves the terminal: quitting (`None`) or
+        // opening a shell in a repo (`Some(path)`)
+        let outcome = run_app(&mut terminal, &mut app, workspace, &mut background);
 
         // Restore the terminal however the session ended. An error used to
         // skip this and leave the shell it returns to in raw mode on the
@@ -631,13 +563,6 @@ fn run_repo_operation<B: ratatui::backend::Backend>(
     in_progress: RepoOperationStatus,
     mut operation: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    let draw = |terminal: &mut Terminal<B>, app: &mut App| -> Result<()> {
-        terminal
-            .draw(|f| ui(f, app))
-            .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
-        Ok(())
-    };
-
     for repo_path in repo_paths {
         app.update_repo_status(repo_path, in_progress.clone());
         draw(terminal, app)?;
@@ -656,6 +581,54 @@ fn run_repo_operation<B: ratatui::backend::Backend>(
     std::thread::sleep(Duration::from_millis(500));
 
     Ok(())
+}
+
+/// Drop each of the workspace repos at the given tree paths into the library
+fn drop_to_library<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    workspace: &Workspace,
+    repo_paths: &[String],
+) -> Result<()> {
+    run_repo_operation(
+        terminal,
+        app,
+        repo_paths,
+        RepoOperationStatus::Dropping,
+        |repo_path| {
+            // Tree paths are already workspace-relative paths, so they name
+            // their repo verbatim rather than being read as a clone URL
+            let pattern = RepoPattern::from_relative_path(repo_path);
+            // A repo left in place (uncommitted or unpushed changes) is a
+            // failure as far as the UI is concerned, so the row says why
+            // instead of silently reporting success
+            let report = workspace.drop(&pattern, false, false)?;
+            match report.skipped.first() {
+                Some((_, blocker)) => bail!("{blocker}"),
+                None => Ok(()),
+            }
+        },
+    )
+}
+
+fn draw<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+    terminal
+        .draw(|f| ui(f, app))
+        .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
+    Ok(())
+}
+
+/// Leave the event loop: stop the background jobs and discard the input
+/// nobody will read
+fn quit(background: &BackgroundTasks) -> Result<Option<PathBuf>> {
+    // Stop in-flight sync jobs between git invocations
+    background.sync.interrupt.store(true, Ordering::Relaxed);
+    background.details.interrupt.store(true, Ordering::Relaxed);
+
+    while event::poll(Duration::from_millis(0))? {
+        let _ = event::read()?;
+    }
+    Ok(None)
 }
 
 /// What the event loop should do with a key before any mode looks at it
@@ -686,26 +659,28 @@ fn classify_key(key: &event::KeyEvent) -> KeyBinding {
     }
 }
 
+/// Run the event loop until the user quits (`None`) or asks for a shell in a
+/// repo (`Some(path)`)
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    file_watcher: &mut Option<FileWatcher>,
+    workspace: &Workspace,
     background: &mut BackgroundTasks,
-) -> Result<Action> {
+) -> Result<Option<PathBuf>> {
     loop {
         // Apply results from background work before drawing
-        if let Some(rx) = &background.watcher {
+        if let Some(rx) = &background.watcher_starting {
             match rx.try_recv() {
                 Ok(Ok(watcher)) => {
-                    *file_watcher = Some(watcher);
-                    background.watcher = None;
+                    background.watcher = Some(watcher);
+                    background.watcher_starting = None;
                 }
                 Ok(Err(_)) => {
                     app.watch_disabled = true;
-                    background.watcher = None;
+                    background.watcher_starting = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => background.watcher = None,
+                Err(mpsc::TryRecvError::Disconnected) => background.watcher_starting = None,
             }
         }
         if let Some(loader) = background.loader.as_mut()
@@ -713,7 +688,7 @@ fn run_app<B: ratatui::backend::Backend>(
         {
             background.loader = None;
             // Drain events generated by the scan to prevent a feedback loop
-            if let Some(watcher) = file_watcher.as_mut() {
+            if let Some(watcher) = background.watcher.as_mut() {
                 watcher.drain_pending();
             }
         }
@@ -726,20 +701,21 @@ fn run_app<B: ratatui::backend::Backend>(
         background.details.note_selection(app);
         background.details.pump(app);
 
-        terminal
-            .draw(|f| ui(f, app))
-            .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
+        draw(terminal, app)?;
 
         // Check for filesystem changes. Remote-tracking ref updates (e.g. a
         // push from another terminal) trigger a sync check for that repo;
         // worktree changes trigger a reload unless one is already running
-        if let Some(watcher) = file_watcher.as_mut() {
+        if let Some(watcher) = background.watcher.as_mut() {
             let signals = watcher.poll();
             background
                 .sync
                 .request_watcher_syncs(signals.refs_changed, app);
             if signals.refresh && background.loader.is_none() {
-                return Ok(Action::RefreshData);
+                background.reload(app, workspace);
+                if let Some(watcher) = background.watcher.as_mut() {
+                    watcher.drain_pending();
+                }
             }
         }
 
@@ -753,7 +729,7 @@ fn run_app<B: ratatui::backend::Backend>(
             let code = match classify_key(&key) {
                 // Ctrl+C quits from any mode, including the help overlay and
                 // the search and clone prompts
-                KeyBinding::Quit => return Ok(Action::None),
+                KeyBinding::Quit => return quit(background),
                 // Every other binding is the bare character, so a modified one
                 // is not it: Ctrl+D is not 'd' and must not drop the selection
                 KeyBinding::Ignored => continue,
@@ -782,17 +758,15 @@ fn run_app<B: ratatui::backend::Backend>(
                         {
                             let repo_paths = node.collect_repo_paths();
                             if !repo_paths.is_empty() {
-                                return Ok(Action::DropToLibrary(repo_paths));
+                                drop_to_library(terminal, app, workspace, &repo_paths)?;
+                                background.reload(app, workspace);
                             }
                         }
                     }
                     KeyCode::Right | KeyCode::Left => {
                         app.toggle_expand();
                     }
-                    KeyCode::Esc => {
-                        // Return None to exit - cleanup happens in the outer loop
-                        return Ok(Action::None);
-                    }
+                    KeyCode::Esc => return quit(background),
                     KeyCode::Tab => {
                         // Tab switches between workspace and library
                         app.switch_section();
@@ -813,14 +787,19 @@ fn run_app<B: ratatui::backend::Backend>(
                         if let Some((repo_dir, repo_paths)) = selected {
                             match app.active_section {
                                 Section::Workspace => match repo_dir {
-                                    Some(path) => return Ok(Action::OpenShell(path)),
+                                    Some(path) => return Ok(Some(path)),
                                     None => app.toggle_expand(),
                                 },
+                                Section::Library if repo_paths.is_empty() => app.toggle_expand(),
                                 Section::Library => {
-                                    if !repo_paths.is_empty() {
-                                        return Ok(Action::RestoreFromLibrary(repo_paths));
-                                    }
-                                    app.toggle_expand();
+                                    run_repo_operation(
+                                        terminal,
+                                        app,
+                                        &repo_paths,
+                                        RepoOperationStatus::Restoring,
+                                        |repo_path| workspace.restore_from_library(repo_path),
+                                    )?;
+                                    background.reload(app, workspace);
                                 }
                             }
                         }
