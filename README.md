@@ -348,7 +348,8 @@ paths. `?` toggles an overlay listing the keybindings for the panel you're in.
 library to drop; the overlay leaves the row out while the library has focus.
 
 `Enter` on a workspace repo hands the terminal to `$SHELL` in that repo's
-directory; leaving the shell comes back to the TUI. `d` is held to the same rule
+directory; leaving the shell comes back to the TUI as you left it — same
+selection, same filter — with every repo rescanned. `d` is held to the same rule
 as `workset drop`, so a repo with uncommitted changes or unpushed commits stays
 where it is and its row says which. Cloning is `workset clone` and has no key of
 its own.

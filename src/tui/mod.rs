@@ -319,6 +319,14 @@ impl SyncManager {
         self.request_sync(path, false);
     }
 
+    /// Treat the current selection as new, and forget which repos were
+    /// fetched recently, so the selection is fetched once it rests again
+    fn forget_selection(&mut self) {
+        self.last_selection = None;
+        self.selection_pending = None;
+        self.recently_synced.clear();
+    }
+
     /// Spawn queued jobs up to the concurrency cap
     fn pump(&mut self) {
         while self.in_flight.len() < MAX_CONCURRENT_SYNCS {
@@ -393,16 +401,35 @@ struct BackgroundTasks {
 }
 
 impl BackgroundTasks {
-    /// Kick off a non-progressive background rescan, seeding it with the app's
-    /// current rows so they keep their data while being refreshed.
+    /// Kick off a background rescan, seeding it with the app's current rows so
+    /// they keep their data while being refreshed.
+    ///
+    /// A rescan replacing the initial load stays progressive: only a
+    /// progressive scan clears the title's progress counter when it finishes,
+    /// so taking that over quietly would leave the counter on screen for good.
     fn reload(&mut self, app: &App, workspace: &Workspace) {
+        let progressive = self
+            .loader
+            .as_ref()
+            .is_some_and(|loader| loader.progressive);
         let (seed_workspace, seed_library) = app.repo_snapshot();
         self.loader = Some(RepoLoader::start(
             workspace,
             seed_workspace,
             seed_library,
-            false,
+            progressive,
         ));
+    }
+
+    /// Pick up where the session left off after the user's shell exits.
+    ///
+    /// Anything may have changed while the shell ran — commits made, branches
+    /// pushed, repos cloned or deleted by hand — so every row is rescanned,
+    /// and the selected repo is fetched again as it would be on startup
+    /// rather than waiting out a cooldown that was started before the shell.
+    fn resume_after_shell(&mut self, app: &App, workspace: &Workspace) {
+        self.reload(app, workspace);
+        self.sync.forget_selection();
     }
 }
 
@@ -473,6 +500,35 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
     // matter how often the shell is opened and the terminal rebuilt around it
     let mut graphics: Option<Picker> = None;
 
+    // Create app with empty data; repos stream in from the background loader.
+    //
+    // The app and its background work outlive the terminal, which is torn
+    // down and rebuilt around every shell the user opens: building them anew
+    // each time around put the user back at the top of a freshly loading
+    // list, with the filter they had typed, the panel they were in and the
+    // repo they had just been working in all forgotten.
+    let mut app = App::new(workspace.path.display().to_string(), Vec::new(), Vec::new());
+    app.loading_progress = Some("loading...".to_string());
+
+    // Setup the debounced filesystem watcher on a background thread, since
+    // recursively registering a large workspace can take a while and would
+    // delay the first frame
+    let workspace_path = workspace.path.clone();
+    let (watcher_tx, watcher_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = watcher_tx.send(FileWatcher::new(
+            &workspace_path,
+            Duration::from_millis(500),
+        ));
+    });
+    let mut background = BackgroundTasks {
+        loader: Some(RepoLoader::start(workspace, Vec::new(), Vec::new(), true)),
+        watcher_starting: Some(watcher_rx),
+        watcher: None,
+        sync: SyncManager::new(),
+        details: DetailsLoader::new(),
+    };
+
     loop {
         // Setup terminal FIRST so we can show progress
         enable_raw_mode()?;
@@ -480,29 +536,6 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
-
-        // Create app with empty data; repos stream in from the background loader
-        let mut app = App::new(workspace.path.display().to_string(), Vec::new(), Vec::new());
-        app.loading_progress = Some("loading...".to_string());
-
-        // Setup the debounced filesystem watcher on a background thread, since
-        // recursively registering a large workspace can take a while and would
-        // delay the first frame
-        let workspace_path = workspace.path.clone();
-        let (watcher_tx, watcher_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = watcher_tx.send(FileWatcher::new(
-                &workspace_path,
-                Duration::from_millis(500),
-            ));
-        });
-        let mut background = BackgroundTasks {
-            loader: Some(RepoLoader::start(workspace, Vec::new(), Vec::new(), true)),
-            watcher_starting: Some(watcher_rx),
-            watcher: None,
-            sync: SyncManager::new(),
-            details: DetailsLoader::new(),
-        };
 
         // The scan is already running and the first frame is on screen before
         // anything is asked of the terminal: the graphics query waits for a
@@ -539,6 +572,8 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         std::process::Command::new(&shell)
             .current_dir(&path)
             .status()?;
+
+        background.resume_after_shell(&app, workspace);
     }
 }
 
@@ -2050,5 +2085,54 @@ mod tests {
         assert!(mgr.selection_pending.is_none());
         mgr.pump_selection(false);
         assert!(mgr.queue.is_empty());
+    }
+
+    #[test]
+    fn sync_manager_refetches_the_selection_after_the_shell() {
+        let backdate = |by: Duration| Instant::now().checked_sub(by).expect("clock too young");
+        let mut mgr = SyncManager::new();
+        let repo = PathBuf::from("ws/repo");
+
+        // The selection was fetched just before the user opened a shell in it
+        mgr.last_selection = Some(repo.clone());
+        mgr.recently_synced.insert(repo.clone(), Instant::now());
+
+        // Back from the shell, the same row is fetched again once it rests,
+        // although it is still selected and its cooldown hasn't run out
+        mgr.forget_selection();
+        mgr.note_selection(Some(repo.clone()));
+        assert!(mgr.selection_pending.is_some());
+        mgr.selection_pending = Some((repo.clone(), backdate(SELECTION_SYNC_DEBOUNCE)));
+        mgr.pump_selection(false);
+        assert_eq!(mgr.queue.iter().collect::<Vec<_>>(), vec![&repo]);
+    }
+
+    #[test]
+    fn rescan_during_the_initial_load_still_clears_the_progress_counter() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace {
+            path: temp.path().to_path_buf(),
+        };
+        std::fs::create_dir_all(workspace.library_path()).unwrap();
+
+        let mut app = App::new(workspace.path.display().to_string(), Vec::new(), Vec::new());
+        app.loading_progress = Some("loading...".to_string());
+        let mut background = BackgroundTasks {
+            loader: Some(RepoLoader::start(&workspace, Vec::new(), Vec::new(), true)),
+            watcher_starting: None,
+            watcher: None,
+            sync: SyncManager::new(),
+            details: DetailsLoader::new(),
+        };
+
+        // The user comes back from a shell (or drops a repo) before the
+        // initial scan is done, and the rescan takes its place
+        background.resume_after_shell(&app, &workspace);
+
+        let loader = background.loader.as_mut().unwrap();
+        while loader.poll(&mut app) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.loading_progress, None);
     }
 }
