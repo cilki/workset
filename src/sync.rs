@@ -524,7 +524,8 @@ fn run_git(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| spawn_error(e, repo_path))?;
 
     // Drain pipes on separate threads so a chatty child can't fill the pipe
     // buffer and deadlock against try_wait polling
@@ -566,9 +567,60 @@ fn run_git(
     })
 }
 
+/// Say what kept a git command from starting.
+///
+/// Spawning fails with the same bare "No such file or directory" whether the
+/// `git` program is missing or the directory the command runs in is, and the
+/// TUI shows that text as the row's sync failure. workset's own commands use
+/// gitoxide and never need the `git` program, so a workspace can be set up
+/// and used for a long time before the TUI's first fetch finds it missing —
+/// and the error should say that, not leave the user to guess which file was
+/// not there.
+fn spawn_error(error: std::io::Error, repo_path: &Path) -> anyhow::Error {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return anyhow::anyhow!("could not run git: {}", error);
+    }
+    if !repo_path.is_dir() {
+        return anyhow::anyhow!("{} no longer exists", repo_path.display());
+    }
+    anyhow::anyhow!("git is not installed (no 'git' program on PATH)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing `git` and a missing repo directory both make the spawn fail
+    /// with NotFound; each has to be reported as what it is
+    #[test]
+    fn spawn_failure_names_what_is_missing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let not_found = || std::io::Error::from(std::io::ErrorKind::NotFound);
+
+        let message = spawn_error(not_found(), temp.path()).to_string();
+        assert_eq!(message, "git is not installed (no 'git' program on PATH)");
+
+        let gone = temp.path().join("gone");
+        let message = spawn_error(not_found(), &gone).to_string();
+        assert_eq!(message, format!("{} no longer exists", gone.display()));
+
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = spawn_error(denied, temp.path()).to_string();
+        assert!(message.starts_with("could not run git: "), "{}", message);
+    }
+
+    /// The real spawn path: a sync of a directory that is gone (a drop that
+    /// raced the fetch) names the directory rather than claiming git is gone
+    #[test]
+    fn sync_of_a_vanished_repo_says_so() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gone = temp.path().join("gone");
+        let error = sync_repo(&gone, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("{} no longer exists", gone.display())
+        );
+    }
 
     fn branch(name: &str, local: Option<&str>, remotes: &[(&str, Option<&str>)]) -> RefState {
         RefState {
