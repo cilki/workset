@@ -267,6 +267,23 @@ testDropRefusesLinkedWorktree() {
 	git -C feature status >/dev/null
 }
 
+## A linked worktree whose repo was deleted is still refused, but not by
+## sending the user to drop a repository that no longer exists
+testDropRefusesOrphanedWorktree() {
+	newWorkspace
+	createRepo main-repo 1
+	git -C main-repo worktree add -q ../feature -b feature
+	echo "only here" >feature/work.txt
+	rm -rf main-repo
+
+	for flags in "" "--force" "--delete --force"; do
+		output=$(workset drop $flags feature 2>&1) && exit 1
+		echo "$output" | grep -- "feature - ⚠ kept (the git directory its .git file names is gone, move out any files you need"
+	done
+
+	[ "$(cat feature/work.txt)" = "only here" ]
+}
+
 ## Dropping the main worktree would move the git directory every linked
 ## worktree reads through into the library, breaking each of them in place
 testDropRefusesMainWorktreeWithLinkedWorktrees() {

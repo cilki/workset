@@ -719,6 +719,13 @@ pub enum DropBlocker {
     /// that's gone.
     BorrowedGitDir,
 
+    /// `.git` is a `gitdir:` file like the one `BorrowedGitDir` describes, but
+    /// the git directory it names isn't there: the repo a worktree was added
+    /// from, or the superproject a submodule was checked out by, was deleted
+    /// or moved and left this behind. There is no other repository to drop
+    /// instead, and nothing of a git directory here for the library to hold.
+    OrphanedGitDir,
+
     /// `.git` is a symlink, which git accepts as a repository: the git
     /// directory is whatever the link points at, which is not in this repo
     /// and need not even be in the workspace.
@@ -756,6 +763,7 @@ impl DropBlocker {
                 "move this repo to another path, or use --delete to discard it"
             }
             Self::BorrowedGitDir => "drop that repository instead",
+            Self::OrphanedGitDir => "move out any files you need and remove the directory yourself",
             Self::LinkedGitDir => "replace the link with the git directory it points at",
             Self::MainWorktree(1) => "remove it with 'git worktree remove' first",
             Self::MainWorktree(_) => "remove them with 'git worktree remove' first",
@@ -779,6 +787,7 @@ impl std::fmt::Display for DropBlocker {
                 f.write_str("the library holds a repo at a directory above this path")
             }
             Self::BorrowedGitDir => f.write_str("git directory belongs to another repository"),
+            Self::OrphanedGitDir => f.write_str("the git directory its .git file names is gone"),
             Self::LinkedGitDir => f.write_str("git directory is a symlink to somewhere else"),
             Self::MainWorktree(1) => f.write_str("git directory shared with 1 linked worktree"),
             Self::MainWorktree(count) => {
@@ -836,8 +845,18 @@ fn worktree_blocker(repo: &Path) -> Option<DropBlocker> {
     // file and fails with a bare ENOTDIR, which in a `workset drop` with no
     // pattern abandoned the whole request; `--delete` skips the library and
     // deletes the worktree while the owner keeps its registration.
+    //
+    // Whether that repository is still there decides what the user can do
+    // about it: telling them to "drop that repository instead" when it was
+    // deleted long ago sends them looking for a repo that doesn't exist.
     if git_kind.is_file() {
-        return Some(DropBlocker::BorrowedGitDir);
+        return Some(
+            if gitdir_file_target(&git_path).is_some_and(|dir| dir.is_dir()) {
+                DropBlocker::BorrowedGitDir
+            } else {
+                DropBlocker::OrphanedGitDir
+            },
+        );
     }
 
     // The third shape: `.git` is a symlink to a git directory, which git
@@ -872,6 +891,18 @@ fn worktree_blocker(repo: &Path) -> Option<DropBlocker> {
         0 => None,
         count => Some(DropBlocker::MainWorktree(count)),
     }
+}
+
+/// The git directory a `gitdir: <path>` file names, or `None` when the file
+/// can't be read or isn't one. git resolves a relative path against the
+/// directory holding the file, which is how it writes a submodule's.
+fn gitdir_file_target(git_file: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(git_file).ok()?;
+    let target = contents.lines().next()?.strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some(git_file.parent()?.join(target))
 }
 
 /// How many linked worktrees are still using the given git directory.
@@ -3044,6 +3075,60 @@ mod tests {
             );
             assert!(worktree.join(".git").is_file());
         }
+    }
+
+    /// A worktree outlives the repo it was added from when that repo is
+    /// deleted. It is still refused — its git directory is just as absent —
+    /// but not with "drop that repository instead": there is no repository
+    /// left to drop, and the user went looking for one.
+    #[test]
+    fn drop_says_a_worktree_whose_repo_is_gone_is_orphaned() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+
+        let main_repo = workspace.path.join("main");
+        fs::create_dir_all(&main_repo).unwrap();
+        gix::init(&main_repo).unwrap();
+        let worktree = workspace.path.join("feature");
+        add_linked_worktree(&main_repo, &worktree, "feature");
+        fs::write(worktree.join("work.txt"), "only here").unwrap();
+        fs::remove_dir_all(&main_repo).unwrap();
+
+        // A submodule's `.git` file names its git directory relative to
+        // itself, and one that resolves to nothing is orphaned the same way
+        let submodule = workspace.path.join("sub");
+        fs::create_dir_all(&submodule).unwrap();
+        fs::write(submodule.join(".git"), "gitdir: ../gone/.git/modules/sub\n").unwrap();
+
+        for (name, git_file) in [("feature", &worktree), ("sub", &submodule)] {
+            let pattern = name.parse::<RepoPattern>().unwrap();
+            for (delete, force) in [(false, false), (false, true), (true, true)] {
+                let report = workspace.drop(&pattern, delete, force).unwrap();
+                assert!(report.dropped.is_empty());
+                assert_eq!(
+                    report.skipped,
+                    vec![(name.to_string(), DropBlocker::OrphanedGitDir)]
+                );
+                assert!(git_file.join(".git").is_file());
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(worktree.join("work.txt")).unwrap(),
+            "only here"
+        );
+
+        // A relative gitdir that does resolve is still another repo's
+        fs::create_dir_all(workspace.path.join("gone/.git/modules/sub")).unwrap();
+        let report = workspace
+            .drop(&"sub".parse::<RepoPattern>().unwrap(), false, false)
+            .unwrap();
+        assert_eq!(
+            report.skipped,
+            vec![("sub".to_string(), DropBlocker::BorrowedGitDir)]
+        );
     }
 
     /// A repo whose `.git` is a symlink is an ordinary repository to git, and
