@@ -178,13 +178,42 @@ fn for_each_pattern(
         match action(requested) {
             Ok(done) => succeeded &= done,
             Err(e) => {
-                eprintln!("Failed to {} '{}': {:#}", verb, quote_path(requested), e);
+                eprintln!(
+                    "Failed to {} '{}': {}",
+                    verb,
+                    quote_path(requested),
+                    error_chain(&e)
+                );
                 succeeded = false;
             }
         }
     }
 
     succeeded
+}
+
+/// An error and the causes behind it, each said once.
+///
+/// anyhow's `{:#}` appends every source's message to its parent's, which
+/// assumes a parent never mentions its source itself. gix's errors do, so a
+/// failed clone printed each cause twice over —
+/// `Transport handshake failed: Didn't find '…' header …: Didn't find '…'
+/// header …` — burying the one line the user needed under its own echo. A
+/// cause whose message the text so far already ends with adds nothing and is
+/// left out.
+fn error_chain(error: &anyhow::Error) -> String {
+    let mut message = String::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if message.ends_with(&text) {
+            continue;
+        }
+        if !message.is_empty() {
+            message.push_str(": ");
+        }
+        message.push_str(&text);
+    }
+    message
 }
 
 /// Every repo checked out in the workspace, as its workspace-relative path
@@ -1066,6 +1095,40 @@ mod tests {
         std::fs::create_dir_all(workspace.library_path().join("github.com/user/stored")).unwrap();
         gix::init_bare(workspace.library_path().join("github.com/user/stored")).unwrap();
         workspace
+    }
+
+    /// An error that, like gix's, repeats its source's message in its own
+    #[derive(Debug)]
+    struct Echoing(std::io::Error);
+
+    impl std::fmt::Display for Echoing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Transport handshake failed: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Echoing {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn an_error_chain_says_each_cause_once() {
+        let echoing = anyhow::Error::new(Echoing(std::io::Error::other("host unreachable")));
+        assert_eq!(
+            error_chain(&echoing),
+            "Transport handshake failed: host unreachable"
+        );
+
+        // Causes that don't repeat themselves are all still said, in order
+        let layered = anyhow::anyhow!("dns lookup failed")
+            .context("could not connect")
+            .context("fetch origin");
+        assert_eq!(
+            error_chain(&layered),
+            "fetch origin: could not connect: dns lookup failed"
+        );
     }
 
     /// The candidate words for the given line, as fish gets them: everything
