@@ -545,8 +545,9 @@ fn check_out_worktree(worktree: &Path, git_dir: &Path) -> Result<()> {
 
     // The index is what tells every later status check that the worktree
     // matches the commit it was checked out from; without it the whole
-    // worktree reads as untracked.
-    index.write(Default::default())?;
+    // worktree reads as untracked. It is written with the permissions the
+    // repo's `core.sharedRepository` asks for, as git would write it.
+    index.write(Default::default(), repo.refs.shared_repository_permissions)?;
     Ok(())
 }
 
