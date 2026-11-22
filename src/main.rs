@@ -112,6 +112,9 @@ enum BadArg {
     Unrecognized(String),
     /// The empty string, which names no repo at all
     Empty,
+    /// A non-empty argument that parses to the empty pattern, and so names no
+    /// repo either: a bare scheme, blank space, a lone `/`
+    NamesNothing(String),
 }
 
 impl std::fmt::Display for BadArg {
@@ -124,6 +127,9 @@ impl std::fmt::Display for BadArg {
                 write!(f, "Unrecognized argument: {}", quote_path(arg))
             }
             Self::Empty => write!(f, "Empty repository pattern"),
+            Self::NamesNothing(arg) => {
+                write!(f, "'{}' names no repository", quote_path(arg))
+            }
         }
     }
 }
@@ -147,6 +153,13 @@ impl std::fmt::Display for BadArg {
 /// restore ""` checked the whole library back out. A pattern that was given has
 /// to name something; the bare `workset drop` is how you ask for everything
 /// under the current directory.
+///
+/// The empty string is not the only spelling of the empty pattern, though. A
+/// pattern is read as a clone URL, and the URL syntax around it comes off —
+/// the scheme, the whitespace, the slashes — so `"https://$repo"` with `repo`
+/// unset, a blank `" "`, or a lone `/` all came out as the empty pattern and
+/// took the whole working set or library just the same. An argument is
+/// refused when what it parses to names nothing, whatever it was spelled as.
 fn free_args(args: pico_args::Arguments) -> std::result::Result<Vec<String>, BadArg> {
     args.finish()
         .into_iter()
@@ -156,11 +169,19 @@ fn free_args(args: pico_args::Arguments) -> std::result::Result<Vec<String>, Bad
                 Err(BadArg::Unrecognized(arg))
             } else if arg.is_empty() {
                 Err(BadArg::Empty)
+            } else if names_nothing(&arg) {
+                Err(BadArg::NamesNothing(arg))
             } else {
                 Ok(arg)
             }
         })
         .collect()
+}
+
+/// Whether `arg`, read as a repo pattern, comes out as the empty one
+fn names_nothing(arg: &str) -> bool {
+    let Ok(pattern) = arg.parse::<workset::RepoPattern>();
+    pattern.full_path().is_empty()
 }
 
 /// Run `action` over every pattern the user named, reporting a pattern that
@@ -1183,6 +1204,42 @@ mod tests {
             BadArg::Empty.to_string(),
             "Empty repository pattern".to_string()
         );
+    }
+
+    /// The URL syntax a pattern sheds can leave nothing behind, and an
+    /// argument that parses to the empty pattern is refused like the empty
+    /// string itself: `workset drop --delete --force "https://$repo"` with
+    /// `repo` unset used to destroy the whole working set, and `workset
+    /// restore https://` checked out the whole library.
+    #[test]
+    fn an_argument_that_parses_to_nothing_is_not_a_pattern() {
+        for arg in ["https://", "ssh://", "https:///", " ", "/", "//"] {
+            assert_eq!(
+                args_of(&[arg]),
+                Err(BadArg::NamesNothing(arg.to_string())),
+                "{arg:?}"
+            );
+            assert_eq!(
+                args_of(&["repo", arg]),
+                Err(BadArg::NamesNothing(arg.to_string()))
+            );
+        }
+        assert_eq!(
+            BadArg::NamesNothing("https://".to_string()).to_string(),
+            "'https://' names no repository"
+        );
+
+        // A pattern that does name something still gets through, however
+        // much of it is URL syntax — and so does the current directory
+        for arg in [
+            "https://github.com/user/repo",
+            "github.com/",
+            ".",
+            "./",
+            "../repo",
+        ] {
+            assert_eq!(args_of(&[arg]), Ok(vec![arg.to_string()]), "{arg:?}");
+        }
     }
 
     /// A flag nobody parsed is still reported as the argument it is, by name
