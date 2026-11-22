@@ -72,14 +72,17 @@ enum LoadEvent {
 /// from the app's previous data on a refresh, so it keeps its last known
 /// status, or bare on the initial load — and is replaced by the scanned row
 /// once a worker gets to that repo.
+///
+/// A scan reports its progress in the title only while the title is showing
+/// a progress counter at all — the initial load sets one — and clears it once
+/// it finishes, so a rescan that takes over the initial load takes the counter
+/// over with it.
 struct RepoLoader {
     rx: mpsc::Receiver<LoadEvent>,
     workspace: Vec<RepoInfo>,
     library: Vec<RepoInfo>,
     done: usize,
     total: usize,
-    /// Show a spinner with scan progress in the title (initial load)
-    progressive: bool,
 }
 
 impl RepoLoader {
@@ -87,7 +90,6 @@ impl RepoLoader {
         workspace: &Workspace,
         seed_workspace: Vec<RepoInfo>,
         seed_library: Vec<RepoInfo>,
-        progressive: bool,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let workspace = workspace.clone();
@@ -104,7 +106,6 @@ impl RepoLoader {
             library: mark_scanning(seed_library),
             done: 0,
             total: 0,
-            progressive,
         }
     }
 
@@ -147,12 +148,10 @@ impl RepoLoader {
                 std::mem::take(&mut self.workspace),
                 std::mem::take(&mut self.library),
             );
-            if self.progressive {
-                app.loading_progress = None;
-            }
+            app.loading_progress = None;
         } else if received {
             app.update_repos(self.workspace.clone(), self.library.clone());
-            if self.progressive {
+            if app.loading_progress.is_some() {
                 let spinner = SPINNER_FRAMES[self.done % SPINNER_FRAMES.len()];
                 app.loading_progress = Some(format!("{} {}/{}", spinner, self.done, self.total));
             }
@@ -403,22 +402,9 @@ struct BackgroundTasks {
 impl BackgroundTasks {
     /// Kick off a background rescan, seeding it with the app's current rows so
     /// they keep their data while being refreshed.
-    ///
-    /// A rescan replacing the initial load stays progressive: only a
-    /// progressive scan clears the title's progress counter when it finishes,
-    /// so taking that over quietly would leave the counter on screen for good.
     fn reload(&mut self, app: &App, workspace: &Workspace) {
-        let progressive = self
-            .loader
-            .as_ref()
-            .is_some_and(|loader| loader.progressive);
         let (seed_workspace, seed_library) = app.repo_snapshot();
-        self.loader = Some(RepoLoader::start(
-            workspace,
-            seed_workspace,
-            seed_library,
-            progressive,
-        ));
+        self.loader = Some(RepoLoader::start(workspace, seed_workspace, seed_library));
     }
 
     /// Pick up where the session left off after the user's shell exits.
@@ -522,7 +508,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         ));
     });
     let mut background = BackgroundTasks {
-        loader: Some(RepoLoader::start(workspace, Vec::new(), Vec::new(), true)),
+        loader: Some(RepoLoader::start(workspace, Vec::new(), Vec::new())),
         watcher_starting: Some(watcher_rx),
         watcher: None,
         sync: SyncManager::new(),
@@ -1763,7 +1749,6 @@ mod tests {
                 ),
             ],
             Vec::new(),
-            false,
         );
 
         while loader.poll(&mut app) {
@@ -2164,7 +2149,7 @@ mod tests {
         let mut app = App::new(workspace.path.display().to_string(), Vec::new(), Vec::new());
         app.loading_progress = Some("loading...".to_string());
         let mut background = BackgroundTasks {
-            loader: Some(RepoLoader::start(&workspace, Vec::new(), Vec::new(), true)),
+            loader: Some(RepoLoader::start(&workspace, Vec::new(), Vec::new())),
             watcher_starting: None,
             watcher: None,
             sync: SyncManager::new(),
