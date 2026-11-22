@@ -31,7 +31,7 @@ use ratatui::{
 use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -551,14 +551,14 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         app.help_image = build_help_image(picker);
 
         // Runs until the user leaves the terminal: quitting (`None`) or
-        // opening a shell in a repo (`Some(path)`)
+        // opening a shell in a repo (`Some((display_name, path))`)
         let outcome = run_app(&mut terminal, &mut app, workspace, &mut background);
 
         // Restore the terminal however the session ended. An error used to
         // skip this and leave the shell it returns to in raw mode on the
         // alternate screen, with the error message drawn into it.
         let restored = restore_terminal(&mut terminal);
-        let Some(path) = outcome? else {
+        let Some((display_name, path)) = outcome? else {
             return restored;
         };
         restored?;
@@ -569,11 +569,30 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
 
         // Spawn an interactive shell in the repository directory, then go
         // round again to rebuild the terminal once it exits
-        std::process::Command::new(&shell)
-            .current_dir(&path)
-            .status()?;
+        match run_shell(&shell, &path) {
+            Ok(()) => background.resume_after_shell(&app, workspace),
+            // A shell that never started is no reason to end the session: it
+            // used to take the whole TUI down with a bare "No such file or
+            // directory (os error 2)", naming neither the shell nor the repo.
+            // The row says what went wrong instead, like a failed drop does,
+            // and a rescan picks up a repo that is gone from under it.
+            Err(reason) => {
+                app.update_repo_status(&display_name, RepoOperationStatus::Failed(reason));
+                background.reload(&app, workspace);
+            }
+        }
+    }
+}
 
-        background.resume_after_shell(&app, workspace);
+/// Run `shell` interactively in `repo` until it exits. How the shell exits is
+/// the user's business; failing to start it is reported in terms of what was
+/// missing, since the OS error alone doesn't say whether that was the shell or
+/// the repo.
+fn run_shell(shell: &str, repo: &Path) -> std::result::Result<(), String> {
+    match std::process::Command::new(shell).current_dir(repo).status() {
+        Ok(_) => Ok(()),
+        Err(_) if !repo.is_dir() => Err("repo is no longer there".to_string()),
+        Err(e) => Err(format!("can't start shell {shell}: {e}")),
     }
 }
 
@@ -655,7 +674,7 @@ fn draw<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App)
 
 /// Leave the event loop: stop the background jobs and discard the input
 /// nobody will read
-fn quit(background: &BackgroundTasks) -> Result<Option<PathBuf>> {
+fn quit(background: &BackgroundTasks) -> Result<Option<(String, PathBuf)>> {
     // Stop in-flight sync jobs between git invocations
     background.sync.interrupt.store(true, Ordering::Relaxed);
     background.details.interrupt.store(true, Ordering::Relaxed);
@@ -695,13 +714,13 @@ fn classify_key(key: &event::KeyEvent) -> KeyBinding {
 }
 
 /// Run the event loop until the user quits (`None`) or asks for a shell in a
-/// repo (`Some(path)`)
+/// repo (`Some((display_name, path))`)
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     workspace: &Workspace,
     background: &mut BackgroundTasks,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<(String, PathBuf)>> {
     loop {
         // Apply results from background work before drawing
         if let Some(rx) = &background.watcher_starting {
@@ -814,7 +833,9 @@ fn run_app<B: ratatui::backend::Backend>(
                         // Enter on a directory node = toggle expansion
                         let selected = app.selected_node().map(|node| {
                             (
-                                node.repo_info.as_ref().map(|r| r.path.clone()),
+                                node.repo_info
+                                    .as_ref()
+                                    .map(|r| (r.display_name.clone(), r.path.clone())),
                                 node.collect_repo_paths(),
                             )
                         });
@@ -822,7 +843,7 @@ fn run_app<B: ratatui::backend::Backend>(
                         if let Some((repo_dir, repo_paths)) = selected {
                             match app.active_section {
                                 Section::Workspace => match repo_dir {
-                                    Some(path) => return Ok(Some(path)),
+                                    Some(repo) => return Ok(Some(repo)),
                                     None => app.toggle_expand(),
                                 },
                                 Section::Library if repo_paths.is_empty() => app.toggle_expand(),
@@ -1590,6 +1611,31 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    /// A shell that can't be started is reported in words naming what was
+    /// missing: a bare "No such file or directory" used to end the session,
+    /// leaving the user to guess whether it meant $SHELL or the repo.
+    #[test]
+    fn a_shell_that_cannot_start_says_what_was_missing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let missing_shell = temp.path().join("no-such-shell");
+        let missing_shell = missing_shell.to_str().unwrap();
+
+        let reason = run_shell(missing_shell, &repo).unwrap_err();
+        assert!(reason.contains(missing_shell), "{reason}");
+
+        // A repo that went away is what's missing, whatever the shell
+        let gone = temp.path().join("gone");
+        assert_eq!(
+            run_shell(missing_shell, &gone).unwrap_err(),
+            "repo is no longer there"
+        );
+
+        // A shell that runs and fails is the user's own exit status
+        assert_eq!(run_shell("false", &repo), Ok(()));
     }
 
     /// The rows discovery announces are the scan's input, so everything
