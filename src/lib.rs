@@ -1745,13 +1745,57 @@ impl Workspace {
     /// `workset list` in a workspace that was itself a git repo showed that
     /// one nameless row and nothing else, and `workset drop` with no pattern
     /// failed on it without dropping anything.
+    ///
+    /// A `path` inside a repo's worktree — `repo/src`, say — is that repo's
+    /// content, so the repo enclosing it is the one repo under it. Walking
+    /// down from there instead found nothing from `repo/src`, so `workset
+    /// drop` run in a repo's subdirectory reported that there were no repos
+    /// in it, and from `repo/vendor` it found the git directory nested in
+    /// `repo`'s worktree and dropped it as though it were a repo of the
+    /// working set: the content left `repo` without the `--force` its
+    /// uncommitted state called for.
     pub fn repos_under(&self, path: &Path) -> Vec<PathBuf> {
         debug!(path = %path.display(), "Recursively searching for git repositories");
-        worktrees(if self.is_root(path) {
-            find_repos_below(path)
-        } else {
-            find_repos(path)
-        })
+        if self.is_root(path) {
+            return worktrees(find_repos_below(path));
+        }
+        match self.enclosing_repo(path) {
+            Some(enclosing) => worktrees(vec![enclosing]),
+            None => worktrees(find_repos(path)),
+        }
+    }
+
+    /// The repository strictly between the workspace root and `path` that
+    /// `path` lies inside, if any: the outermost one, since that is where the
+    /// walk from the root stops. A symlink on the way ends the search, as it
+    /// does the walk, which never follows one.
+    fn enclosing_repo(&self, path: &Path) -> Option<(PathBuf, RepoKind)> {
+        // Under whichever spelling of the root `path` uses, so the repo
+        // comes back spelled the way the rest of the walk spells it
+        let (mut ancestor, relative) = match path.strip_prefix(&self.path) {
+            Ok(relative) => (self.path.clone(), relative),
+            Err(_) => {
+                let root = std::fs::canonicalize(&self.path).ok()?;
+                let relative = path.strip_prefix(&root).ok()?;
+                (root.clone(), relative)
+            }
+        };
+
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            // `path` itself is find_repos' to judge
+            if components.peek().is_none() {
+                break;
+            }
+            ancestor.push(component);
+            if !std::fs::symlink_metadata(&ancestor).is_ok_and(|meta| meta.is_dir()) {
+                return None;
+            }
+            if let Some(kind) = repo_kind(&ancestor) {
+                return Some((ancestor, kind));
+            }
+        }
+        None
     }
 
     /// Whether `path` is this workspace's root directory, compared on
@@ -2789,6 +2833,59 @@ mod tests {
         fs::create_dir_all(one.join("vendor/dep/.git")).unwrap();
         assert_eq!(workspace.repos(), vec![one.clone(), two]);
         assert_eq!(workspace.repos_under(&one), vec![one]);
+    }
+
+    /// Below a repo's root is still that repo. `workset drop` from
+    /// `app/src` used to report no repos at all, and from `app/vendor` it
+    /// dropped the git directory nested in app's worktree — app's content,
+    /// not a repo of the working set — without the `--force` app's
+    /// uncommitted state calls for.
+    #[test]
+    fn a_path_inside_a_repo_is_that_repo() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let app = workspace.path.join("h.com/u/app");
+        repo_with_a_commit(&app);
+        fs::create_dir_all(app.join("src")).unwrap();
+        let nested = app.join("vendor/lib");
+        repo_with_a_commit(&nested);
+        assert_eq!(workspace.repos(), vec![app.clone()]);
+
+        for below in ["src", "vendor", "vendor/lib", "vendor/lib/missing"] {
+            assert_eq!(
+                workspace.repos_under(&app.join(below)),
+                vec![app.clone()],
+                "under {below}"
+            );
+            let pattern = format!("h.com/u/app/{below}")
+                .parse::<RepoPattern>()
+                .unwrap();
+            assert_eq!(
+                workspace.search(&pattern).unwrap(),
+                vec![app.clone()],
+                "pattern {below}"
+            );
+        }
+
+        // The nested repo is untracked content of app, so app is dirty and
+        // the drop keeps both where they are
+        let report = workspace
+            .drop_under(&app.join("vendor"), false, false)
+            .unwrap();
+        assert!(report.dropped.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].0, "h.com/u/app");
+        assert!(nested.join(".git").exists());
+
+        // Nor is anything inside a library entry a repo of the working set
+        let stored = workspace.library_path().join("h.com/u/stored");
+        fs::create_dir_all(stored.join("objects")).unwrap();
+        fs::create_dir_all(stored.join("refs")).unwrap();
+        fs::write(stored.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(workspace.repos_under(&stored.join("refs")).is_empty());
     }
 
     /// Dropping "everything here" from the root of a workspace that is itself

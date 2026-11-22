@@ -50,7 +50,8 @@ and `restore` place a repo at its full path under the workspace root, and `list`
 
 # Or, you can drop every repository at or below the current directory (any that
 # have uncommitted or unpushed changes will not be touched). Run from the
-# workspace root, this empties the whole working set.
+# workspace root, this empties the whole working set; run from anywhere inside
+# a repository (its src/, say), it drops that repository.
 ❯ workset drop
 
 # If you don't want a repo to remain in the library, use --delete

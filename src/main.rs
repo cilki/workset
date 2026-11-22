@@ -461,7 +461,8 @@ fn main() -> Result<ExitCode> {
   {subcmd}drop{reset} {arg}[pattern]{reset} {arg}[--delete]{reset} {arg}[--force]{reset}  Drop repository(ies) from workspace
 {dim}                                       Several patterns can be given at once
                                        A directory pattern drops every repo in it
-                                       Without pattern: drops every repo under the cwd
+                                       Without pattern: drops every repo under the cwd,
+                                       or the repo the cwd is inside
                                        With --delete: permanently delete (don't store)
                                        With --force: drop despite uncommitted changes or
                                        unpushed commits, or delete a repo never pushed{reset}

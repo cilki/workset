@@ -427,6 +427,37 @@ testDropRejectsEmptyPattern() {
 	[ -d .workset/github.com/user/one ]
 }
 
+## Below a repo's root is still that repo: a bare drop from its src/ used to
+## report "No repositories found", and from a directory holding a git repo
+## nested in the worktree it dropped that nested repo -- the outer repo's
+## untracked content -- as though it were a repo of the working set
+testDropFromInsideARepoDropsThatRepo() {
+	newWorkspace
+	createRepo github.com/user/app
+	createRepo github.com/user/app/vendor/lib
+	mkdir github.com/user/app/src
+
+	# The nested repo makes app dirty, so app is kept and so is the nested
+	# repo inside it
+	cd github.com/user/app/vendor
+	output=$(workset drop 2>&1) && exit 1
+	echo "$output" | grep -- "github.com/user/app - ⚠ kept (uncommitted changes"
+	[ -d lib/.git ]
+	[ ! -e ../../../../.workset/github.com ]
+	cd ../../../..
+
+	rm -rf github.com/user/app/vendor
+	cd github.com/user/app/src
+	workset drop | grep -- "github.com/user/app - ✓ dropped"
+	cd ../../../..
+	[ -d .workset/github.com/user/app ]
+
+	# A path pattern that lands inside the repo names it too
+	workset restore github.com/user/app
+	cd github.com/user/app/src
+	workset drop . | grep -- "github.com/user/app - ✓ dropped"
+}
+
 ## Clone and restore refuse an empty pattern too: every library path contains
 ## the empty string, so restoring it checked the whole library back out
 testCloneAndRestoreRejectEmptyPattern() {
