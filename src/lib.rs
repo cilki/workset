@@ -389,6 +389,15 @@ fn edited_config(config: &gix::bstr::BStr, bare: Option<bool>) -> Result<gix::bs
 
 /// Clone a repository (from a remote URL or a local path) into the given
 /// destination directory, creating parent directories as needed
+///
+/// The clone reads the user's git configuration and environment the way
+/// `git clone` does. Isolating it, as the library's own repo opens are, left
+/// out everything a user sets up so that clones of their repos work at all:
+/// a global `url.<base>.insteadOf` (the usual way of sending `https://` URLs
+/// over SSH), credential helpers, proxies, and `GIT_TERMINAL_PROMPT=0`, which
+/// a script sets so that a repo it can't reach fails instead of waiting on a
+/// prompt. The repo being created has no configuration of its own yet, so
+/// nothing in it can be untrusted.
 pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -399,7 +408,7 @@ pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
         dest,
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
-        gix::open::Options::isolated(),
+        gix::open::Options::default(),
     )?;
     let should_interrupt = std::sync::atomic::AtomicBool::new(false);
     let (mut prepare_checkout, _) =

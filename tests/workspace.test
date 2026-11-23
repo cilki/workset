@@ -476,6 +476,24 @@ testCloneAndRestoreRejectEmptyPattern() {
 	echo "$output" | grep "Empty repository pattern"
 }
 
+## A clone goes through the user's git configuration like `git clone` does, so
+## a global `url.<base>.insteadOf` (how https:// URLs are usually sent over
+## SSH) decides where the repo is fetched from. The host never resolves, so
+## the clone only succeeds by following the rewrite.
+testCloneFollowsGlobalInsteadOf() {
+	newWorkspace
+	git init -q --bare "$PWD/../remote.git"
+	createRepo ../seed 2
+	git -C ../seed push -q "$PWD/../remote.git" main
+
+	export GIT_CONFIG_GLOBAL="$PWD/../gitconfig"
+	git config --global url."file://$PWD/../remote.git".insteadOf \
+		https://example.invalid/user/mirror
+
+	workset clone example.invalid/user/mirror | grep "^Cloned example.invalid/user/mirror$"
+	[ -f example.invalid/user/mirror/file1.txt ]
+}
+
 ## The commands that take no pattern say so instead of ignoring one
 testArgumentlessCommandsRejectExtraArguments() {
 	newWorkspace
