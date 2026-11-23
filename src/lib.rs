@@ -726,6 +726,15 @@ pub enum DropBlocker {
     /// instead, and nothing of a git directory here for the library to hold.
     OrphanedGitDir,
 
+    /// `.git` is a `gitdir:` file naming a git directory that belongs to no
+    /// other repository: the layout `git clone --separate-git-dir` and `git
+    /// init --separate-git-dir` write, where the repo keeps its history
+    /// somewhere else on disk. The git directory is this repo's, but it isn't
+    /// in the repo — nor necessarily in the workspace — so moving it into the
+    /// library would reach outside both, and deleting the worktree would leave
+    /// it behind with nothing pointing at it.
+    SeparateGitDir,
+
     /// `.git` is a symlink, which git accepts as a repository: the git
     /// directory is whatever the link points at, which is not in this repo
     /// and need not even be in the workspace.
@@ -764,6 +773,7 @@ impl DropBlocker {
             }
             Self::BorrowedGitDir => "drop that repository instead",
             Self::OrphanedGitDir => "move out any files you need and remove the directory yourself",
+            Self::SeparateGitDir => "replace the .git file with the git directory it names",
             Self::LinkedGitDir => "replace the link with the git directory it points at",
             Self::MainWorktree(1) => "remove it with 'git worktree remove' first",
             Self::MainWorktree(_) => "remove them with 'git worktree remove' first",
@@ -788,6 +798,7 @@ impl std::fmt::Display for DropBlocker {
             }
             Self::BorrowedGitDir => f.write_str("git directory belongs to another repository"),
             Self::OrphanedGitDir => f.write_str("the git directory its .git file names is gone"),
+            Self::SeparateGitDir => f.write_str("git directory is kept outside the repository"),
             Self::LinkedGitDir => f.write_str("git directory is a symlink to somewhere else"),
             Self::MainWorktree(1) => f.write_str("git directory shared with 1 linked worktree"),
             Self::MainWorktree(count) => {
@@ -848,15 +859,16 @@ fn worktree_blocker(repo: &Path) -> Option<DropBlocker> {
     //
     // Whether that repository is still there decides what the user can do
     // about it: telling them to "drop that repository instead" when it was
-    // deleted long ago sends them looking for a repo that doesn't exist.
+    // deleted long ago sends them looking for a repo that doesn't exist — and
+    // so does sending them after one that never existed, which is what a
+    // `--separate-git-dir` clone's `.git` file names.
     if git_kind.is_file() {
-        return Some(
-            if gitdir_file_target(&git_path).is_some_and(|dir| dir.is_dir()) {
-                DropBlocker::BorrowedGitDir
-            } else {
-                DropBlocker::OrphanedGitDir
-            },
-        );
+        return Some(match gitdir_file_target(&git_path) {
+            Some(dir) if !dir.is_dir() => DropBlocker::OrphanedGitDir,
+            Some(dir) if !belongs_to_another_repo(&dir) => DropBlocker::SeparateGitDir,
+            Some(_) => DropBlocker::BorrowedGitDir,
+            None => DropBlocker::OrphanedGitDir,
+        });
     }
 
     // The third shape: `.git` is a symlink to a git directory, which git
@@ -903,6 +915,31 @@ fn gitdir_file_target(git_file: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(git_file.parent()?.join(target))
+}
+
+/// Whether the git directory a `gitdir:` file names is another repository's
+/// rather than the file's own.
+///
+/// git writes that file for three layouts, and only two of them have an owner
+/// elsewhere. A linked worktree's git directory is
+/// `<main>/.git/worktrees/<name>`, which holds a `commondir` file naming the
+/// git directory it shares; a submodule's is `<super>/.git/modules/<name>`,
+/// whose config sets `core.worktree` back to the submodule's checkout. A
+/// `--separate-git-dir` repo's has neither: it is a whole git directory of its
+/// own that just lives somewhere else. One that can't be read as a git
+/// directory at all is assumed to be borrowed, which is what every `gitdir:`
+/// file was taken to be before.
+fn belongs_to_another_repo(git_dir: &Path) -> bool {
+    if git_dir.join("commondir").exists() {
+        return true;
+    }
+    match gix::config::File::from_path_no_includes(
+        git_dir.join("config"),
+        gix::config::Source::Local,
+    ) {
+        Ok(config) => config.string("core.worktree").is_some(),
+        Err(_) => true,
+    }
 }
 
 /// How many linked worktrees are still using the given git directory.
@@ -3129,6 +3166,96 @@ mod tests {
             report.skipped,
             vec![("sub".to_string(), DropBlocker::BorrowedGitDir)]
         );
+    }
+
+    /// `git clone --separate-git-dir` writes the same `gitdir:` file a linked
+    /// worktree and a submodule have, but the git directory it names is the
+    /// repo's own. Refusing it with "drop that repository instead" sent the
+    /// user after a repository that doesn't exist. The layouts are made by git
+    /// itself, so what tells them apart is what git really writes.
+    #[test]
+    fn drop_tells_a_separate_git_dir_from_one_another_repo_owns() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = Workspace {
+            path: temp_dir.path().join("ws"),
+        };
+        fs::create_dir_all(workspace.library_path()).unwrap();
+        let upstream = temp_dir.path().join("upstream");
+        repo_with_a_commit(&upstream);
+
+        // History kept outside the workspace altogether
+        let separate = workspace.path.join("separate");
+        let elsewhere = temp_dir.path().join("elsewhere.git");
+        git(
+            temp_dir.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--separate-git-dir",
+                &elsewhere.to_string_lossy(),
+                &upstream.to_string_lossy(),
+                &separate.to_string_lossy(),
+            ],
+        );
+
+        // A linked worktree of the main repo
+        let main_repo = workspace.path.join("main");
+        git(
+            temp_dir.path(),
+            &[
+                "clone",
+                "--quiet",
+                &upstream.to_string_lossy(),
+                &main_repo.to_string_lossy(),
+            ],
+        );
+        let worktree = workspace.path.join("feature");
+        git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                &worktree.to_string_lossy(),
+            ],
+        );
+
+        // A submodule, which no pattern reaches — one inside a repo names the
+        // repo — so it is classified directly
+        git(
+            &main_repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                &upstream.to_string_lossy(),
+                "vendor/sub",
+            ],
+        );
+        assert_eq!(
+            worktree_blocker(&main_repo.join("vendor/sub")),
+            Some(DropBlocker::BorrowedGitDir)
+        );
+
+        for (name, blocker) in [
+            ("separate", DropBlocker::SeparateGitDir),
+            ("feature", DropBlocker::BorrowedGitDir),
+        ] {
+            let pattern = name.parse::<RepoPattern>().unwrap();
+            for (delete, force) in [(false, false), (false, true), (true, true)] {
+                let report = workspace.drop(&pattern, delete, force).unwrap();
+                assert!(report.dropped.is_empty(), "{name}");
+                assert_eq!(report.skipped, vec![(name.to_string(), blocker)]);
+                assert!(workspace.path.join(name).join(".git").is_file(), "{name}");
+            }
+        }
+        // The separate git directory is left where it was, still in use
+        assert_eq!(check_repo_status(&separate), RepoStatus::Clean);
+        assert!(elsewhere.join("HEAD").is_file());
     }
 
     /// A repo whose `.git` is a symlink is an ordinary repository to git, and

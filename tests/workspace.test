@@ -284,6 +284,28 @@ testDropRefusesOrphanedWorktree() {
 	[ "$(cat feature/work.txt)" = "only here" ]
 }
 
+## A --separate-git-dir clone keeps its own git directory outside the repo.
+## There is no other repository to drop, so the refusal says what to do
+## instead, and doing it makes the repo one a drop takes
+testDropRefusesSeparateGitDir() {
+	createRepo upstream 1
+	newWorkspace
+	git clone -q --separate-git-dir ../elsewhere.git ../upstream separate
+
+	for flags in "" "--force" "--delete --force"; do
+		output=$(workset drop $flags separate 2>&1) && exit 1
+		echo "$output" | grep -- "separate - ⚠ kept (git directory is kept outside the repository, replace the .git file with the git directory it names)"
+	done
+	[ -f separate/.git ]
+	[ -f ../elsewhere.git/HEAD ]
+
+	rm separate/.git
+	mv ../elsewhere.git separate/.git
+	workset drop separate | grep -- "separate - ✓ dropped"
+	workset restore separate
+	git -C separate status >/dev/null
+}
+
 ## Dropping the main worktree would move the git directory every linked
 ## worktree reads through into the library, breaking each of them in place
 testDropRefusesMainWorktreeWithLinkedWorktrees() {
