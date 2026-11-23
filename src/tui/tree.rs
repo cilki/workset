@@ -198,24 +198,6 @@ fn insert_repo_at(root_nodes: &mut Vec<TreeNode>, path: &str, repo: &RepoInfo) -
     true
 }
 
-/// Build library tree, excluding repos that exist in workspace
-pub fn build_library_tree(
-    library_repos: Vec<RepoInfo>,
-    workspace_repos: &[RepoInfo],
-) -> Vec<TreeNode> {
-    let workspace_paths: std::collections::HashSet<_> = workspace_repos
-        .iter()
-        .map(|r| r.display_name.as_str())
-        .collect();
-
-    let filtered_repos: Vec<RepoInfo> = library_repos
-        .into_iter()
-        .filter(|repo| !workspace_paths.contains(repo.display_name.as_str()))
-        .collect();
-
-    build_tree(filtered_repos)
-}
-
 /// Flatten a forest of trees into a list
 pub fn flatten_trees(trees: &[TreeNode]) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
     let mut result = Vec::new();

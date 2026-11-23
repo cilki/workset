@@ -1,6 +1,6 @@
 use super::tree::{
-    RepoInfo, RepoOperationStatus, TreeNode, build_library_tree, build_tree, count_repos_in_trees,
-    flatten_trees, toggle_node_at_path,
+    RepoInfo, RepoOperationStatus, TreeNode, build_tree, count_repos_in_trees, flatten_trees,
+    toggle_node_at_path,
 };
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -151,7 +151,11 @@ impl App {
                 .filter(|repo| matches(repo))
                 .collect(),
         );
-        let library = build_library_tree(
+        // Every entry the library holds, as `workset list` counts them. A
+        // restore moves the git directory out of the library, so an entry
+        // sharing a checked-out repo's path is a different repository — the
+        // one a drop of that path refuses to overwrite — not a copy of it.
+        let library = build_tree(
             self.library_repos_list
                 .iter()
                 .filter(|repo| matches(repo))
@@ -161,7 +165,6 @@ impl App {
                     repo
                 })
                 .collect(),
-            &self.workspace_repos_list,
         );
         self.trees = [workspace, library];
     }
@@ -649,6 +652,32 @@ mod tests {
         app.clear_search();
         assert_eq!(app.count_repos(Section::Workspace), 2);
         assert_eq!(app.count_repos(Section::Library), 2);
+    }
+
+    /// A restore moves an entry's git directory out of the library, so an
+    /// entry at a path that is also checked out is a second repository — a
+    /// drop's earlier store, replaced in the workspace by a fresh clone — and
+    /// the library panel lists it like `workset list` counts it, rather than
+    /// hiding the only repo a drop of that path refuses to overwrite.
+    #[test]
+    fn a_library_entry_at_a_checked_out_path_is_still_listed() {
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app")],
+            vec![repo("github.com/foo/app"), repo("github.com/bar/lib")],
+        );
+        assert_eq!(app.count_repos(Section::Workspace), 1);
+        assert_eq!(app.count_repos(Section::Library), 2);
+
+        // Selection follows the row it was on, in the panel it was in
+        app.switch_section();
+        assert_eq!(app.active_section, Section::Library);
+        assert_eq!(selected_path(&app).as_deref(), Some("github.com"));
+        app.update_repos(
+            vec![repo("github.com/foo/app")],
+            vec![repo("github.com/foo/app"), repo("github.com/bar/lib")],
+        );
+        assert_eq!(app.active_section, Section::Library);
     }
 
     /// Typing a filter and pressing Enter opens the repo it found: the
