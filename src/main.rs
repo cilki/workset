@@ -847,9 +847,10 @@ impl Completions {
     /// globbing, reached through the candidate's own bytes instead.
     ///
     /// Printed output answers this by quoting the name
-    /// ([`workset::quote_path`]), but a candidate can't be quoted: bash
-    /// inserts it into the command line verbatim, so the C-style escapes
-    /// would become part of the pattern and name nothing. The candidate is
+    /// ([`workset::quote_path`]), but a candidate can't be quoted that way:
+    /// bash inserts it into the command line verbatim, and a newline has no
+    /// backslash escape ([`quote_for_bash`]) — only C-style ones, which would
+    /// become part of the pattern and name nothing. The candidate is
     /// dropped instead, along with the rest of what
     /// [`workset::path_rewrites_output`] covers — a tab truncates a fish
     /// candidate at the description, and an ESC sequence or a bidi override
@@ -899,6 +900,121 @@ fn line_before_cursor(comp_line: &str, comp_point: Option<usize>) -> &str {
     &comp_line[..point]
 }
 
+/// One word of a command line: the text typed for it, and the argument the
+/// shell will make of that text once it has removed the quoting.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Word<'line> {
+    /// The word as it was typed, quotes and backslashes included
+    raw: &'line str,
+    /// The word as the program will receive it
+    value: String,
+    /// The quote still open at the end of the word, if the cursor is inside
+    /// one: `'` or `"`
+    open_quote: Option<char>,
+}
+
+/// Split a command line into words the way the shell will, honouring
+/// backslashes and single and double quotes, so a typed `host/my\ repo` is
+/// one word and not two. Also says whether the line ends between words — in
+/// unquoted whitespace, or with nothing typed at all — in which case the word
+/// at the cursor is a new, empty one.
+fn shell_words(line: &str) -> (Vec<Word<'_>>, bool) {
+    let mut words = Vec::new();
+    let mut start = None;
+    let mut value = String::new();
+    let mut quote = None;
+    let mut chars = line.char_indices().peekable();
+
+    while let Some((index, c)) = chars.next() {
+        match quote {
+            Some('\'') if c == '\'' => quote = None,
+            Some('\'') => value.push(c),
+            Some(_) if c == '"' => quote = None,
+            // Inside double quotes a backslash only escapes the characters
+            // that would otherwise mean something there
+            Some(_) if c == '\\' => match chars.peek() {
+                Some(&(_, next @ ('$' | '`' | '"' | '\\'))) => {
+                    value.push(next);
+                    chars.next();
+                }
+                _ => value.push(c),
+            },
+            Some(_) => value.push(c),
+            None if c.is_whitespace() => {
+                if let Some(start) = start.take() {
+                    words.push(Word {
+                        raw: &line[start..index],
+                        value: std::mem::take(&mut value),
+                        open_quote: None,
+                    });
+                }
+            }
+            None => {
+                start.get_or_insert(index);
+                match c {
+                    '\'' | '"' => quote = Some(c),
+                    '\\' => value.extend(chars.next().map(|(_, escaped)| escaped)),
+                    _ => value.push(c),
+                }
+            }
+        }
+    }
+
+    let between_words = start.is_none();
+    if let Some(start) = start {
+        words.push(Word {
+            raw: &line[start..],
+            value,
+            open_quote: quote,
+        });
+    }
+    (words, between_words)
+}
+
+/// `candidate` written so that bash, inserting it verbatim where the word at
+/// the cursor began, reads it back as exactly `candidate` — or `None` when
+/// that can't be written in the quoting the user already opened.
+///
+/// Bash puts a completion on the command line as it is, and the line is then
+/// parsed like any other: a repo path holding a space became two patterns, and
+/// one holding `;` or `$(...)` became a command of its own. A repo's directory
+/// name is whoever assembled the repo to choose, so `evil/x;touch PWNED`
+/// completed to a line that ran `touch PWNED`, and `evil/proj github.com` to a
+/// `workset drop` of every repo under `github.com`.
+///
+/// Inside an opened quote, readline keeps the quote, inserts the candidate
+/// after it and closes it again, so the candidate is written for that quote:
+/// unchanged inside `'`, which has no escapes and so can't hold a `'`, and
+/// with `\` before what is special inside `"`, which can't hold a `!` that
+/// history expansion would not take.
+fn quote_for_bash(candidate: &str, open_quote: Option<char>) -> Option<String> {
+    match open_quote {
+        Some('\'') => (!candidate.contains('\'')).then(|| candidate.to_string()),
+        Some(_) => (!candidate.contains('!')).then(|| {
+            let mut quoted = String::with_capacity(candidate.len());
+            for c in candidate.chars() {
+                if matches!(c, '$' | '`' | '"' | '\\') {
+                    quoted.push('\\');
+                }
+                quoted.push(c);
+            }
+            quoted
+        }),
+        None => {
+            let mut quoted = String::with_capacity(candidate.len());
+            for c in candidate.chars() {
+                // ASCII is where the shell's syntax lives; letters beyond it
+                // are letters to bash and stay readable
+                if c.is_ascii() && !c.is_ascii_alphanumeric() && !"-_./,:@+%=".contains(c) {
+                    quoted.push('\\');
+                }
+                quoted.push(c);
+            }
+            Some(quoted)
+        }
+    }
+}
+
 /// Everything the word at the cursor could become, together with what has
 /// been typed of that word already.
 ///
@@ -910,16 +1026,22 @@ fn completions<'line>(
     maybe_workspace: Option<&Workspace>,
     comp_line: &'line str,
     comp_point: Option<usize>,
-) -> (&'line str, Completions) {
+) -> (Word<'line>, Completions) {
     let line = line_before_cursor(comp_line, comp_point);
-    let words: Vec<&str> = line.split_whitespace().collect();
+    let (mut words, between_words) = shell_words(line);
 
     // The word being completed is empty when the cursor follows whitespace,
     // otherwise it is the last word
-    let (current_word, word_index) = if line.is_empty() || line.ends_with(char::is_whitespace) {
-        ("", words.len())
+    let word_index = if between_words {
+        words.len()
     } else {
-        (*words.last().unwrap(), words.len() - 1)
+        words.len() - 1
+    };
+    let subcommand = words.get(1).map(|word| word.value.clone());
+    let current_word = if between_words {
+        Word::default()
+    } else {
+        words.pop().unwrap()
     };
 
     // Word 0 is the binary's own name, so the subcommand is word 1
@@ -936,7 +1058,7 @@ fn completions<'line>(
         // in neither (it refuses one that is checked out or in the library),
         // and `init`, `list` and `ls` take no argument whatsoever, so
         // offering them a repo only offers a command that fails.
-        match (maybe_workspace, words.get(1).copied()) {
+        match (maybe_workspace, subcommand.as_deref()) {
             (Some(workspace), Some("restore")) => Completions::Library(workspace.list_library()),
             (Some(workspace), Some("drop")) => Completions::Workspace(workspace_repos(workspace)),
             _ => Completions::Workspace(Vec::new()),
@@ -975,15 +1097,24 @@ fn describe_workspace_repo(repo: &Path) -> String {
     }
 }
 
+/// The lines bash is handed: the candidates that begin with what has been
+/// typed of the word, written the way the shell has to read them back
+fn bash_lines(current_word: &Word, candidates: &Completions) -> Vec<String> {
+    candidates
+        .values()
+        .into_iter()
+        .filter(|value| value.starts_with(current_word.value.as_str()))
+        .filter_map(|value| quote_for_bash(value, current_word.open_quote))
+        .collect()
+}
+
 /// Output dynamic completions for bash, which takes bare words and inserts
-/// them verbatim, so the prefix has to be honoured here
+/// them verbatim, so the prefix and the quoting have to be honoured here
 fn complete_bash(maybe_workspace: Option<Workspace>) {
     let (comp_line, comp_point) = completion_request();
     let (current_word, candidates) = completions(maybe_workspace.as_ref(), &comp_line, comp_point);
-    for value in candidates.values() {
-        if value.starts_with(current_word) {
-            outln!("{}", value);
-        }
+    for line in bash_lines(&current_word, &candidates) {
+        outln!("{}", line);
     }
 }
 
@@ -1097,7 +1228,7 @@ fn fish_lines(current_word: &str, candidates: Completions) -> Vec<String> {
 fn complete_fish(maybe_workspace: Option<Workspace>) {
     let (comp_line, comp_point) = completion_request();
     let (current_word, candidates) = completions(maybe_workspace.as_ref(), &comp_line, comp_point);
-    for line in fish_lines(current_word, candidates) {
+    for line in fish_lines(current_word.raw, candidates) {
         outln!("{}", line);
     }
 }
@@ -1165,20 +1296,15 @@ mod tests {
     }
 
     /// The candidate words for the given line, as bash gets them: narrowed by
-    /// what has been typed of the word at `comp_point`, because bash inserts
-    /// them verbatim
+    /// what has been typed of the word at `comp_point` and quoted for it,
+    /// because bash inserts them verbatim
     fn offered_to_bash(
         maybe_workspace: Option<&Workspace>,
         line: &str,
         comp_point: Option<usize>,
     ) -> Vec<String> {
         let (current_word, candidates) = completions(maybe_workspace, line, comp_point);
-        candidates
-            .values()
-            .iter()
-            .filter(|value| value.starts_with(current_word))
-            .map(|value| value.to_string())
-            .collect()
+        bash_lines(&current_word, &candidates)
     }
 
     /// The free arguments of a command line, as the subcommands get them
@@ -1386,7 +1512,7 @@ mod tests {
 
         let lines = |line: &str| {
             let (current_word, candidates) = completions(Some(&workspace), line, None);
-            fish_lines(current_word, candidates)
+            fish_lines(current_word.raw, candidates)
         };
 
         // The repo is freshly initialized, so its description is its status
@@ -1449,7 +1575,7 @@ mod tests {
         // A completion run against the real budget still offers all three,
         // described or not
         let (current_word, candidates) = completions(Some(&workspace), "workset drop ", None);
-        let offered: Vec<String> = fish_lines(current_word, candidates)
+        let offered: Vec<String> = fish_lines(current_word.raw, candidates)
             .into_iter()
             .map(|line| line.split('\t').next().unwrap().to_string())
             .collect();
@@ -1499,7 +1625,7 @@ mod tests {
         // its description are themselves separated by a tab
         let (current_word, candidates) = completions(Some(&workspace), "workset drop ", None);
         assert_eq!(
-            fish_lines(current_word, candidates),
+            fish_lines(current_word.raw, candidates),
             ["github.com/user/alpha\tno commits"]
         );
     }
@@ -1535,5 +1661,115 @@ mod tests {
             ["github.com/user/alpha"]
         );
         assert!(offered_to_bash(Some(&workspace), multibyte, Some(15)).is_empty());
+    }
+
+    /// Bash inserts a candidate verbatim and then parses the line like any
+    /// other, so a repo name holding shell syntax has to arrive escaped: one
+    /// holding a space was inserted as two patterns, and one holding `;` as a
+    /// pattern followed by a command of its own.
+    #[test]
+    fn a_repo_name_cannot_put_shell_syntax_on_the_command_line() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = workspace(temp.path());
+        for name in [
+            "evil/x;touch PWNED",
+            "evil/proj github.com",
+            "evil/$(id)",
+            "evil/*",
+        ] {
+            let repo = temp.path().join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            gix::init(&repo).unwrap();
+        }
+
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset drop evil/", None),
+            [
+                "evil/\\$\\(id\\)",
+                "evil/\\*",
+                "evil/proj\\ github.com",
+                "evil/x\\;touch\\ PWNED",
+            ]
+        );
+        // A name with nothing the shell would read differently is left alone
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset drop gi", None),
+            ["github.com/user/alpha"]
+        );
+    }
+
+    /// What has been typed of the word is matched as the argument the shell
+    /// will make of it, so an escaped or quoted space continues the word
+    /// rather than starting a new one — and inside an opened quote, the
+    /// candidate is written for that quote, since readline keeps it and closes
+    /// it after the candidate.
+    #[test]
+    fn a_quoted_word_is_completed_inside_its_quotes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = workspace(temp.path());
+        for name in ["evil/proj github.com", "evil/it's", "evil/$HOME!"] {
+            let repo = temp.path().join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            gix::init(&repo).unwrap();
+        }
+
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset drop evil/proj\\ g", None),
+            ["evil/proj\\ github.com"]
+        );
+        // Inside `'` nothing is escaped, and a name holding `'` can't be
+        // written at all
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset drop 'evil/", None),
+            ["evil/$HOME!", "evil/proj github.com"]
+        );
+        // Inside `"` the characters special there are escaped, and a name
+        // holding `!` can't be written at all
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset drop \"evil/", None),
+            ["evil/it's", "evil/proj github.com"]
+        );
+        // A quote that was closed again leaves the word unquoted
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset drop 'evil/proj g'it", None),
+            ["evil/proj\\ github.com"]
+        );
+        // A quoted subcommand is still the subcommand
+        assert_eq!(
+            offered_to_bash(Some(&workspace), "workset 'drop' gi", None),
+            ["github.com/user/alpha"]
+        );
+    }
+
+    #[test]
+    fn words_are_split_the_way_the_shell_splits_them() {
+        let values = |line| {
+            let (words, between_words) = shell_words(line);
+            let values: Vec<String> = words.into_iter().map(|word| word.value).collect();
+            (values, between_words)
+        };
+
+        assert_eq!(values(""), (vec![], true));
+        assert_eq!(
+            values("workset  drop "),
+            (vec!["workset".into(), "drop".into()], true)
+        );
+        assert_eq!(values("a\\ b c"), (vec!["a b".into(), "c".into()], false));
+        assert_eq!(values("'a b'\"c d\"e"), (vec!["a bc de".into()], false));
+        // Inside double quotes a backslash only escapes what is special there
+        assert_eq!(values(r#""\$\a""#), (vec![r"$\a".into()], false));
+        // Inside single quotes nothing is escaped
+        assert_eq!(values(r"'\'"), (vec![r"\".into()], false));
+        // An unterminated quote leaves its whitespace inside the word
+        let (words, between_words) = shell_words("drop 'a b ");
+        assert!(!between_words);
+        assert_eq!(
+            words.last(),
+            Some(&Word {
+                raw: "'a b ",
+                value: "a b ".into(),
+                open_quote: Some('\''),
+            })
+        );
     }
 }

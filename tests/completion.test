@@ -255,7 +255,9 @@ testBashScriptOffersRepos() {
 ## character in one must not be expanded against the directory the completion
 ## runs in. A repo named '*' used to replace itself with every entry of the
 ## workspace, and the entries that are not repos are still taken as patterns:
-## `workset drop subdir` drops everything under subdir.
+## `workset drop subdir` drops everything under subdir. The candidate is
+## escaped, too: bash inserts it verbatim, and a bare '*' on the command line
+## is globbed when the line runs.
 testBashScriptDoesNotGlobRepoNames() {
 	setupWorkspace
 	mkdir '*'
@@ -263,7 +265,26 @@ testBashScriptDoesNotGlobRepoNames() {
 
 	bashCompleteThroughScript "workset drop "
 
-	diff <(printf '%s\n' "${COMPREPLY[@]}") <(printf '*\n'; repos)
+	diff <(printf '%s\n' "${COMPREPLY[@]}") <(printf '\\*\n'; repos)
+}
+
+## Bash inserts a candidate verbatim and then parses the line like any other,
+## so a repo name holding shell syntax arrives escaped. A name holding a space
+## used to be inserted as two patterns -- 'evil/proj github.com' became a drop
+## of every repo under github.com -- and one holding ';' as a command of its
+## own. Each candidate, read back by the shell, is the repo's name again.
+testBashScriptEscapesShellSyntaxInRepoNames() {
+	setupWorkspace
+	for repo in 'evil/proj github.com' 'evil/x;touch PWNED'; do
+		mkdir -p "$repo"
+		git -C "$repo" init -q -b main
+	done
+
+	bashCompleteThroughScript "workset drop evil/"
+
+	diff <(printf '%s\n' "${COMPREPLY[@]}") <(printf '%s\n' 'evil/proj\ github.com' 'evil/x\;touch\ PWNED')
+	diff <(eval "printf '%s\n' ${COMPREPLY[*]}") <(printf '%s\n' 'evil/proj github.com' 'evil/x;touch PWNED')
+	[ ! -e PWNED ]
 }
 
 ## A completion candidate is one line, and a repo's directory name may hold a
