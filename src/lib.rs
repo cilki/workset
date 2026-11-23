@@ -128,6 +128,24 @@ impl RepoPattern {
         }
     }
 
+    /// The pattern a clone files its repo under: the same one, with the
+    /// provider spelled in lowercase.
+    ///
+    /// A host name is case-insensitive, so `GitHub.com/user/repo` and
+    /// `github.com/user/repo` reach the same repository — but the provider is
+    /// also the first directory of the repo's path in the workspace, and the
+    /// filesystem does tell them apart. Taken as typed, cloning the
+    /// capitalised spelling didn't find the repo already checked out (or held
+    /// in the library) under the lowercase one, and fetched a second copy of
+    /// it into a `GitHub.com/` tree beside the first. Only the provider is
+    /// folded: whether the path is case-sensitive is up to the forge.
+    pub fn with_lowercase_provider(self) -> Self {
+        Self {
+            provider: self.provider.map(|provider| provider.to_ascii_lowercase()),
+            path: self.path,
+        }
+    }
+
     /// Get the full path including provider if it exists
     pub fn full_path(&self) -> String {
         match &self.provider {
@@ -5336,6 +5354,25 @@ mod tests {
                 "parsing {url}"
             );
         }
+    }
+
+    /// Only the host is folded to lowercase; the path's case is the forge's
+    /// business, and a pattern without a provider is a local path
+    #[test]
+    fn only_the_provider_is_lowercased() {
+        let Ok(pattern) = "https://Git.Example.COM:3000/Cilki/WorkSet".parse::<RepoPattern>();
+        assert_eq!(
+            pattern.with_lowercase_provider(),
+            RepoPattern {
+                provider: Some("git.example.com:3000".to_string()),
+                path: "Cilki/WorkSet".to_string(),
+            }
+        );
+        let local = RepoPattern::from_relative_path("Local/Repo");
+        assert_eq!(
+            local.with_lowercase_provider(),
+            RepoPattern::from_relative_path("Local/Repo")
+        );
     }
 
     /// A self-hosted forge publishes a port in its clone URLs, and the clone

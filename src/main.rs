@@ -67,7 +67,8 @@ macro_rules! out {
 
 /// Clone a repository. Returns false when the repo was not cloned because it
 /// is already in the workspace or the library.
-fn clone_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<bool> {
+fn clone_repo(workspace: &Workspace, pattern: workset::RepoPattern) -> Result<bool> {
+    let pattern = &pattern.with_lowercase_provider();
     let repo_path = workspace.repo_path(pattern)?;
 
     // Check if repo already exists in workspace
@@ -606,7 +607,7 @@ fn main() -> Result<ExitCode> {
                 } else {
                     for_each_pattern(&patterns, "clone", |requested| {
                         let Ok(pattern) = requested.parse::<workset::RepoPattern>();
-                        clone_repo(&workspace, &pattern)
+                        clone_repo(&workspace, pattern)
                     })
                 }
             }
@@ -1133,6 +1134,30 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
         }
+    }
+
+    /// A host name is case-insensitive, so a clone spelling the provider in
+    /// capitals names the repo already filed under the lowercase spelling —
+    /// whether it is checked out or in the library — instead of fetching a
+    /// second copy of it into a tree of its own.
+    #[test]
+    fn a_clone_finds_its_repo_whatever_case_the_host_is_typed_in() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = workspace(temp.path());
+
+        for requested in [
+            "GitHub.com/user/alpha",
+            "https://GITHUB.COM/user/alpha.git",
+            "git@GitHub.com:user/stored.git",
+        ] {
+            let Ok(pattern) = requested.parse::<workset::RepoPattern>();
+            assert!(
+                !clone_repo(&workspace, pattern).unwrap(),
+                "cloning {requested}"
+            );
+        }
+        assert!(!temp.path().join("GitHub.com").exists());
+        assert!(!temp.path().join("GITHUB.COM").exists());
     }
 
     #[test]
